@@ -337,6 +337,136 @@ fn member_identity_probe(pin: &mut process.ChildStdin, pout: &mut process.ChildS
         harness.fail("instance fields mixed types from different modules: " + field.raw_json(field.root))
 }
 
+fn reference_request(pin: &mut process.ChildStdin, pout: &mut process.ChildStdout, rx: &mut []u8,
+    uri: string, line: i32, column: i32, include_declaration: bool, id: i64) -> json.Doc {
+    req := "{\"jsonrpc\":\"2.0\",\"id\":" + id.str() + ",\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":" +
+        json.quote(uri) + "},\"position\":{\"line\":" + line.str() + ",\"character\":" + column.str() +
+        "},\"context\":{\"includeDeclaration\":" + (if include_declaration { "true" } else { "false" }) + "}}}"
+    if !send_lsp_msg(&mut pin, req) { return json.Doc::parse_text("") }
+    read_until_id(&mut pout, &mut rx, id)
+}
+
+fn has_reference(doc: &json.Doc, uri: string, line: i64, start: i64, end: i64) -> bool {
+    result := doc.field(doc.root, "result")
+    for i in 0..doc.count(result) {
+        item := doc.at(result, i)
+        span := doc.field(item, "range")
+        first := doc.field(span, "start")
+        last := doc.field(span, "end")
+        if doc.get_str(item, "uri").unwrap_or("") == uri && doc.get_i64(first, "line") == .Some(line) &&
+            doc.get_i64(last, "line") == .Some(line) && doc.get_i64(first, "character") == .Some(start) &&
+            doc.get_i64(last, "character") == .Some(end) { return true }
+    }
+    false
+}
+
+fn references_probe(pin: &mut process.ChildStdin, pout: &mut process.ChildStdout, rx: &mut []u8,
+                    uri: string, ws: string, ws_uri: string) -> bool {
+    if !sys.write_text(ws + "/alpha.ddr", "pub fn lookup(n: i32) -> i32 { n + 1 }\n").ok ||
+        !sys.write_text(ws + "/beta.ddr", "pub fn lookup(n: i32) -> i32 { n }\n").ok ||
+        !fs.mkdir_all(ws + "/sibling").ok ||
+        !sys.write_text(ws + "/sibling/client.ddr", "import ..alpha as util\nfn another() { print(util.lookup(2)) }\n").ok {
+        return harness.fail("failed to write reference fixtures")
+    }
+    overlay_uri := ws_uri + "/unsaved.ddr"
+    overlay := "import alpha as a\nfn use_it() { print(a.lookup(3)) }\n"
+    if !send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":" +
+        json.quote(overlay_uri) + ",\"languageId\":\"dunder\",\"version\":1,\"text\":" + json.quote(overlay) + "}}}") { return false }
+    _ := read_until_diag(&mut pout, &mut rx, overlay_uri)
+    source := "import alpha as first\nimport beta as second\n" +
+        "fn main() { print(first.lookup(1)); print(second.lookup(1)); print(\"lookup\") }\n"
+    if !change_doc(&mut pin, uri, source, 14) { return false }
+    _ := read_until_diag(&mut pout, &mut rx, uri)
+    alpha_uri := ws_uri + "/alpha.ddr"
+    call_column := i64("fn main() { print(first.".len)
+    references := reference_request(&mut pin, &mut pout, &mut rx, uri, 2, i32(call_column), true, 40)
+    if references.count(references.field(references.root, "result")) != 4 ||
+        !has_reference(&references, alpha_uri, 0, 7, 13) ||
+        !has_reference(&references, uri, 2, call_column, call_column + 6) ||
+        !has_reference(&references, ws_uri + "/sibling/client.ddr", 1, 26, 32) ||
+        !has_reference(&references, overlay_uri, 1, 22, 28) {
+        return harness.fail("workspace references mixed or missed declarations: " + references.raw_json(references.root))
+    }
+    uses := reference_request(&mut pin, &mut pout, &mut rx, alpha_uri, 0, 8, false, 41)
+    if uses.count(uses.field(uses.root, "result")) != 3 || has_reference(&uses, alpha_uri, 0, 7, 13) {
+        return harness.fail("references from declaration failed: " + uses.raw_json(uses.root))
+    }
+    local_source := "fn main() {\n" +
+        "    mut value := 1\n" +
+        "    if true { value := value + 1; print(value) }\n" +
+        "    value += 1\n" +
+        "    print(\"🦔\"); print(value)\n" +
+        "}\n"
+    if !change_doc(&mut pin, uri, local_source, 15) { return false }
+    _ := read_until_diag(&mut pout, &mut rx, uri)
+    locals := reference_request(&mut pin, &mut pout, &mut rx, uri, 1, 8, true, 42)
+    unicode_column := i64("    print(\"🦔\"); print(".len)
+    (locals.count(locals.field(locals.root, "result")) == 4 &&
+        has_reference(&locals, uri, 1, 8, 13) &&
+        has_reference(&locals, uri, 2, 23, 28) &&
+        has_reference(&locals, uri, 3, 4, 9) &&
+        has_reference(&locals, uri, 4, unicode_column, unicode_column + 5)) ||
+        harness.fail("local references mixed lexical bindings: " + locals.raw_json(locals.root))
+}
+
+fn member_references_probe(pin: &mut process.ChildStdin, pout: &mut process.ChildStdout, rx: &mut []u8,
+    uri: string, ws: string, ws_uri: string) -> bool {
+    decl := "pub struct Meter { reading: i32 }\n" +
+        "impl Meter {\n    pub fn sample(&self) -> i32 { self.reading }\n" +
+        "    pub fn make(n: i32) -> Self { Self { reading: n } }\n" +
+        "    pub fn chain(&self) -> Self { Self { reading: self.reading } }\n}\n"
+    client := "import ..alpha as a\nfn use_it() { meter := a.Meter { reading: 2 }; print(meter.sample()) }\n"
+    if !sys.write_text(ws + "/alpha.ddr", decl).ok || !sys.write_text(ws + "/beta.ddr", decl).ok ||
+        !sys.write_text(ws + "/sibling/client.ddr", client).ok { return false }
+    source := "import alpha.Meter as Reading\nimport beta as other\n" +
+        "fn main() {\n    first := Reading { reading: 1 }\n    second := other.Meter { reading: 2 }\n" +
+        "    print(first.sample())\n    print(second.sample())\n    print(first.reading)\n" +
+        "    print(Reading::make(3).chain().sample())\n    print(\"first.sample\")\n}\n"
+    if !change_doc(&mut pin, uri, source, 16) { return false }
+    _ := read_until_diag(&mut pout, &mut rx, uri)
+    alpha_uri := ws_uri + "/alpha.ddr"
+    second_uri := ws_uri + "/sibling/client.ddr"
+    column := i64("    print(first.".len)
+    sibling_column := i64("fn use_it() { meter := a.Meter { reading: 2 }; print(meter.".len)
+    methods := reference_request(&mut pin, &mut pout, &mut rx, uri, 5, i32(column), true, 43)
+    chain_column := i64("    print(Reading::make(3).chain().".len)
+    if methods.count(methods.field(methods.root, "result")) != 4 ||
+        !has_reference(&methods, alpha_uri, 2, 11, 17) ||
+        !has_reference(&methods, uri, 5, column, column + 6) ||
+        !has_reference(&methods, uri, 8, chain_column, chain_column + 6) ||
+        !has_reference(&methods, second_uri, 1, sibling_column, sibling_column + 6) {
+        return harness.fail("method references mixed receiver types: " + methods.raw_json(methods.root))
+    }
+    fields := reference_request(&mut pin, &mut pout, &mut rx, uri, 7, i32(column), true, 44)
+    self_column := i64("    pub fn sample(&self) -> i32 { self.".len)
+    other_column := i64("    second := other.Meter { ".len)
+    if !has_reference(&fields, alpha_uri, 0, 19, 26) ||
+        !has_reference(&fields, alpha_uri, 2, self_column, self_column + 7) ||
+        !has_reference(&fields, uri, 3, 23, 30) ||
+        !has_reference(&fields, uri, 7, column, column + 7) ||
+        has_reference(&fields, uri, 4, other_column, other_column + 7) {
+        return harness.fail("field references mixed record types: " + fields.raw_json(fields.root))
+    }
+    name := i64("import alpha.".len)
+    imported := reference_request(&mut pin, &mut pout, &mut rx, uri, 0, i32(name), true, 45)
+    if !has_reference(&imported, alpha_uri, 0, 11, 16) ||
+        !has_reference(&imported, uri, 0, name, name + 5) ||
+        !has_reference(&imported, uri, 3, 13, 20) ||
+        has_reference(&imported, ws_uri + "/beta.ddr", 0, 11, 16) {
+        return harness.fail("references for a direct import alias: " + imported.raw_json(imported.root))
+    }
+    string_site := reference_request(&mut pin, &mut pout, &mut rx, uri, 9, i32(column + 1), true, 46)
+    if !string_site.ok || string_site.count(string_site.field(string_site.root, "result")) != 0 {
+        return harness.fail("string content selected a member: " + string_site.raw_json(string_site.root))
+    }
+    callee_column := i64("    print(Reading::".len)
+    associated := reference_request(&mut pin, &mut pout, &mut rx, uri, 8, i32(callee_column), true, 47)
+    (associated.count(associated.field(associated.root, "result")) == 2 &&
+        has_reference(&associated, alpha_uri, 3, 11, 15) &&
+        has_reference(&associated, uri, 8, callee_column, callee_column + 4)) ||
+        harness.fail("associated function references: " + associated.raw_json(associated.root))
+}
+
 fn workspace_uri(absolute: string) -> string {
     slashes := text.replace(http.percent_encode(absolute), "%2F", "/")
     encoded := text.replace(slashes, "%3A", ":")
@@ -439,6 +569,7 @@ fn run_lsp_e2e(compiler: string, work: string) -> bool {
     if init_doc.get_str(caps, "positionEncoding") != .Some("utf-8") ||
        !init_doc.get_bool(caps, "hoverProvider").unwrap_or(false) ||
        !init_doc.get_bool(caps, "definitionProvider").unwrap_or(false) ||
+       !init_doc.get_bool(caps, "referencesProvider").unwrap_or(false) ||
        !init_doc.get_bool(caps, "documentSymbolProvider").unwrap_or(false) ||
        !init_doc.get_bool(caps, "documentFormattingProvider").unwrap_or(false) ||
        init_doc.kind(init_doc.field(caps, "completionProvider")) != .Object {
@@ -650,6 +781,8 @@ fn run_lsp_e2e(compiler: string, work: string) -> bool {
     if !alias_probe(&mut pin, &mut pout, &mut rx, main_uri, ws) { _ := child.kill(); return false }
     if !completion_probe(&mut pin, &mut pout, &mut rx, main_uri) { _ := child.kill(); return false }
     if !member_identity_probe(&mut pin, &mut pout, &mut rx, main_uri, ws) { _ := child.kill(); return false }
+    if !references_probe(&mut pin, &mut pout, &mut rx, main_uri, ws, ws_uri) { _ := child.kill(); return false }
+    if !member_references_probe(&mut pin, &mut pout, &mut rx, main_uri, ws, ws_uri) { _ := child.kill(); return false }
 
     // 13. didClose
     _ := send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"" + main_uri + "\"}}}")

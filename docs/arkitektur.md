@@ -25,6 +25,9 @@ senaste dokumentversionen. Komplettering, hovring och definitionsuppslag
 återanvänder den senaste analysen så länge källorna och paketinställningarna
 är desamma. Komplettering prioriterar lokala namn i räckvidd och använder
 mottagarens typ för att välja fält, instansmetoder och associerade funktioner.
+Referenssökning använder symbolupplösningen för importer och söker i
+arbetsytans källfiler och osparade buffertar. Lokala bindningar följer sina
+lexikala scope. Fält och metoder identifieras utifrån mottagarens typ.
 
 ## Språkets kostnadsmodell
 

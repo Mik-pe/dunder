@@ -77,6 +77,25 @@ struct Binding {
 
 struct TypeLocation { module: i32, name: string }
 
+struct ReferenceTarget {
+    path: string,
+    name: string,
+    start: i32,
+    public: bool,
+    member: bool,
+}
+
+struct ReferenceSearch {
+    scanned: Set<string>,
+    written: Set<string>,
+    include_declaration: bool,
+}
+
+struct ResolvedMember {
+    target: ReferenceTarget,
+    output: TypeLocation,
+}
+
 struct ConfigInput {
     path: string,
     present: bool,
@@ -921,6 +940,10 @@ fn visible_at(root: &ast.Module, declaration: i32, cursor: i32) -> bool {
     }
     for stmt in &root.stmts {
         if stmt.kind == .For && in_span(stmt.span, declaration) && !in_span(stmt.span, cursor) { return false }
+        if (stmt.kind == .Let || stmt.kind == .For) && stmt.expr >= 0 {
+            value := root.exprs[stmt.expr].span
+            if declaration >= stmt.span.start && declaration < value.start && in_span(value, cursor) { return false }
+        }
     }
     true
 }
@@ -1218,6 +1241,464 @@ fn handle_definition(state: &mut State, doc: &json.Doc, id_node: i32, params: i3
     rw.key("result")
     write_location(&mut rw, &state, def_path, def_src, def_start, def_end)
     rw.end()
+    res := jcompat.writer_finish(&rw)
+    if res.ok { send_json(res.value) }
+}
+
+fn load_references(state: &State, path: string) -> modules.Loaded {
+    mut lexing := modules.serial_lexing()
+    lexing.references = true
+    mut tokens := lexer.empty(false)
+    mut inputs: []ConfigInput = []
+    deps := resolve_dep_graph(&state, project_dir(&state, path), &mut inputs)
+    modules.load_group_with_overlays(path, true, true, -1, false, &mut tokens, &deps,
+        &lexing, &state.doc_paths, &state.doc_texts)
+}
+
+fn global_reference_target(loaded: &modules.Loaded, offset: i32) -> Option<ReferenceTarget> {
+    mut symbol := -1
+    for site in &loaded.references {
+        if site.owner == 0 && offset >= site.start && offset < site.end {
+            symbol = site.symbol
+            break
+        }
+    }
+    if symbol < 0 { return .None }
+    for site in &loaded.references {
+        if site.symbol == symbol && site.declaration {
+            return .Some(ReferenceTarget {
+                path: loaded.paths[site.owner].clone(), name: loaded.symbols[symbol].clone(),
+                start: site.start, public: site.public, member: false,
+            })
+        }
+    }
+    .None
+}
+
+fn write_reference(w: &mut json.Writer, state: &State, uri: string, lines: &positions.LineIndex, start: i32, end: i32) {
+    w.object()
+    w.key("uri"); w.string(uri)
+    w.key("range"); write_range(&mut w, &lines, state.encoding, start, end)
+    w.end()
+}
+
+fn write_global_references(w: &mut json.Writer, state: &State, search: &mut ReferenceSearch,
+    loaded: &modules.Loaded, wanted: &ReferenceTarget) {
+    mut symbol := -1
+    for site in &loaded.references {
+        if site.declaration && site.start == wanted.start {
+            path := &loaded.paths[site.owner]
+            if path == wanted.path || sys.same_file(path, wanted.path) { symbol = site.symbol; break }
+        }
+    }
+    if loaded.ok {
+        for path in &loaded.paths { _ := search.scanned.insert(path.clone()) }
+    }
+    if symbol < 0 { return }
+    mut current_owner := -1
+    mut uri := ""
+    mut lines := positions.index("")
+    for site in &loaded.references {
+        if site.symbol != symbol || (site.declaration && !search.include_declaration) { continue }
+        if !is_real_module_path(loaded.paths[site.owner]) { continue }
+        if current_owner != site.owner {
+            current_owner = site.owner
+            uri = path_to_uri(&state, loaded.paths[current_owner])
+            lines = positions.index(loaded.sources[current_owner])
+        }
+        if search.written.insert(uri + "#" + site.start.str()) {
+            write_reference(&mut w, &state, uri, &lines, site.start, site.end)
+        }
+    }
+}
+
+fn scan_reference_file(w: &mut json.Writer, state: &State, search: &mut ReferenceSearch,
+    path: string, wanted: &ReferenceTarget, entry_point: bool) {
+    if search.scanned.contains(path) || !text.ends_with(path, ".ddr") { return }
+    _ := search.scanned.insert(path.clone())
+    if (!entry_point || wanted.member) && !text.contains(doc_text(&state, path), wanted.name) { return }
+    if wanted.member {
+        analysis := build_analysis(&state, path, project_dir(&state, path))
+        write_member_references(&mut w, &state, &mut search, &analysis, &wanted)
+    } else {
+        loaded := load_references(&state, path)
+        write_global_references(&mut w, &state, &mut search, &loaded, &wanted)
+    }
+}
+
+fn write_workspace_references(w: &mut json.Writer, state: &State, search: &mut ReferenceSearch,
+    document: string, wanted: &ReferenceTarget) {
+    directory := project_dir(&state, document)
+    resolved := fs.realpath(state.root_path)
+    worktree := if resolved.ok { paths.normalize(resolved.value) } else { "" }
+    real_document := fs.realpath(document)
+    doc_path := if real_document.ok { real_document.value } else { document.clone() }
+    root := if worktree != "" && text.starts_with(doc_path, worktree + "/") { worktree } else { directory.clone() }
+    if directory != "" {
+        config := manifest.parse(dependencies.path_in(directory, "dunder.toml"), true)
+        if config.ok {
+            scan_reference_file(&mut w, &state, &mut search, dependencies.path_in(directory, config.root), &wanted, true)
+            scan_reference_file(&mut w, &state, &mut search, dependencies.path_in(directory, config.test_root), &wanted, true)
+        }
+    }
+    if root == "" {
+        for path in &state.doc_paths {
+            scan_reference_file(&mut w, &state, &mut search, path, &wanted, false)
+        }
+        return
+    }
+    for path in &state.doc_paths {
+        if text.starts_with(path, root + "/") {
+            scan_reference_file(&mut w, &state, &mut search, path, &wanted, false)
+        }
+    }
+    mut pending: []string = [root]
+    while pending.len > 0 {
+        dir := pending.pop()
+        listed := fs.list_dir(dir)
+        if listed.is_err() { continue }
+        for entry in move listed.unwrap() {
+            if entry.len == 0 || entry[0] == 46 || entry == "build" { continue }
+            path := dependencies.path_in(dir, entry)
+            if fs.is_symlink(path) { continue }
+            info := sys.metadata(path)
+            if info.is_dir { pending.push(move path) }
+            else if info.is_file { scan_reference_file(&mut w, &state, &mut search, path, &wanted, false) }
+        }
+    }
+}
+
+fn local_reference_binding(analysis: &Analysis, name: string, offset: i32) -> i32 {
+    root := &analysis.root
+    enclosing := ast.find_item_at(&root, offset)
+    if enclosing < 0 { return -1 }
+    item := &root.items[enclosing]
+    if item.kind == .Impl || item.kind == .Trait {
+        for i in 0..item.member_count {
+            member := &root.members[item.first_member + i]
+            if in_span(member.span, offset) {
+                return binding_at(&analysis, name, offset, member.span.start, member.span.end)
+            }
+        }
+        return -1
+    }
+    binding_at(&analysis, name, offset, item.span.start, item.span.end)
+}
+
+fn local_reference_expression(root: &ast.Module, name: string, offset: i32) -> bool {
+    for expr in &root.exprs {
+        if expr.kind == .Ident && expr.span.start == offset && expr.text == name { return true }
+    }
+    for field in &root.field_inits {
+        if field.is_shorthand && field.span.start == offset && field.name == name { return true }
+    }
+    false
+}
+
+fn write_local_references(w: &mut json.Writer, state: &State, analysis: &Analysis,
+    uri: string, offset: i32, include_declaration: bool) -> bool {
+    cursor := word_at(analysis.root.source, offset)
+    if cursor.word == "" { return false }
+    binding := local_reference_binding(&analysis, cursor.word, cursor.start)
+    if binding < 0 { return false }
+    declaration := analysis.bindings[binding].start
+    if cursor.start != declaration && !local_reference_expression(&analysis.root, cursor.word, cursor.start) { return false }
+    mut seen := Set<i32>::new()
+    for expr in &analysis.root.exprs {
+        if expr.kind != .Ident || expr.text != cursor.word || expr.span.start == declaration { continue }
+        found := local_reference_binding(&analysis, cursor.word, expr.span.start)
+        if found >= 0 && analysis.bindings[found].start == declaration && seen.insert(expr.span.start) {
+            write_reference(&mut w, &state, uri, &analysis.lines, expr.span.start, expr.span.start + cursor.word.len)
+        }
+    }
+    for field in &analysis.root.field_inits {
+        if !field.is_shorthand || field.name != cursor.word || field.span.start == declaration { continue }
+        found := local_reference_binding(&analysis, cursor.word, field.span.start)
+        if found >= 0 && analysis.bindings[found].start == declaration && seen.insert(field.span.start) {
+            write_reference(&mut w, &state, uri, &analysis.lines, field.span.start, field.span.start + cursor.word.len)
+        }
+    }
+    if include_declaration {
+        write_reference(&mut w, &state, uri, &analysis.lines, declaration, declaration + cursor.word.len)
+    }
+    true
+}
+
+fn member_declaration(m: &ast.Module, item: &ast.Item, member: &ast.Member) -> Option<ReferenceTarget> {
+    start := if member.attr_count > 0 { m.attrs[member.first_attr + member.attr_count - 1].span.end } else { member.span.start }
+    end := if member.body_span.start > start { member.body_span.start } else { member.span.end }
+    if start < 0 || end < start || end > m.source.len { return .None }
+    tokens := lexer.scan(m.source[start..end], false)
+    for i in 0..tokens.kinds.len {
+        if tokens.kinds[i] == .Name && tokens.texts[i] == member.name {
+            exported := if item.kind == .Impl { member.is_pub } else { item.is_pub && !item.is_opaque }
+            return .Some(ReferenceTarget { path: m.path.clone(), name: member.name.clone(),
+                start: start + tokens.starts[i], public: exported, member: true })
+        }
+    }
+    .None
+}
+
+fn member_in_module(analysis: &Analysis, m: &ast.Module, owner: i32,
+    ty: &TypeLocation, name: string, instance: bool, associated: bool) -> Option<ResolvedMember> {
+    for item in &m.items {
+        methods := item.kind == .Impl
+        if methods {
+            target := declared_type(&analysis.loaded, &m, owner, item.target_name)
+            if target.module != ty.module || target.name != ty.name { continue }
+        } else {
+            if ty.module != owner || item.name != ty.name || (owner != 0 && (!item.is_pub || item.is_opaque)) { continue }
+            if instance && item.kind != .Struct && item.kind != .Union { continue }
+            if !instance && (associated || item.kind != .Enum) { continue }
+        }
+        for i in 0..item.member_count {
+            member := &m.members[item.first_member + i]
+            if member.name != name { continue }
+            if methods {
+                receiver := member.param_count > 0 && m.params[member.first_param].receiver != .None
+                if receiver != instance || (!instance && !associated) || (owner != 0 && !member.is_pub) { continue }
+            }
+            match member_declaration(&m, &item, &member) {
+                .Some(declaration) => {
+                    spelling := format_type(&m, member.ty)
+                    result := if base_type_name(spelling) == "Self" {
+                        TypeLocation { module: ty.module, name: ty.name.clone() }
+                    } else { declared_type(&analysis.loaded, &m, owner, spelling) }
+                    return .Some(ResolvedMember { target: move declaration, output: move result })
+                },
+                .None => { return .None },
+            }
+        }
+    }
+    .None
+}
+
+fn member_of_type(analysis: &Analysis, ty: &TypeLocation, name: string, instance: bool, associated: bool) -> Option<ResolvedMember> {
+    if ty.module < 0 { return .None }
+    local := member_in_module(&analysis, &analysis.root, 0, &ty, name, instance, associated)
+    if local.is_some() { return local }
+    for i in 1..analysis.loaded.paths.len {
+        source := &analysis.loaded.sources[i]
+        if !text.contains(source, ty.name) || !text.contains(source, name) { continue }
+        if i != ty.module && !text.contains(source, "impl") { continue }
+        m := parser.parse_source(analysis.loaded.paths[i], source)
+        found := member_in_module(&analysis, &m, i, &ty, name, instance, associated)
+        if found.is_some() { return found }
+    }
+    .None
+}
+
+fn member_target(move resolved: Option<ResolvedMember>) -> Option<ReferenceTarget> {
+    match move resolved {
+        .Some(member) => .Some(member.target),
+        .None => .None,
+    }
+}
+
+fn type_in_document(analysis: &Analysis, spelling: string, offset: i32) -> TypeLocation {
+    enclosing := ast.find_item_at(&analysis.root, offset)
+    if spelling == "Self" && enclosing >= 0 && analysis.root.items[enclosing].kind == .Impl {
+        return declared_type(&analysis.loaded, &analysis.root, 0, analysis.root.items[enclosing].target_name)
+    }
+    declared_type(&analysis.loaded, &analysis.root, 0, spelling)
+}
+
+fn unbound_name(analysis: &Analysis, expr: &ast.ExprNode) -> bool {
+    if expr.kind != .Ident { return false }
+    local_reference_binding(&analysis, expr.text, expr.span.start) < 0
+}
+
+fn expression_type(analysis: &Analysis, index: i32, depth: i32) -> TypeLocation {
+    unknown := TypeLocation { module: -1, name: "" }
+    m := &analysis.root
+    if index < 0 || index >= m.exprs.len || depth == 0 { return unknown }
+    expr := &m.exprs[index]
+    if expr.kind == .Ident {
+        id := local_reference_binding(&analysis, expr.text, expr.span.start)
+        if id >= 0 {
+            binding := &analysis.bindings[id]
+            return TypeLocation { module: binding.module, name: base_type_name(binding.type_name) }
+        }
+        return type_in_document(&analysis, expr.text, expr.span.start)
+    }
+    if expr.kind == .Group || expr.kind == .Move {
+        return expression_type(&analysis, expr.left, depth - 1)
+    }
+    if expr.left < 0 { return unknown }
+    left := &m.exprs[expr.left]
+    if expr.kind == .StructLit && left.kind == .Ident {
+        spelling := if expr.op == "." { left.text + "." + expr.text } else { left.text.clone() }
+        return type_in_document(&analysis, spelling, expr.span.start)
+    }
+    if expr.kind == .Call {
+        if left.kind == .Field && left.op == "::" { return expression_type(&analysis, expr.left, depth - 1) }
+        if unbound_name(&analysis, &left) {
+            item := find_item_def_in_module(&m, left.text)
+            if item >= 0 && (m.items[item].kind == .Fn || m.items[item].kind == .ExternFn) {
+                return type_in_document(&analysis, format_type(&m, m.items[item].ret_type), expr.span.start)
+            }
+        }
+        return unknown
+    }
+    if expr.kind != .Field && expr.kind != .MethodCall { return unknown }
+    if expr.op == "." && unbound_name(&analysis, &left) {
+        imported := modules.imported_module(&analysis.loaded, 0, left.text)
+        if imported >= 0 {
+            if expr.kind == .Field { return type_in_document(&analysis, left.text + "." + expr.text, expr.span.start) }
+            module := parser.parse_source(analysis.loaded.paths[imported], analysis.loaded.sources[imported])
+            item := find_public_item(&module, expr.text)
+            if item >= 0 && (module.items[item].kind == .Fn || module.items[item].kind == .ExternFn) {
+                ty := format_type(&module, module.items[item].ret_type)
+                return declared_type(&analysis.loaded, &module, imported, ty)
+            }
+        }
+    }
+    receiver := expression_type(&analysis, expr.left, depth - 1)
+    associated := expr.op == "::"
+    instance := !associated && !unbound_name(&analysis, &left)
+    match member_of_type(&analysis, &receiver, expr.text, instance, associated) {
+        .Some(member) => member.output,
+        .None => unknown,
+    }
+}
+
+fn access_name_at(m: &ast.Module, expr: &ast.ExprNode, offset: i32) -> bool {
+    if expr.left < 0 || !in_span(expr.span, offset) { return false }
+    mut at := m.exprs[expr.left].span.end
+    while at < offset {
+        byte := m.source[at]
+        if byte > 32 && byte != 46 && byte != 58 { return false }
+        at += 1
+    }
+    at == offset
+}
+
+fn member_reference_at(analysis: &Analysis, name: string, offset: i32) -> Option<ReferenceTarget> {
+    root := &analysis.root
+    for item in &root.items {
+        if !in_span(item.span, offset) ||
+           (item.kind != .Impl && item.kind != .Struct && item.kind != .Union && item.kind != .Enum) { continue }
+        for i in 0..item.member_count {
+            member := &root.members[item.first_member + i]
+            if member.name != name || !in_span(member.span, offset) { continue }
+            match member_declaration(&root, &item, &member) {
+                .Some(site) => { if site.start == offset { return .Some(move site) } },
+                .None => {},
+            }
+        }
+    }
+
+    for expr in &root.exprs {
+        if expr.kind != .StructLit || expr.left < 0 || !in_span(expr.span, offset) { continue }
+        for i in 0..expr.child_count {
+            field := &root.field_inits[expr.first_child + i]
+            if field.name != name || field.span.start != offset { continue }
+            receiver := &root.exprs[expr.left]
+            if receiver.kind != .Ident { continue }
+            spelling := if expr.op == "." { receiver.text + "." + expr.text } else { receiver.text.clone() }
+            ty := type_in_document(&analysis, spelling, offset)
+            return member_target(member_of_type(&analysis, &ty, name, true, false))
+        }
+    }
+    for expr in &root.exprs {
+        if (expr.kind != .Field && expr.kind != .MethodCall) || expr.text != name ||
+            !access_name_at(&root, &expr, offset) { continue }
+        receiver := expression_type(&analysis, expr.left, 12)
+        associated := expr.op == "::"
+        instance := !associated && !unbound_name(&analysis, &root.exprs[expr.left])
+        return member_target(member_of_type(&analysis, &receiver, name, instance, associated))
+    }
+    context := completion_context(root.source, offset)
+    if context.scope == .Plain || context.qualifier == "" { return .None }
+    binding := if context.scope == .Dot { local_reference_binding(&analysis, context.qualifier, offset) } else { -1 }
+    if binding >= 0 {
+        b := &analysis.bindings[binding]
+        ty := TypeLocation { module: b.module, name: base_type_name(b.type_name) }
+        return member_target(member_of_type(&analysis, &ty, name, true, false))
+    }
+    ty := type_in_document(&analysis, context.qualifier, offset)
+    member_target(member_of_type(&analysis, &ty, name, false, context.scope == .Static))
+}
+
+fn write_member_references(w: &mut json.Writer, state: &State, search: &mut ReferenceSearch,
+    analysis: &Analysis, wanted: &ReferenceTarget) {
+    tokens := lexer.scan(analysis.root.source, false)
+    uri := path_to_uri(&state, analysis.path)
+    for i in 0..tokens.kinds.len {
+        if tokens.kinds[i] != .Name || tokens.texts[i] != wanted.name { continue }
+        start := tokens.starts[i]
+        match member_reference_at(&analysis, wanted.name, start) {
+            .Some(site) => {
+                if site.start != wanted.start || (site.path != wanted.path && !sys.same_file(site.path, wanted.path)) { continue }
+                if !search.include_declaration && start == wanted.start &&
+                   (analysis.path == wanted.path || sys.same_file(analysis.path, wanted.path)) { continue }
+                if search.written.insert(uri + "#" + start.str()) {
+                    write_reference(&mut w, &state, uri, &analysis.lines, start, start + wanted.name.len)
+                }
+            },
+            .None => {},
+        }
+    }
+}
+
+fn selected_member(analysis: &Analysis, cursor: &WordInfo) -> Option<ReferenceTarget> {
+    tokens := lexer.scan(analysis.root.source, false)
+    for i in 0..tokens.kinds.len {
+        if tokens.starts[i] == cursor.start && tokens.kinds[i] == .Name && tokens.texts[i] == cursor.word {
+            return member_reference_at(&analysis, cursor.word, cursor.start)
+        }
+    }
+    .None
+}
+
+fn handle_references(state: &mut State, doc: &json.Doc, id_node: i32, params: i32) {
+    uri := jcompat.get_str(&doc, doc.field(params, "textDocument"), "uri").value
+    if uri == "" { send_null_result(&doc, id_node); return }
+    path := uri_to_path(uri)
+    source := doc_text(&state, path)
+    lines := positions.index(source)
+    offset := read_position(&doc, doc.field(params, "position"), &lines, state.encoding)
+    if offset < 0 { send_null_result(&doc, id_node); return }
+    cursor := word_at(source, offset)
+    include_declaration := doc.get_bool(doc.field(params, "context"), "includeDeclaration").unwrap_or(false)
+    mut rw := json.Writer::new()
+    rw.object()
+    rw.key("jsonrpc"); rw.string("2.0")
+    rw.key("id"); write_rpc_id(&mut rw, &doc, id_node)
+    rw.key("result"); rw.array()
+    if cursor.word != "" {
+        loaded := load_references(&state, path)
+        target := global_reference_target(&loaded, cursor.start)
+        match move target {
+            .Some(wanted) => {
+                mut search := ReferenceSearch {
+                    scanned: Set<string>::new(), written: Set<string>::new(), include_declaration: include_declaration,
+                }
+                write_global_references(&mut rw, &state, &mut search, &loaded, &wanted)
+                if wanted.public { write_workspace_references(&mut rw, &state, &mut search, path, &wanted) }
+            },
+            .None => {
+                prepare_analysis(&mut state, path)
+                analysis := &state.analysis[0]
+                if !write_local_references(&mut rw, &state, &analysis, uri, offset, include_declaration) {
+                    match selected_member(&analysis, &cursor) {
+                        .Some(wanted) => {
+                            mut search := ReferenceSearch { scanned: Set<string>::new(), written: Set<string>::new(),
+                                include_declaration: include_declaration }
+                            _ := search.scanned.insert(path.clone())
+                            write_member_references(&mut rw, &state, &mut search, &analysis, &wanted)
+                            if wanted.public {
+                                scan_reference_file(&mut rw, &state, &mut search, wanted.path, &wanted, false)
+                                write_workspace_references(&mut rw, &state, &mut search, path, &wanted)
+                            }
+                        },
+                        .None => {},
+                    }
+                }
+            },
+        }
+    }
+    rw.end(); rw.end()
     res := jcompat.writer_finish(&rw)
     if res.ok { send_json(res.value) }
 }
@@ -1640,6 +2121,7 @@ fn handle_initialize(state: &mut State, doc: &json.Doc, id_node: i32, params: i3
     rw.key("codeActionProvider"); rw.boolean(true)
     rw.key("hoverProvider"); rw.boolean(true)
     rw.key("definitionProvider"); rw.boolean(true)
+    rw.key("referencesProvider"); rw.boolean(true)
     rw.key("documentSymbolProvider"); rw.boolean(true)
     rw.key("completionProvider"); rw.object()
     rw.key("triggerCharacters"); rw.array(); rw.string("."); rw.string(":"); rw.end()
@@ -1783,6 +2265,8 @@ pub fn run(default_target: i32) -> i32 {
             if has_id { handle_hover(&mut state, &doc, id_node, params) }
         } else if method == "textDocument/definition" {
             if has_id { handle_definition(&mut state, &doc, id_node, params) }
+        } else if method == "textDocument/references" {
+            if has_id { handle_references(&mut state, &doc, id_node, params) }
         } else if method == "textDocument/documentSymbol" {
             if has_id { handle_document_symbol(&state, &doc, id_node, params) }
         } else if method == "textDocument/completion" {
