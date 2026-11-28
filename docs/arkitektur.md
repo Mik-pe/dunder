@@ -20,6 +20,11 @@ Byggen för macOS och Linux kan bädda in DWARF v4-debuginformation (`-g`/`--deb
 samt använda [funktionscachen](incremental.md). `dunder lsp` föreslår
 `mut` vid tilldelning till en oföränderlig lokal variabel. När en importerad
 modul redigeras uppdateras diagnostiken även i de öppna filer som beror på den.
+Språkservern samlar ändringar som redan väntar på stdin och kontrollerar den
+senaste dokumentversionen. Komplettering, hovring och definitionsuppslag
+återanvänder den senaste analysen så länge källorna och paketinställningarna
+är desamma. Komplettering prioriterar lokala namn i räckvidd och använder
+mottagarens typ för att välja fält, instansmetoder och associerade funktioner.
 
 ## Språkets kostnadsmodell
 

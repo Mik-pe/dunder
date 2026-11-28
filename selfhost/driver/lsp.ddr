@@ -5,6 +5,7 @@ import cli
 import dependencies
 import fmt
 import json_compat as jcompat
+import lsp_positions as positions
 import manifest
 import modules
 import paths
@@ -49,6 +50,7 @@ unsafe fn frame_write(buffer: ptr, count: i32) -> i64 {
 struct FrameRead {
     ok: bool,
     eof: bool,
+    waiting: bool,
     body: string,
 }
 
@@ -56,11 +58,6 @@ struct HeaderSplit {
     found: bool,
     header_end: i32,
     body_start: i32,
-}
-
-struct Pos {
-    line: i32,
-    character: i32,
 }
 
 struct WordInfo {
@@ -71,17 +68,47 @@ struct WordInfo {
     has_dot: bool,
 }
 
+struct Binding {
+    name: string,
+    type_name: string,
+    module: i32,
+    start: i32,
+}
+
+struct TypeLocation { module: i32, name: string }
+
+struct ConfigInput {
+    path: string,
+    present: bool,
+    text: string,
+}
+
 struct Analysis {
-    ok: bool,
+    path: string,
+    project_dir: string,
+    config_inputs: []ConfigInput,
     loaded: modules.Loaded,
-    records: compiler.Bindings,
+    root: ast.Module,
+    lines: positions.LineIndex,
+    bindings: []Binding,
     diagnostics: []diag.Diagnostic,
+}
+
+enum CompletionScope { Plain, Dot, Static }
+
+struct CompletionContext {
+    scope: CompletionScope,
+    qualifier: string,
+    prefix: string,
+    start: i32,
+    end: i32,
 }
 
 struct CompletionEntry {
     label: string,
     kind: i32,
     detail: string,
+    priority: i32,
 }
 
 struct DiagnosticSnapshot {
@@ -93,10 +120,14 @@ struct DiagnosticSnapshot {
 struct State {
     default_target: i32,
     root_path: string,
+    encoding: positions.Encoding,
+    versioned_diagnostics: bool,
     doc_paths: []string,
     doc_uris: []string,
     doc_texts: []string,
+    doc_versions: []Option<i64>,
     snapshots: []DiagnosticSnapshot,
+    analysis: []Analysis,
     shutting_down: bool,
 }
 
@@ -104,10 +135,14 @@ fn new_state(default_target: i32) -> State {
     State {
         default_target: default_target,
         root_path: "",
+        encoding: .Utf16,
+        versioned_diagnostics: false,
         doc_paths: [],
         doc_uris: [],
         doc_texts: [],
+        doc_versions: [],
         snapshots: [],
+        analysis: [],
         shutting_down: false,
     }
 }
@@ -229,33 +264,43 @@ fn drop_prefix(rx: &mut []u8, count: i32) {
     rx = move rest
 }
 
-fn read_frame(rx: &mut []u8) -> FrameRead {
+fn read_ready_stdin(rx: &mut []u8, wait: bool) -> i32 {
+    if !wait {
+        mut fd: []u8 = [0, 0, 0, 0, 1, 0, 0, 0]
+        unsafe { if sys.fd_poll(&mut fd, 1, 0) <= 0 { return -2 } }
+    }
+    read_more_stdin(&mut rx)
+}
+
+fn read_frame(rx: &mut []u8, wait: bool) -> FrameRead {
     while true {
         split := find_header_end(&rx)
         if !split.found {
-            n := read_more_stdin(&mut rx)
-            if n <= 0 { return FrameRead { ok: false, eof: true, body: "" } }
+            n := read_ready_stdin(&mut rx, wait)
+            if n == -2 { return FrameRead { ok: false, eof: false, waiting: true, body: "" } }
+            if n <= 0 { return FrameRead { ok: false, eof: true, waiting: false, body: "" } }
             continue
         }
         hdr := match utf8.decode_range(&rx, 0, split.header_end) { .Ok(value) => value, .Err(_) => "" }
         content_len := parse_content_length(hdr)
         if content_len < 0 {
             drop_prefix(&mut rx, split.body_start)
-            return FrameRead { ok: false, eof: false, body: "" }
+            return FrameRead { ok: false, eof: false, waiting: false, body: "" }
         }
         needed := split.body_start + content_len
         while rx.len < needed {
-            n := read_more_stdin(&mut rx)
-            if n <= 0 { return FrameRead { ok: false, eof: true, body: "" } }
+            n := read_ready_stdin(&mut rx, wait)
+            if n == -2 { return FrameRead { ok: false, eof: false, waiting: true, body: "" } }
+            if n <= 0 { return FrameRead { ok: false, eof: true, waiting: false, body: "" } }
         }
         decoded := utf8.decode_range(&rx, split.body_start, needed)
         drop_prefix(&mut rx, needed)
         return match move decoded {
-            .Ok(body) => FrameRead { ok: true, eof: false, body: body },
-            .Err(_) => FrameRead { ok: false, eof: false, body: "" },
+            .Ok(body) => FrameRead { ok: true, eof: false, waiting: false, body: body },
+            .Err(_) => FrameRead { ok: false, eof: false, waiting: false, body: "" },
         }
     }
-    FrameRead { ok: false, eof: true, body: "" }
+    FrameRead { ok: false, eof: true, waiting: false, body: "" }
 }
 
 fn hex_digit(b: i32) -> i32 {
@@ -344,18 +389,20 @@ fn find_doc_index(state: &State, path: string) -> i32 {
     -1
 }
 
-fn set_doc(state: &mut State, uri: string, text_val: string) -> string {
+fn set_doc(state: &mut State, uri: string, text_val: string, version: Option<i64>) -> string {
     path := uri_to_path(uri)
     idx := find_doc_index(&state, path)
     if idx >= 0 {
         state.doc_uris[idx] = uri.clone()
         state.doc_texts[idx] = text_val.clone()
+        state.doc_versions[idx] = version
         return state.doc_paths[idx].clone()
     }
     state.snapshots.push(DiagnosticSnapshot { inputs: [], items: [], loaded: false })
     state.doc_paths.push(path.clone())
     state.doc_uris.push(uri.clone())
     state.doc_texts.push(text_val.clone())
+    state.doc_versions.push(version)
     path
 }
 
@@ -367,93 +414,30 @@ fn remove_doc(state: &mut State, uri: string) -> string {
     _ := state.doc_paths.remove(idx)
     _ := state.doc_uris.remove(idx)
     _ := state.doc_texts.remove(idx)
+    _ := state.doc_versions.remove(idx)
     _ := state.snapshots.remove(idx)
     removed
 }
 
-fn offset_to_pos(source: string, byte_off: i32) -> Pos {
-    mut clamped := byte_off
-    if clamped < 0 { clamped = 0 }
-    if clamped > source.len { clamped = source.len }
-    mut line := 0
-    mut col := 0
-    mut i := 0
-    while i < clamped {
-        b := source[i]
-        if b == 10 {
-            line += 1
-            col = 0
-            i += 1
-        } else if b == 13 {
-            if i + 1 < source.len && source[i + 1] == 10 {
-                i += 1
-            } else {
-                col += 1
-                i += 1
-            }
-        } else if b < 128 {
-            col += 1
-            i += 1
-        } else if b >= 240 {
-            col += 2
-            i += 4
-        } else if b >= 224 {
-            col += 1
-            i += 3
-        } else if b >= 192 {
-            col += 1
-            i += 2
-        } else {
-            i += 1
-        }
-    }
-    Pos { line: line, character: col }
+fn read_position(doc: &json.Doc, node: i32, lines: &positions.LineIndex, encoding: positions.Encoding) -> i32 {
+    line := jcompat.get_i64(&doc, node, "line")
+    column := jcompat.get_i64(&doc, node, "character")
+    if !line.ok || !column.ok { return -1 }
+    positions.offset(&lines, line.value, column.value, encoding)
 }
 
-fn pos_to_offset(source: string, target_line: i32, target_char: i32) -> i32 {
-    if target_line <= 0 && target_char <= 0 { return 0 }
-    mut line := 0
-    mut i := 0
-    while i < source.len && line < target_line {
-        if source[i] == 10 { line += 1 }
-        i += 1
-    }
-    if line < target_line { return source.len }
-    mut col := 0
-    while i < source.len && col < target_char {
-        b := source[i]
-        if b == 10 { break }
-        if b == 13 && i + 1 < source.len && source[i + 1] == 10 { break }
-        if b < 128 {
-            col += 1; i += 1
-        } else if b >= 240 {
-            col += 2; i += 4
-        } else if b >= 224 {
-            col += 1; i += 3
-        } else if b >= 192 {
-            col += 1; i += 2
-        } else {
-            i += 1
-        }
-    }
-    if i > source.len { return source.len }
-    i
-}
-
-fn write_pos(w: &mut json.Writer, pos: &Pos) {
+fn write_pos(w: &mut json.Writer, pos: &positions.Position) {
     w.object()
     w.key("line"); w.integer(i64(pos.line))
     w.key("character"); w.integer(i64(pos.character))
     w.end()
 }
 
-fn write_range(w: &mut json.Writer, source: string, start_off: i32, end_off: i32) {
-    mut s := start_off
-    mut e := end_off
-    if s < 0 { s = 0 }
-    if e < s { e = s }
-    sp := offset_to_pos(source, s)
-    ep := offset_to_pos(source, e)
+fn write_range(w: &mut json.Writer, lines: &positions.LineIndex, encoding: positions.Encoding, start_off: i32, end_off: i32) {
+    start := if start_off >= 0 { start_off } else { 0 }
+    end := if end_off >= start { end_off } else { start }
+    sp := positions.position(&lines, start, encoding)
+    ep := positions.position(&lines, end, encoding)
     w.object()
     w.key("start"); write_pos(&mut w, &sp)
     w.key("end"); write_pos(&mut w, &ep)
@@ -463,7 +447,8 @@ fn write_range(w: &mut json.Writer, source: string, start_off: i32, end_off: i32
 fn write_location(w: &mut json.Writer, state: &State, path: string, source: string, start_off: i32, end_off: i32) {
     w.object()
     w.key("uri"); w.string(path_to_uri(&state, path))
-    w.key("range"); write_range(&mut w, source, start_off, end_off)
+    lines := positions.index(source)
+    w.key("range"); write_range(&mut w, &lines, state.encoding, start_off, end_off)
     w.end()
 }
 
@@ -506,21 +491,34 @@ fn send_null_result(doc: &json.Doc, id_node: i32) {
     if res.ok { send_json(res.value) }
 }
 
-fn resolve_dep_graph(state: &State, doc_path: string) -> modules.DepGraph {
-    mut search_dir := dependencies.dir_of(doc_path)
-    if search_dir == "" || !sys.metadata(search_dir).is_dir {
+fn project_dir(state: &State, doc_path: string) -> string {
+    mut directory := dependencies.dir_of(doc_path)
+    if directory == "" || !sys.metadata(directory).is_dir {
         if state.root_path != "" && sys.metadata(state.root_path).is_dir {
-            search_dir = state.root_path.clone()
+            directory = state.root_path.clone()
         }
     }
-    manifest_dir := dependencies.find_manifest_dir(search_dir)
-    if manifest_dir == "" { return modules.empty_deps() }
-    toml_path := dependencies.path_in(manifest_dir, "dunder.toml")
-    if !sys.metadata(toml_path).is_file { return modules.empty_deps() }
+    dependencies.find_manifest_dir(directory)
+}
+
+fn config_input(path: string) -> ConfigInput {
+    read := sys.read_text(path)
+    ConfigInput { path: path.clone(), present: read.ok, text: read.value }
+}
+
+fn resolve_dep_graph(state: &State, directory: string, inputs: &mut []ConfigInput) -> modules.DepGraph {
+    if directory == "" { return modules.empty_deps() }
+    toml_path := dependencies.path_in(directory, "dunder.toml")
+    inputs.push(config_input(toml_path))
+    inputs.push(config_input(dependencies.path_in(directory, "dunder.lock")))
+    if !inputs[0].present { return modules.empty_deps() }
     parsed := manifest.parse(toml_path, true)
     if !parsed.ok { return modules.empty_deps() }
-    graph := dependencies.resolve(manifest_dir, toml_path, &parsed, true, false, false, state.default_target)
+    graph := dependencies.resolve(directory, toml_path, &parsed, true, true, false, state.default_target)
     if !graph.ok { return modules.empty_deps() }
+    for i in 1..graph.pkg_dirs.len {
+        inputs.push(config_input(dependencies.path_in(graph.pkg_dirs[i], "dunder.toml")))
+    }
     modules.DepGraph {
         pkg_dirs: graph.pkg_dirs,
         pkg_entries: graph.pkg_entries,
@@ -532,23 +530,83 @@ fn resolve_dep_graph(state: &State, doc_path: string) -> modules.DepGraph {
     }
 }
 
-fn analyze_doc(state: &State, doc_path: string) -> Analysis {
-    dep_graph := resolve_dep_graph(&state, doc_path)
-    lexing := modules.serial_lexing()
+fn binding_module(raw_type: string, loaded: &modules.Loaded) -> i32 {
+    name := base_type_name(raw_type)
+    prefix := "__dunder_module_"
+    if !text.starts_with(name, prefix) { return -1 }
+    id := parse.integer(name[prefix.len..name.len])
+    if !id.ok || id.value < 0 || id.value >= i64(loaded.symbol_owners.len) { return -1 }
+    loaded.symbol_owners[i32(id.value)]
+}
+
+fn build_analysis(state: &State, doc_path: string, directory: string) -> Analysis {
+    mut inputs: []ConfigInput = []
+    dep_graph := resolve_dep_graph(&state, directory, &mut inputs)
+    mut lexing := modules.serial_lexing()
+    lexing.symbol_owners = true
     mut session := compiler.new_session()
-    loaded := compiler.load_group_with_overlays_into(&mut session, doc_path, .Check, -1, false,
+    mut loaded := compiler.load_group_with_overlays_into(&mut session, doc_path, .Check, -1, false,
         &dep_graph, &lexing, &state.doc_paths, &state.doc_texts)
-    mut records := compiler.bindings()
-    if !loaded.ok {
-        items := agent.resolve_loader_diagnostics(&loaded)
-        return Analysis { ok: false, loaded: loaded, records: records, diagnostics: items }
+    source := source_for(&state, &loaded, doc_path)
+    root := parser.parse_source(doc_path, source)
+    lines := positions.index(source)
+    mut bindings: []Binding = []
+    mut items: []diag.Diagnostic = []
+    if loaded.ok {
+        mut records := compiler.bindings()
+        mut config := compiler.configuration()
+        config.workers = 1
+        result := compiler.compile_loaded(&mut session, state.default_target, &loaded.map_starts, &loaded.map_files,
+            true, true, &mut records, "", "", &config)
+        items = agent.resolve_compiler_diagnostics(&loaded, &result)
+        for i in 0..records.offsets.len {
+            loc := modules.location(&loaded, records.offsets[i])
+            if loc.path == loaded.paths[0] {
+                bindings.push(Binding { name: records.names[i].clone(),
+                    type_name: agent.public_name(records.types[i], &loaded.symbols),
+                    module: binding_module(records.types[i], &loaded), start: loc.offset })
+            }
+        }
+    } else {
+        items = agent.resolve_loader_diagnostics(&loaded)
     }
-    mut config := compiler.configuration()
-    config.workers = 1
-    result := compiler.compile_loaded(&mut session, state.default_target, &loaded.map_starts, &loaded.map_files,
-        true, true, &mut records, "", "", &config)
-    items := agent.resolve_compiler_diagnostics(&loaded, &result)
-    Analysis { ok: result.ok, loaded: loaded, records: records, diagnostics: items }
+    // Only the source-level data survives the compiler session.
+    loaded.map_starts = []
+    loaded.map_files = []
+    loaded.map_offsets = []
+    loaded.symbols = []
+    loaded.symbol_owners = []
+    Analysis { path: doc_path.clone(), project_dir: directory.clone(), config_inputs: inputs,
+        loaded: loaded, root: root, lines: lines, bindings: bindings, diagnostics: items }
+}
+
+fn analysis_is_current(state: &State, analysis: &Analysis, path: string, directory: string) -> bool {
+    if analysis.path != path || analysis.project_dir != directory || !analysis.loaded.ok { return false }
+    for input in &analysis.config_inputs {
+        current := sys.read_text(input.path)
+        if current.ok != input.present || current.value != input.text { return false }
+    }
+    for i in 0..analysis.loaded.paths.len {
+        module_path := analysis.loaded.paths[i].clone()
+        if !is_real_module_path(module_path) { continue }
+        idx := find_doc_index(&state, module_path)
+        if idx >= 0 {
+            if state.doc_texts[idx] != analysis.loaded.sources[i] { return false }
+        } else {
+            disk := sys.read_text(module_path)
+            if !disk.ok || disk.value != analysis.loaded.sources[i] { return false }
+        }
+    }
+    true
+}
+
+fn prepare_analysis(state: &mut State, path: string) {
+    directory := project_dir(&state, path)
+    if state.analysis.len > 0 && analysis_is_current(&state, &state.analysis[0], path, directory) { return }
+    // Features share one analysis so memory doesn't grow with the number of open documents.
+    state.analysis.clear()
+    analysis := build_analysis(&state, path, directory)
+    state.analysis.push(move analysis)
 }
 
 fn source_for(state: &State, loaded: &modules.Loaded, path: string) -> string {
@@ -576,17 +634,25 @@ fn push_unique(list: &mut []string, value: string) {
     if !contains_str(&list, value) { list.push(value.clone()) }
 }
 
-fn publish_diagnostics_for_uri(uri: string, source: string, items: &[]diag.Diagnostic) {
+fn publish_diagnostics_for_uri(state: &State, uri: string, source: string, items: &[]diag.Diagnostic) {
+    lines := positions.index(source)
     mut w := json.Writer::new()
     w.object()
     w.key("jsonrpc"); w.string("2.0")
     w.key("method"); w.string("textDocument/publishDiagnostics")
     w.key("params"); w.object()
     w.key("uri"); w.string(uri)
+    if state.versioned_diagnostics {
+        idx := find_doc_index(&state, uri_to_path(uri))
+        if idx >= 0 {
+            version := state.doc_versions[idx]
+            if version.is_some() { w.key("version"); w.integer(version.unwrap()) }
+        }
+    }
     w.key("diagnostics"); w.array()
     for d in &items {
         w.object()
-        w.key("range"); write_range(&mut w, source, d.start, d.end)
+        w.key("range"); write_range(&mut w, &lines, state.encoding, d.start, d.end)
         w.key("severity"); w.integer(if d.severity == .Error { 1 } else { 2 })
         if d.code != "" { w.key("code"); w.string(d.code) }
         w.key("source"); w.string("dunder")
@@ -637,22 +703,30 @@ fn doc_text(state: &State, path: string) -> string {
     sys.read_text(path).value
 }
 
-fn refresh_diagnostics(state: &mut State, path: string, uris: &mut []string) {
+fn refresh_diagnostics(state: &mut State, changed: &[]string, uris: &mut []string) {
     for i in 0..state.doc_paths.len {
-        if state.doc_paths[i] != path && !tracks(&state.snapshots[i], path) { continue }
+        mut affected := false
+        for path in &changed {
+            if state.doc_paths[i] == path || tracks(&state.snapshots[i], path) { affected = true; break }
+        }
+        if !affected { continue }
         snapshot_uris(&state, i, &mut uris)
-        analysis := analyze_doc(&state, state.doc_paths[i])
+        root_path := state.doc_paths[i].clone()
+        prepare_analysis(&mut state, root_path)
+        analysis := &state.analysis[0]
         mut inputs: []string = []
         for p in &analysis.loaded.paths {
             if is_real_module_path(p) { inputs.push(p.clone()) }
         }
-        state.snapshots[i] = DiagnosticSnapshot { inputs: inputs, items: analysis.diagnostics, loaded: analysis.loaded.ok }
+        mut items: []diag.Diagnostic = []
+        for d in &analysis.diagnostics { items.push(diag.clone_diag(&d)) }
+        state.snapshots[i] = DiagnosticSnapshot { inputs: inputs, items: items, loaded: analysis.loaded.ok }
         snapshot_uris(&state, i, &mut uris)
     }
     for uri in &uris {
         items := items_for_uri(&state, uri)
         source := if items.len > 0 { doc_text(&state, items[0].path) } else { "" }
-        publish_diagnostics_for_uri(uri, source, &items)
+        publish_diagnostics_for_uri(&state, uri, source, &items)
     }
 }
 
@@ -696,28 +770,41 @@ fn word_at(source: string, offset_in: i32) -> WordInfo {
     WordInfo { start: start, end: end, word: source[start..end], qualifier: qual, has_dot: has_dot }
 }
 
-fn completion_prefix(source: string, offset_in: i32) -> WordInfo {
-    mut off := offset_in
-    if off < 0 { off = 0 }
-    if off > source.len { off = source.len }
-    mut start := off
+fn completion_context(source: string, offset: i32) -> CompletionContext {
+    mut start := offset
+    mut end := offset
     while start > 0 && lexer.name_byte(i32(source[start - 1])) { start -= 1 }
-    mut has_dot := false
-    mut qual := ""
-    if start > 0 && i32(source[start - 1]) == 46 {
-        has_dot = true
-        qend := start - 1
-        mut qstart := qend
-        while qstart > 0 && lexer.name_byte(i32(source[qstart - 1])) { qstart -= 1 }
-        if qstart < qend { qual = source[qstart..qend] }
+    while end < source.len && lexer.name_byte(i32(source[end])) { end += 1 }
+    mut scope := CompletionScope.Plain
+    mut qualifier_end := start
+    if start > 0 && source[start - 1] == 46 {
+        scope = .Dot
+        qualifier_end = start - 1
+    } else if start >= 2 && source[start - 2..start] == "::" {
+        scope = .Static
+        qualifier_end = start - 2
     }
-    WordInfo { start: start, end: off, word: source[start..off], qualifier: qual, has_dot: has_dot }
+    mut qualifier_start := qualifier_end
+    if scope != .Plain {
+        while qualifier_start > 0 && lexer.name_byte(i32(source[qualifier_start - 1])) { qualifier_start -= 1 }
+        if scope == .Static && qualifier_start > 0 && source[qualifier_start - 1] == 46 {
+            qualifier_start -= 1
+            while qualifier_start > 0 && lexer.name_byte(i32(source[qualifier_start - 1])) { qualifier_start -= 1 }
+        }
+    }
+    CompletionContext { scope: scope, qualifier: source[qualifier_start..qualifier_end],
+        prefix: source[start..offset], start: start, end: end }
 }
 
 fn format_type(m: &ast.Module, ty_idx: i32) -> string {
     if ty_idx < 0 || ty_idx >= m.types.len { return "" }
     t := &m.types[ty_idx]
-    if t.kind == .Named || t.kind == .ConstArg { return t.name.clone() }
+    if t.kind == .Named || t.kind == .ConstArg || t.kind == .Tuple || t.kind == .FnType {
+        if t.span.start >= 0 && t.span.end > t.span.start && t.span.end <= m.source.len {
+            return m.source[t.span.start..t.span.end]
+        }
+        return t.name.clone()
+    }
     if t.kind == .Slice { return "[]" + format_type(&m, t.inner) }
     if t.kind == .FixedArray { return "[" + format_type(&m, t.inner) + "; " + t.count.str() + "]" }
     if t.kind == .Ref { return "&" + format_type(&m, t.inner) }
@@ -725,8 +812,6 @@ fn format_type(m: &ast.Module, ty_idx: i32) -> string {
     if t.kind == .RawConst { return "*const " + format_type(&m, t.inner) }
     if t.kind == .RawMut { return "*mut " + format_type(&m, t.inner) }
     if t.kind == .Unit { return "()" }
-    if t.kind == .Tuple { return "(...)" }
-    if t.kind == .FnType { return "fn(...)" }
     ""
 }
 
@@ -794,8 +879,15 @@ fn format_member_signature(m: &ast.Module, owner_idx: i32, mem_idx: i32) -> stri
     mut out := ""
     if mem.is_pub { out += "pub " }
     if mem.is_unsafe { out += "unsafe " }
-    ft := format_type(&m, mem.ty)
-    out + "fn " + mem.name + (if ft != "" { " -> " + ft } else { "" })
+    out += "fn " + mem.name + "("
+    for i in 0..mem.param_count {
+        if i > 0 { out += ", " }
+        param := &m.params[mem.first_param + i]
+        out += m.source[param.span.start..param.span.end]
+    }
+    out += ")"
+    rt := format_type(&m, mem.ty)
+    out + (if rt != "" && rt != "()" { " -> " + rt } else { "" })
 }
 
 fn base_type_name(raw_ty: string) -> string {
@@ -805,51 +897,56 @@ fn base_type_name(raw_ty: string) -> string {
         else if text.starts_with(s, "&") { s = text.trim(s[1..s.len]) }
         else { break }
     }
-    mut dot := -1
-    for i in 0..s.len { if s[i] == 46 { dot = i } }
-    if dot >= 0 && dot + 1 < s.len { return s[(dot + 1)..s.len] }
-    s
+    if text.starts_with(s, "[") { return s }
+    mut start := 0
+    mut end := s.len
+    for i in 0..s.len {
+        if s[i] == 60 { end = i; break }
+        if s[i] == 46 { start = i + 1 }
+    }
+    s[start..end]
 }
 
-fn find_binding_type_at(analysis: &Analysis, doc_path: string, name: string, offset: i32, enclose_start: i32, enclose_end: i32) -> string {
-    mut exact := ""
-    mut latest := ""
-    mut latest_off := -1
-    for i in 0..analysis.records.offsets.len {
-        if analysis.records.names[i] != name { continue }
-        loc := modules.location(&analysis.loaded, analysis.records.offsets[i])
-        if loc.path != doc_path && !sys.same_file(loc.path, doc_path) { continue }
-        ty := agent.public_name(analysis.records.types[i], &analysis.loaded.symbols)
-        if offset >= loc.offset && offset <= loc.offset + name.len {
-            exact = ty.clone()
-        }
-        if loc.offset >= enclose_start && loc.offset <= enclose_end && loc.offset <= offset + name.len && loc.offset >= latest_off {
-            latest = ty
-            latest_off = loc.offset
-        }
+fn in_span(span: ast.Span, offset: i32) -> bool {
+    offset >= span.start && offset < span.end
+}
+
+fn visible_at(root: &ast.Module, declaration: i32, cursor: i32) -> bool {
+    for expr in &root.exprs {
+        if (expr.kind == .BlockExpr || expr.kind == .UnsafeBlock || expr.kind == .Closure) &&
+            in_span(expr.span, declaration) && !in_span(expr.span, cursor) { return false }
     }
-    if exact != "" { return exact }
+    for arm in &root.match_arms {
+        if in_span(arm.span, declaration) && !in_span(arm.span, cursor) { return false }
+    }
+    for stmt in &root.stmts {
+        if stmt.kind == .For && in_span(stmt.span, declaration) && !in_span(stmt.span, cursor) { return false }
+    }
+    true
+}
+
+fn binding_at(analysis: &Analysis, name: string, offset: i32, enclose_start: i32, enclose_end: i32) -> i32 {
+    mut latest := -1
+    for i in 0..analysis.bindings.len {
+        b := &analysis.bindings[i]
+        if b.name != name || b.start < enclose_start || b.start > enclose_end || b.start > offset ||
+            !visible_at(&analysis.root, b.start, offset) { continue }
+        if latest < 0 || b.start > analysis.bindings[latest].start { latest = i }
+    }
     latest
 }
 
-fn find_binding_decl_offset(analysis: &Analysis, doc_path: string, name: string, offset: i32, enclose_start: i32, enclose_end: i32) -> i32 {
-    mut latest_off := -1
-    for i in 0..analysis.records.offsets.len {
-        if analysis.records.names[i] != name { continue }
-        loc := modules.location(&analysis.loaded, analysis.records.offsets[i])
-        if loc.path != doc_path && !sys.same_file(loc.path, doc_path) { continue }
-        if loc.offset >= enclose_start && loc.offset <= enclose_end && loc.offset <= offset + name.len && loc.offset >= latest_off {
-            latest_off = loc.offset
-        }
-    }
-    latest_off
+fn find_binding_type_at(analysis: &Analysis, name: string, offset: i32, enclose_start: i32, enclose_end: i32) -> string {
+    idx := binding_at(&analysis, name, offset, enclose_start, enclose_end)
+    if idx < 0 { return "" }
+    analysis.bindings[idx].type_name.clone()
 }
 
 fn is_real_module_path(path: string) -> bool {
     path != "" && path[0] != 60
 }
 
-fn handle_hover(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
+fn handle_hover(state: &mut State, doc: &json.Doc, id_node: i32, params: i32) {
     td := doc.field(params, "textDocument")
     pos_node := doc.field(params, "position")
     uri := jcompat.get_str(&doc, td, "uri").value
@@ -858,15 +955,18 @@ fn handle_hover(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     if uri == "" || !line.ok || !ch.ok { send_null_result(&doc, id_node); return }
 
     doc_path := uri_to_path(uri)
-    analysis := analyze_doc(&state, doc_path)
-    src := source_for(&state, &analysis.loaded, doc_path)
+    prepare_analysis(&mut state, doc_path)
+    analysis := &state.analysis[0]
+    src := analysis.root.source.clone()
     if src == "" { send_null_result(&doc, id_node); return }
 
-    off := pos_to_offset(src, i32(line.value), i32(ch.value))
+    lines := &analysis.lines
+    off := positions.offset(&lines, line.value, ch.value, state.encoding)
+    if off < 0 { send_null_result(&doc, id_node); return }
     w := word_at(src, off)
     if w.word == "" { send_null_result(&doc, id_node); return }
 
-    cur_mod := parser.parse_source(doc_path, src)
+    cur_mod := &analysis.root
     enc_idx := ast.find_item_at(&cur_mod, w.start)
     mut enc_start := 0
     mut enc_end := src.len
@@ -878,7 +978,7 @@ fn handle_hover(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     mut hover_text := ""
     if w.has_dot && w.qualifier != "" {
         imported := modules.imported_module(&analysis.loaded, 0, w.qualifier)
-        qual_ty := find_binding_type_at(&analysis, doc_path, w.qualifier, w.start, enc_start, enc_end)
+        qual_ty := find_binding_type_at(&analysis, w.qualifier, w.start, enc_start, enc_end)
         mut qual_base := base_type_name(qual_ty)
         if qual_base == "" && imported < 0 { qual_base = w.qualifier.clone() }
         // Search struct fields, enum variants, or impl methods for receiver type
@@ -911,7 +1011,7 @@ fn handle_hover(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     }
 
     if hover_text == "" && !w.has_dot {
-        bty := find_binding_type_at(&analysis, doc_path, w.word, w.start, enc_start, enc_end)
+        bty := find_binding_type_at(&analysis, w.word, w.start, enc_start, enc_end)
         if bty != "" { hover_text = w.word + ": " + bty }
     }
 
@@ -952,7 +1052,7 @@ fn handle_hover(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     rw.key("kind"); rw.string("markdown")
     rw.key("value"); rw.string("```dunder\n" + hover_text + "\n```")
     rw.end()
-    rw.key("range"); write_range(&mut rw, src, w.start, w.end)
+    rw.key("range"); write_range(&mut rw, &lines, state.encoding, w.start, w.end)
     rw.end(); rw.end()
     res := jcompat.writer_finish(&rw)
     if res.ok { send_json(res.value) }
@@ -973,7 +1073,7 @@ fn find_public_item(m: &ast.Module, name: string) -> i32 {
     if idx >= 0 && m.items[idx].is_pub { idx } else { -1 }
 }
 
-fn handle_definition(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
+fn handle_definition(state: &mut State, doc: &json.Doc, id_node: i32, params: i32) {
     td := doc.field(params, "textDocument")
     pos_node := doc.field(params, "position")
     uri := jcompat.get_str(&doc, td, "uri").value
@@ -982,15 +1082,18 @@ fn handle_definition(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     if uri == "" || !line.ok || !ch.ok { send_null_result(&doc, id_node); return }
 
     doc_path := uri_to_path(uri)
-    analysis := analyze_doc(&state, doc_path)
-    src := source_for(&state, &analysis.loaded, doc_path)
+    prepare_analysis(&mut state, doc_path)
+    analysis := &state.analysis[0]
+    src := analysis.root.source.clone()
     if src == "" { send_null_result(&doc, id_node); return }
 
-    off := pos_to_offset(src, i32(line.value), i32(ch.value))
+    lines := &analysis.lines
+    off := positions.offset(&lines, line.value, ch.value, state.encoding)
+    if off < 0 { send_null_result(&doc, id_node); return }
     w := word_at(src, off)
     if w.word == "" { send_null_result(&doc, id_node); return }
 
-    cur_mod := parser.parse_source(doc_path, src)
+    cur_mod := &analysis.root
     enc_idx := ast.find_item_at(&cur_mod, w.start)
     mut enc_start := 0
     mut enc_end := src.len
@@ -1008,7 +1111,7 @@ fn handle_definition(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     // 1. Member/impl method lookup when qualified with receiver or module alias
     if w.has_dot && w.qualifier != "" {
         imported := modules.imported_module(&analysis.loaded, 0, w.qualifier)
-        qual_ty := find_binding_type_at(&analysis, doc_path, w.qualifier, w.start, enc_start, enc_end)
+        qual_ty := find_binding_type_at(&analysis, w.qualifier, w.start, enc_start, enc_end)
         qual_base := base_type_name(qual_ty)
         if qual_base != "" {
             for m_i in 0..analysis.loaded.paths.len {
@@ -1063,7 +1166,8 @@ fn handle_definition(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
             }
         }
         if !found {
-            boff := find_binding_decl_offset(&analysis, doc_path, w.word, w.start, enc_start, enc_end)
+            bind := binding_at(&analysis, w.word, w.start, enc_start, enc_end)
+            boff := if bind >= 0 { analysis.bindings[bind].start } else { -1 }
             if boff >= 0 && (boff < w.start || boff > w.end) {
                 found = true
                 def_path = doc_path.clone(); def_src = src.clone()
@@ -1153,6 +1257,7 @@ fn handle_document_symbol(state: &State, doc: &json.Doc, id_node: i32, params: i
     rw.key("result"); rw.array()
     if src != "" {
         m := parser.parse_source(doc_path, src)
+        lines := positions.index(src)
         for i in 0..m.items.len {
             it := &m.items[i]
             if it.kind == .Import || it.kind == .Capability || it.kind == .ExternBlock { continue }
@@ -1166,8 +1271,8 @@ fn handle_document_symbol(state: &State, doc: &json.Doc, id_node: i32, params: i
             rw.key("name"); rw.string(label)
             rw.key("detail"); rw.string(format_item_signature(&m, i))
             rw.key("kind"); rw.integer(lsp_symbol_kind(it.kind))
-            rw.key("range"); write_range(&mut rw, src, it.span.start, it.span.end)
-            rw.key("selectionRange"); write_range(&mut rw, src, sel.start, sel.end)
+            rw.key("range"); write_range(&mut rw, &lines, state.encoding, it.span.start, it.span.end)
+            rw.key("selectionRange"); write_range(&mut rw, &lines, state.encoding, sel.start, sel.end)
             if it.member_count > 0 {
                 rw.key("children"); rw.array()
                 for k in 0..it.member_count {
@@ -1179,8 +1284,8 @@ fn handle_document_symbol(state: &State, doc: &json.Doc, id_node: i32, params: i
                     rw.object()
                     rw.key("name"); rw.string(mem.name)
                     rw.key("kind"); rw.integer(mkind)
-                    rw.key("range"); write_range(&mut rw, src, mem.span.start, mem.span.end)
-                    rw.key("selectionRange"); write_range(&mut rw, src, mem.span.start, mem.span.end)
+                    rw.key("range"); write_range(&mut rw, &lines, state.encoding, mem.span.start, mem.span.end)
+                    rw.key("selectionRange"); write_range(&mut rw, &lines, state.encoding, mem.span.start, mem.span.end)
                     rw.end()
                 }
                 rw.end()
@@ -1193,112 +1298,204 @@ fn handle_document_symbol(state: &State, doc: &json.Doc, id_node: i32, params: i
     if res.ok { send_json(res.value) }
 }
 
-fn add_completion(entries: &mut []CompletionEntry, seen: &mut []string, prefix: string, label: string, kind: i32, detail: string) {
-    if label == "" { return }
-    if prefix != "" && !text.starts_with(label, prefix) { return }
-    if contains_str(&seen, label) { return }
-    seen.push(label.clone())
-    entries.push(CompletionEntry { label: label.clone(), kind: kind, detail: detail.clone() })
+fn matches_completion(label: string, prefix: string) -> bool {
+    label != "" && (prefix == "" || text.starts_with(label, prefix))
 }
 
-fn handle_completion(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
-    td := doc.field(params, "textDocument")
-    pos_node := doc.field(params, "position")
-    uri := jcompat.get_str(&doc, td, "uri").value
-    line := jcompat.get_i64(&doc, pos_node, "line")
-    ch := jcompat.get_i64(&doc, pos_node, "character")
-    mut entries: []CompletionEntry = []
-    mut seen: []string = []
+fn add_completion(entries: &mut []CompletionEntry, seen: &mut Set<string>, prefix: string, label: string, kind: i32, detail: string, priority: i32) {
+    if !matches_completion(label, prefix) || !seen.insert(label.clone()) { return }
+    entries.push(CompletionEntry { label: label.clone(), kind: kind, detail: detail.clone(), priority: priority })
+}
 
-    if uri != "" && line.ok && ch.ok {
-        doc_path := uri_to_path(uri)
-        analysis := analyze_doc(&state, doc_path)
-        src := source_for(&state, &analysis.loaded, doc_path)
-        if src != "" {
-            off := pos_to_offset(src, i32(line.value), i32(ch.value))
-            ctx := completion_prefix(src, off)
-            cur_mod := parser.parse_source(doc_path, src)
-            enc_idx := ast.find_item_at(&cur_mod, off)
-            mut enc_start := 0
-            mut enc_end := src.len
-            if enc_idx >= 0 {
-                enc_start = cur_mod.items[enc_idx].span.start
-                enc_end = cur_mod.items[enc_idx].span.end
+fn completion_kind(kind: ast.ItemKind) -> i32 {
+    if kind == .Fn || kind == .ExternFn { return 3 }
+    if kind == .Struct || kind == .Union { return 22 }
+    if kind == .Enum { return 13 }
+    if kind == .TypeAlias || kind == .ExternType || kind == .Trait { return 7 }
+    21
+}
+
+fn import_alias(item: &ast.Item) -> string {
+    if item.name != item.target_name { return item.name.clone() }
+    mut start := 0
+    for i in 0..item.name.len {
+        if item.name[i] == 46 || item.name[i] == 47 { start = i + 1 }
+    }
+    item.name[start..item.name.len]
+}
+
+fn module_completions(entries: &mut []CompletionEntry, seen: &mut Set<string>, m: &ast.Module, prefix: string, external: bool) {
+    for i in 0..m.items.len {
+        item := &m.items[i]
+        if item.kind == .Capability || item.kind == .Impl || item.kind == .ExternBlock { continue }
+        if item.kind == .Import {
+            if external { continue }
+            alias := import_alias(&item)
+            if alias != "_" {
+                kind := if item.target_name.len > 0 && alias.len > 0 && alias[0] >= 65 && alias[0] <= 90 { 7 } else { 9 }
+                add_completion(&mut entries, &mut seen, prefix, alias, kind, "import " + item.target_name, 2)
             }
+            continue
+        }
+        if (external && !item.is_pub) || !matches_completion(item.name, prefix) { continue }
+        add_completion(&mut entries, &mut seen, prefix, item.name, completion_kind(item.kind), format_item_signature(&m, i), 2)
+    }
+}
 
-            if ctx.has_dot && ctx.qualifier != "" {
-                imported := modules.imported_module(&analysis.loaded, 0, ctx.qualifier)
-                qual_ty := find_binding_type_at(&analysis, doc_path, ctx.qualifier, off, enc_start, enc_end)
-                mut qual_base := base_type_name(qual_ty)
-                if qual_base == "" && imported < 0 { qual_base = ctx.qualifier.clone() }
-                for m_i in 0..analysis.loaded.paths.len {
-                    if qual_base == "" { break }
-                    parsed := parser.parse_source(analysis.loaded.paths[m_i], analysis.loaded.sources[m_i])
-                    for it_i in 0..parsed.items.len {
-                        it := &parsed.items[it_i]
-                        if ((it.kind == .Struct || it.kind == .Union || it.kind == .Enum) && it.name == qual_base) ||
-                           (it.kind == .Impl && base_type_name(it.target_name) == qual_base) {
-                            for k in 0..it.member_count {
-                                mem_idx := it.first_member + k
-                                mem := &parsed.members[mem_idx]
-                                ckind := if it.kind == .Struct || it.kind == .Union { 5 } else if it.kind == .Enum { 20 } else { 2 }
-                                add_completion(&mut entries, &mut seen, ctx.word, mem.name.clone(), ckind, format_member_signature(&parsed, it_i, mem_idx))
-                            }
-                        }
-                    }
-                }
-                if qual_ty == "" && imported >= 0 {
-                    parsed := parser.parse_source(analysis.loaded.paths[imported], analysis.loaded.sources[imported])
-                    for it_i in 0..parsed.items.len {
-                        it := &parsed.items[it_i]
-                        if !it.is_pub || it.name == "" || it.kind == .ExternBlock { continue }
-                        ckind := if it.kind == .Fn || it.kind == .ExternFn { 3 } else if it.kind == .Struct || it.kind == .Union || it.kind == .TypeAlias || it.kind == .ExternType { 22 } else if it.kind == .Enum { 13 } else { 21 }
-                        add_completion(&mut entries, &mut seen, ctx.word, it.name.clone(), ckind, format_item_signature(&parsed, it_i))
-                    }
-                }
-            } else {
-                // Local variables & parameters in enclosing item
-                if enc_idx >= 0 {
-                    enc := &cur_mod.items[enc_idx]
-                    for p in 0..enc.param_count {
-                        param := &cur_mod.params[enc.first_param + p]
-                        add_completion(&mut entries, &mut seen, ctx.word, param.name.clone(), 6, format_type(&cur_mod, param.ty))
-                    }
-                }
-                for b_i in 0..analysis.records.offsets.len {
-                    loc := modules.location(&analysis.loaded, analysis.records.offsets[b_i])
-                    if (loc.path == doc_path || sys.same_file(loc.path, doc_path)) &&
-                       loc.offset >= enc_start && loc.offset <= enc_end && loc.offset <= off {
-                        bname := analysis.records.names[b_i].clone()
-                        bty := agent.public_name(analysis.records.types[b_i], &analysis.loaded.symbols)
-                        add_completion(&mut entries, &mut seen, ctx.word, bname, 6, bty)
-                    }
-                }
-                // Top-level items in current + loaded modules
-                for it_i in 0..cur_mod.items.len {
-                    it := &cur_mod.items[it_i]
-                    if it.kind == .Import || it.kind == .Capability || it.kind == .Impl || it.kind == .ExternBlock { continue }
-                    ckind := if it.kind == .Fn || it.kind == .ExternFn { 3 } else if it.kind == .Struct || it.kind == .Union || it.kind == .TypeAlias || it.kind == .ExternType { 22 } else if it.kind == .Enum { 13 } else { 21 }
-                    add_completion(&mut entries, &mut seen, ctx.word, it.name.clone(), ckind, format_item_signature(&cur_mod, it_i))
-                }
-                for m_i in 0..analysis.loaded.paths.len {
-                    mp := analysis.loaded.paths[m_i].clone()
-                    if mp == doc_path { continue }
-                    parsed := parser.parse_source(mp, analysis.loaded.sources[m_i])
-                    for it_i in 0..parsed.items.len {
-                        it := &parsed.items[it_i]
-                        if !it.is_pub || it.kind == .Impl || it.kind == .ExternBlock { continue }
-                        ckind := if it.kind == .Fn || it.kind == .ExternFn { 3 } else if it.kind == .Struct || it.kind == .Union || it.kind == .TypeAlias || it.kind == .ExternType { 22 } else if it.kind == .Enum { 13 } else { 21 }
-                        add_completion(&mut entries, &mut seen, ctx.word, it.name.clone(), ckind, format_item_signature(&parsed, it_i))
-                    }
-                }
-                kws: []string = ["fn", "pub", "mut", "move", "struct", "enum", "trait", "impl", "if", "else", "while", "for", "in", "match", "return", "defer", "unsafe", "import", "capability", "true", "false"]
-                for kw in &kws { add_completion(&mut entries, &mut seen, ctx.word, kw.clone(), 14, "keyword") }
-                prims: []string = ["i16", "i32", "i64", "u8", "u32", "u64", "usize", "f64", "bool", "string", "Option", "Result"]
-                for pr in &prims { add_completion(&mut entries, &mut seen, ctx.word, pr.clone(), 7, "type") }
+fn declared_type(loaded: &modules.Loaded, m: &ast.Module, owner: i32, spelling: string) -> TypeLocation {
+    name := base_type_name(spelling)
+    if name.len < spelling.len {
+        for i in 0..spelling.len {
+            if spelling[i] == 60 { break }
+            if spelling[i] == 46 {
+                return TypeLocation { module: modules.imported_module(&loaded, owner, spelling[0..i]), name: name }
             }
         }
     }
+    for item in &m.items {
+        if item.kind == .Import && import_alias(&item) == name {
+            original := base_type_name(item.target_name)
+            imported := modules.imported_symbol_module(&loaded, owner, name, original)
+            if imported >= 0 { return TypeLocation { module: imported, name: original } }
+        } else if item.name == name && (item.kind == .Struct || item.kind == .Union || item.kind == .Enum || item.kind == .TypeAlias) {
+            return TypeLocation { module: owner, name: name }
+        }
+    }
+    TypeLocation { module: -1, name: name }
+}
+
+fn builtin_member_completions(entries: &mut []CompletionEntry, seen: &mut Set<string>, context: &CompletionContext, receiver: string) {
+    name := base_type_name(receiver)
+    if name == "string" || name == "str" {
+        add_completion(&mut entries, &mut seen, context.prefix, "len", 5, "len: i32", 1)
+        add_completion(&mut entries, &mut seen, context.prefix, "bytes", 2, "fn bytes() -> []u8", 1)
+        add_completion(&mut entries, &mut seen, context.prefix, "runes", 2, "fn runes() -> []rune", 1)
+        if name == "string" {
+            add_completion(&mut entries, &mut seen, context.prefix, "as_str", 2, "fn as_str() -> &str", 1)
+        } else {
+            add_completion(&mut entries, &mut seen, context.prefix, "as_bytes", 2, "fn as_bytes() -> &[]u8", 1)
+        }
+        add_completion(&mut entries, &mut seen, context.prefix, "clone", 2, "fn clone() -> string", 1)
+    } else if text.starts_with(name, "[") {
+        add_completion(&mut entries, &mut seen, context.prefix, "len", 5, "len: i32", 1)
+        add_completion(&mut entries, &mut seen, context.prefix, "cap", 2, "fn cap() -> i32", 1)
+    } else if name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "isize" ||
+        name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "usize" ||
+        name == "f32" || name == "f64" || name == "bool" || name == "rune" {
+        add_completion(&mut entries, &mut seen, context.prefix, "str", 2, "fn str() -> string", 1)
+    }
+}
+
+fn member_completions(entries: &mut []CompletionEntry, seen: &mut Set<string>, loaded: &modules.Loaded,
+    m: &ast.Module, owner: i32, context: &CompletionContext, wanted: &TypeLocation, instance: bool) {
+    external := owner != 0
+    same_type := wanted.module < 0 || wanted.module == owner
+    for i in 0..m.items.len {
+        item := &m.items[i]
+        fields := same_type && (item.kind == .Struct || item.kind == .Union) && item.name == wanted.name && instance
+        variants := same_type && item.kind == .Enum && item.name == wanted.name && !instance && context.scope == .Dot
+        mut methods := false
+        if item.kind == .Impl {
+            target := declared_type(&loaded, &m, owner, item.target_name)
+            methods = target.name == wanted.name && (wanted.module < 0 || wanted.module == target.module)
+        }
+        if !fields && !variants && !methods { continue }
+        if external && !methods && (!item.is_pub || item.is_opaque) { continue }
+        for j in 0..item.member_count {
+            member_index := item.first_member + j
+            member := &m.members[member_index]
+            if !matches_completion(member.name, context.prefix) { continue }
+            if methods {
+                has_receiver := member.param_count > 0 && m.params[member.first_param].receiver != .None
+                if (external && !member.is_pub) || has_receiver != instance || (!instance && context.scope != .Static) { continue }
+            }
+            kind := if fields { 5 } else if variants { 20 } else { 2 }
+            add_completion(&mut entries, &mut seen, context.prefix, member.name, kind, format_member_signature(&m, i, member_index), 1)
+        }
+    }
+}
+
+fn collect_completions(analysis: &Analysis, context: &CompletionContext, offset: i32) -> []CompletionEntry {
+    mut entries: []CompletionEntry = []
+    mut seen := Set<string>::new()
+    root := &analysis.root
+    enclosing := ast.find_item_at(&root, offset)
+    if context.scope == .Plain {
+        if enclosing >= 0 {
+            item := &root.items[enclosing]
+            mut i := analysis.bindings.len
+            while i > 0 {
+                i -= 1
+                binding := &analysis.bindings[i]
+                if binding.start >= item.span.start && binding.start < context.start &&
+                    visible_at(&root, binding.start, offset) {
+                    add_completion(&mut entries, &mut seen, context.prefix, binding.name, 6, binding.type_name, 1)
+                }
+            }
+            for p in 0..item.param_count {
+                param := &root.params[item.first_param + p]
+                if matches_completion(param.name, context.prefix) {
+                    add_completion(&mut entries, &mut seen, context.prefix, param.name, 6, format_type(&root, param.ty), 1)
+                }
+            }
+        }
+        module_completions(&mut entries, &mut seen, &root, context.prefix, false)
+        for builtin in ["print", "assert", "panic", "len"] {
+            add_completion(&mut entries, &mut seen, context.prefix, builtin, 3, "built-in", 3)
+        }
+        for keyword in ["fn", "pub", "mut", "move", "struct", "union", "enum", "trait", "impl", "if", "else",
+            "while", "for", "in", "match", "return", "break", "continue", "defer", "unsafe", "import", "capability", "true", "false"] {
+            add_completion(&mut entries, &mut seen, context.prefix, keyword, 14, "keyword", 4)
+        }
+        for primitive in ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool", "string", "Option", "Result"] {
+            add_completion(&mut entries, &mut seen, context.prefix, primitive, 7, "type", 4)
+        }
+        return entries
+    }
+
+    if context.qualifier == "" { return entries }
+    mut receiver := -1
+    if context.scope == .Dot && enclosing >= 0 {
+        sp := root.items[enclosing].span
+        receiver = binding_at(&analysis, context.qualifier, context.start, sp.start, sp.end)
+    }
+    imported := modules.imported_module(&analysis.loaded, 0, context.qualifier)
+    if context.scope == .Dot && receiver < 0 && imported >= 0 {
+        module := parser.parse_source(analysis.loaded.paths[imported], analysis.loaded.sources[imported])
+        module_completions(&mut entries, &mut seen, &module, context.prefix, true)
+        return entries
+    }
+    instance := receiver >= 0
+    mut spelling := context.qualifier.clone()
+    if spelling == "Self" && enclosing >= 0 && root.items[enclosing].kind == .Impl {
+        spelling = root.items[enclosing].target_name.clone()
+    }
+    mut wanted := declared_type(&analysis.loaded, &root, 0, spelling)
+    if instance {
+        binding := &analysis.bindings[receiver]
+        wanted = TypeLocation { module: binding.module, name: base_type_name(binding.type_name) }
+        if wanted.module < 0 { builtin_member_completions(&mut entries, &mut seen, &context, binding.type_name) }
+    }
+    member_completions(&mut entries, &mut seen, &analysis.loaded, &root, 0, &context, &wanted, instance)
+    for i in 1..analysis.loaded.paths.len {
+        source := &analysis.loaded.sources[i]
+        if !text.contains(source, wanted.name) || (wanted.module >= 0 && i != wanted.module && !text.contains(source, "impl")) { continue }
+        module := parser.parse_source(analysis.loaded.paths[i], source)
+        member_completions(&mut entries, &mut seen, &analysis.loaded, &module, i, &context, &wanted, instance)
+    }
+    entries
+}
+
+fn handle_completion(state: &mut State, doc: &json.Doc, id_node: i32, params: i32) {
+    td := doc.field(params, "textDocument")
+    uri := jcompat.get_str(&doc, td, "uri").value
+    if uri == "" { send_null_result(&doc, id_node); return }
+    prepare_analysis(&mut state, uri_to_path(uri))
+    analysis := &state.analysis[0]
+    offset := read_position(&doc, doc.field(params, "position"), &analysis.lines, state.encoding)
+    if offset < 0 { send_null_result(&doc, id_node); return }
+    context := completion_context(analysis.root.source, offset)
+    entries := collect_completions(&analysis, &context, offset)
 
     mut rw := json.Writer::new()
     rw.object()
@@ -1307,23 +1504,20 @@ fn handle_completion(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     rw.key("result"); rw.object()
     rw.key("isIncomplete"); rw.boolean(false)
     rw.key("items"); rw.array()
-    for e in &entries {
+    for entry in &entries {
         rw.object()
-        rw.key("label"); rw.string(e.label)
-        rw.key("kind"); rw.integer(i64(e.kind))
-        if e.detail != "" { rw.key("detail"); rw.string(e.detail) }
-        rw.end()
+        rw.key("label"); rw.string(entry.label)
+        rw.key("kind"); rw.integer(i64(entry.kind))
+        rw.key("sortText"); rw.string(entry.priority.str() + ":" + entry.label)
+        if entry.detail != "" { rw.key("detail"); rw.string(entry.detail) }
+        rw.key("textEdit"); rw.object()
+        rw.key("range"); write_range(&mut rw, &analysis.lines, state.encoding, context.start, context.end)
+        rw.key("newText"); rw.string(entry.label)
+        rw.end(); rw.end()
     }
     rw.end(); rw.end(); rw.end()
     res := jcompat.writer_finish(&rw)
     if res.ok { send_json(res.value) }
-}
-
-fn action_offset(doc: &json.Doc, node: i32, source: string) -> i32 {
-    line := jcompat.get_i64(&doc, node, "line")
-    col := jcompat.get_i64(&doc, node, "character")
-    if !line.ok || !col.ok || line.value < 0 || col.value < 0 || line.value > 2147483647 || col.value > 2147483647 { return -1 }
-    pos_to_offset(source, i32(line.value), i32(col.value))
 }
 
 fn handle_code_action(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
@@ -1331,8 +1525,9 @@ fn handle_code_action(state: &State, doc: &json.Doc, id_node: i32, params: i32) 
     uri := jcompat.get_str(&doc, td, "uri").value
     source := doc_text(&state, uri_to_path(uri))
     action_range := doc.field(params, "range")
-    start := action_offset(&doc, doc.field(action_range, "start"), source)
-    end := action_offset(&doc, doc.field(action_range, "end"), source)
+    lines := positions.index(source)
+    start := read_position(&doc, doc.field(action_range, "start"), &lines, state.encoding)
+    end := read_position(&doc, doc.field(action_range, "end"), &lines, state.encoding)
     only := doc.field(doc.field(params, "context"), "only")
     mut wanted := only < 0
     for i in 0..doc.count(only) {
@@ -1357,7 +1552,7 @@ fn handle_code_action(state: &State, doc: &json.Doc, id_node: i32, params: i32) 
             rw.object(); rw.key("title"); rw.string("Make '" + name + "' mutable")
             rw.key("kind"); rw.string("quickfix"); rw.key("isPreferred"); rw.boolean(true)
             rw.key("edit"); rw.object(); rw.key("changes"); rw.object(); rw.key(uri); rw.array()
-            rw.object(); rw.key("range"); write_range(&mut rw, source, d.note_start, d.note_start)
+            rw.object(); rw.key("range"); write_range(&mut rw, &lines, state.encoding, d.note_start, d.note_start)
             rw.key("newText"); rw.string("mut "); rw.end(); rw.end(); rw.end(); rw.end(); rw.end()
         }
     }
@@ -1396,7 +1591,8 @@ fn handle_formatting(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
     rw.key("result"); rw.array()
     if changed {
         rw.object()
-        rw.key("range"); write_range(&mut rw, original, 0, original.len)
+        lines := positions.index(original)
+        rw.key("range"); write_range(&mut rw, &lines, state.encoding, 0, original.len)
         rw.key("newText"); rw.string(formatted_text)
         rw.end()
     }
@@ -1406,6 +1602,18 @@ fn handle_formatting(state: &State, doc: &json.Doc, id_node: i32, params: i32) {
 }
 
 fn handle_initialize(state: &mut State, doc: &json.Doc, id_node: i32, params: i32) {
+    caps := doc.field(params, "capabilities")
+    encodings := doc.field(doc.field(caps, "general"), "positionEncodings")
+    state.encoding = .Utf16
+    for i in 0..doc.count(encodings) {
+        offered := jcompat.as_str(&doc, doc.at(encodings, i)).value
+        if offered == "utf-8" { state.encoding = .Utf8; break }
+        if offered == "utf-16" { break }
+        if offered == "utf-32" { state.encoding = .Utf32; break }
+    }
+    publish := doc.field(doc.field(caps, "textDocument"), "publishDiagnostics")
+    state.versioned_diagnostics = doc.get_bool(publish, "versionSupport").unwrap_or(false)
+
     root_uri := jcompat.get_str(&doc, params, "rootUri")
     if root_uri.ok && root_uri.value != "" {
         state.root_path = uri_to_path(root_uri.value)
@@ -1422,10 +1630,12 @@ fn handle_initialize(state: &mut State, doc: &json.Doc, id_node: i32, params: i3
     rw.key("id"); write_rpc_id(&mut rw, &doc, id_node)
     rw.key("result"); rw.object()
     rw.key("capabilities"); rw.object()
+    rw.key("positionEncoding")
+    rw.string(if state.encoding == .Utf8 { "utf-8" } else if state.encoding == .Utf32 { "utf-32" } else { "utf-16" })
     rw.key("textDocumentSync"); rw.object()
     rw.key("openClose"); rw.boolean(true)
     rw.key("change"); rw.integer(2)
-    rw.key("save"); rw.object(); rw.key("includeText"); rw.boolean(true); rw.end()
+    rw.key("save"); rw.boolean(true)
     rw.end()
     rw.key("codeActionProvider"); rw.boolean(true)
     rw.key("hoverProvider"); rw.boolean(true)
@@ -1445,25 +1655,17 @@ fn handle_initialize(state: &mut State, doc: &json.Doc, id_node: i32, params: i3
     if res.ok { send_json(res.value) }
 }
 
-fn apply_change(text_in: string, doc: &json.Doc, ch_node: i32) -> string {
+fn apply_change(text_in: string, doc: &json.Doc, ch_node: i32, encoding: positions.Encoding) -> Option<string> {
     new_text := jcompat.get_str(&doc, ch_node, "text")
-    if !new_text.ok { return text_in.clone() }
-    range_node := doc.field(ch_node, "range")
-    if range_node < 0 || doc.kind(range_node) != .Object {
-        return new_text.value
-    }
-    start_node := doc.field(range_node, "start")
-    end_node := doc.field(range_node, "end")
-    sl := jcompat.get_i64(&doc, start_node, "line")
-    sc := jcompat.get_i64(&doc, start_node, "character")
-    el := jcompat.get_i64(&doc, end_node, "line")
-    ec := jcompat.get_i64(&doc, end_node, "character")
-    if !sl.ok || !sc.ok || !el.ok || !ec.ok {
-        return new_text.value
-    }
-    s_off := pos_to_offset(text_in, i32(sl.value), i32(sc.value))
-    e_off := pos_to_offset(text_in, i32(el.value), i32(ec.value))
-    text_in[0..s_off] + new_text.value + text_in[e_off..text_in.len]
+    if !new_text.ok { return .None }
+    edit_range := doc.field(ch_node, "range")
+    if edit_range < 0 { return .Some(new_text.value) }
+    if doc.kind(edit_range) != .Object { return .None }
+    lines := positions.index(text_in)
+    start := read_position(&doc, doc.field(edit_range, "start"), &lines, encoding)
+    end := read_position(&doc, doc.field(edit_range, "end"), &lines, encoding)
+    if start < 0 || end < start { return .None }
+    .Some(text_in[0..start] + new_text.value + text_in[end..text_in.len])
 }
 
 fn handle_did_open(state: &mut State, doc: &json.Doc, params: i32) {
@@ -1471,42 +1673,41 @@ fn handle_did_open(state: &mut State, doc: &json.Doc, params: i32) {
     uri := jcompat.get_str(&doc, td, "uri").value
     txt := jcompat.get_str(&doc, td, "text")
     if uri == "" || !txt.ok { return }
-    path := set_doc(&mut state, uri, txt.value)
+    path := set_doc(&mut state, uri, txt.value, doc.get_i64(td, "version"))
     mut uris: []string = []
-    refresh_diagnostics(&mut state, path, &mut uris)
+    refresh_diagnostics(&mut state, &[path], &mut uris)
 }
 
-fn handle_did_change(state: &mut State, doc: &json.Doc, params: i32) {
+fn handle_did_change(state: &mut State, doc: &json.Doc, params: i32, changed: &mut []string) {
     td := doc.field(params, "textDocument")
     uri := jcompat.get_str(&doc, td, "uri").value
     changes := doc.field(params, "contentChanges")
-    if uri == "" || changes < 0 { return }
-    path := uri_to_path(uri)
-    idx := find_doc_index(&state, path)
-    mut cur := if idx >= 0 { state.doc_texts[idx].clone() } else { "" }
-    count := doc.count(changes)
-    for k in 0..count {
-        cur = apply_change(cur, &doc, doc.at(changes, k))
+    if uri == "" || doc.kind(changes) != .Array || doc.count(changes) == 0 { return }
+    idx := find_doc_index(&state, uri_to_path(uri))
+    if idx < 0 { return }
+    version := doc.get_i64(td, "version")
+    previous := state.doc_versions[idx]
+    if version.is_some() && previous.is_some() && version.unwrap() <= previous.unwrap() { return }
+    mut current := state.doc_texts[idx].clone()
+    for k in 0..doc.count(changes) {
+        current = match apply_change(current, &doc, doc.at(changes, k), state.encoding) {
+            .Some(updated) => move updated,
+            .None => { return },
+        }
     }
-    actual_path := set_doc(&mut state, uri, cur)
-    mut uris: []string = []
-    refresh_diagnostics(&mut state, actual_path, &mut uris)
+    state.doc_texts[idx] = move current
+    if version.is_some() { state.doc_versions[idx] = version }
+    push_unique(&mut changed, state.doc_paths[idx])
 }
 
 fn handle_did_save(state: &mut State, doc: &json.Doc, params: i32) {
     td := doc.field(params, "textDocument")
     uri := jcompat.get_str(&doc, td, "uri").value
     if uri == "" { return }
-    txt := jcompat.get_str(&doc, params, "text")
-    mut path := uri_to_path(uri)
-    if txt.ok {
-        path = set_doc(&mut state, uri, txt.value)
-    } else {
-        disk := sys.read_text(path)
-        if disk.ok { path = set_doc(&mut state, uri, disk.value) }
-    }
+    idx := find_doc_index(&state, uri_to_path(uri))
+    path := if idx >= 0 { state.doc_paths[idx].clone() } else { uri_to_path(uri) }
     mut uris: []string = []
-    refresh_diagnostics(&mut state, path, &mut uris)
+    refresh_diagnostics(&mut state, &[path], &mut uris)
 }
 
 fn handle_did_close(state: &mut State, doc: &json.Doc, params: i32) {
@@ -1518,7 +1719,8 @@ fn handle_did_close(state: &mut State, doc: &json.Doc, params: i32) {
     mut uris: []string = []
     snapshot_uris(&state, idx, &mut uris)
     path := remove_doc(&mut state, uri)
-    refresh_diagnostics(&mut state, path, &mut uris)
+    if state.analysis.len > 0 && state.analysis[0].path == path { state.analysis.clear() }
+    refresh_diagnostics(&mut state, &[path], &mut uris)
 }
 
 fn configure_stdio() -> bool {
@@ -1527,14 +1729,23 @@ fn configure_stdio() -> bool {
     else { unsafe { return set_mode(0, 32768) >= 0 && set_mode(1, 32768) >= 0 } }
 }
 
+fn publish_pending(state: &mut State, changed: &mut []string) {
+    if changed.len == 0 { return }
+    mut uris: []string = []
+    refresh_diagnostics(&mut state, &changed, &mut uris)
+    changed.clear()
+}
+
 pub fn run(default_target: i32) -> i32 {
     if !configure_stdio() { return 1 }
     mut state := new_state(default_target)
     mut rx: []u8 = []
+    mut changed: []string = []
     while true {
-        frame := read_frame(&mut rx)
+        frame := read_frame(&mut rx, changed.len == 0)
         if !frame.ok {
             if frame.eof { break }
+            if frame.waiting { publish_pending(&mut state, &mut changed) }
             continue
         }
         doc := json.Doc::parse_text(frame.body)
@@ -1546,6 +1757,9 @@ pub fn run(default_target: i32) -> i32 {
         has_id := id_node >= 0
         params := doc.field(doc.root, "params")
 
+        if method != "textDocument/didChange" {
+            publish_pending(&mut state, &mut changed)
+        }
         if method == "initialize" {
             handle_initialize(&mut state, &doc, id_node, params)
         } else if method == "initialized" {
@@ -1558,7 +1772,7 @@ pub fn run(default_target: i32) -> i32 {
         } else if method == "textDocument/didOpen" {
             handle_did_open(&mut state, &doc, params)
         } else if method == "textDocument/didChange" {
-            handle_did_change(&mut state, &doc, params)
+            handle_did_change(&mut state, &doc, params, &mut changed)
         } else if method == "textDocument/didSave" {
             handle_did_save(&mut state, &doc, params)
         } else if method == "textDocument/didClose" {
@@ -1566,13 +1780,13 @@ pub fn run(default_target: i32) -> i32 {
         } else if method == "textDocument/codeAction" {
             if has_id { handle_code_action(&state, &doc, id_node, params) }
         } else if method == "textDocument/hover" {
-            if has_id { handle_hover(&state, &doc, id_node, params) }
+            if has_id { handle_hover(&mut state, &doc, id_node, params) }
         } else if method == "textDocument/definition" {
-            if has_id { handle_definition(&state, &doc, id_node, params) }
+            if has_id { handle_definition(&mut state, &doc, id_node, params) }
         } else if method == "textDocument/documentSymbol" {
             if has_id { handle_document_symbol(&state, &doc, id_node, params) }
         } else if method == "textDocument/completion" {
-            if has_id { handle_completion(&state, &doc, id_node, params) }
+            if has_id { handle_completion(&mut state, &doc, id_node, params) }
         } else if method == "textDocument/formatting" {
             if has_id { handle_formatting(&state, &doc, id_node, params) }
         } else {
@@ -1584,18 +1798,20 @@ pub fn run(default_target: i32) -> i32 {
 
 @test fn lsp_positions_and_uri_round_trip() {
     src := "fn main() {\n    x := 1\n}\n"
-    off := pos_to_offset(src, 1, 4)
+    lines := positions.index(src)
+    off := positions.offset(&lines, 1, 4, .Utf16)
     assert(src[off..off + 1] == "x")
-    p := offset_to_pos(src, off)
+    p := positions.position(&lines, off, .Utf16)
     assert(p.line == 1 && p.character == 4)
 
     w := word_at("foo.bar(x)", 5)
     assert(w.word == "bar" && w.has_dot && w.qualifier == "foo")
     qualified := "mått.öka"
-    word := word_at(qualified, pos_to_offset(qualified, 0, 5))
+    qualified_lines := positions.index(qualified)
+    word := word_at(qualified, positions.offset(&qualified_lines, 0, 5, .Utf16))
     assert(word.word == "öka" && word.qualifier == "mått")
-    prefix := completion_prefix(qualified, pos_to_offset(qualified, 0, 6))
-    assert(prefix.word == "ö" && prefix.qualifier == "mått")
+    prefix := completion_context(qualified, positions.offset(&qualified_lines, 0, 6, .Utf16))
+    assert(prefix.prefix == "ö" && prefix.qualifier == "mått" && prefix.end == qualified.len)
 
     assert(uri_to_path("file:///tmp/hello%20world/main.ddr") == "/tmp/hello world/main.ddr")
     state := new_state(5)
