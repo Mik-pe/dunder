@@ -120,40 +120,77 @@ pub fn check_program_escapes(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags:
 
     mut exposes_fn: []u64 = []
     for _ in 0..max_fn { exposes_fn.push(u64(0)) }
+    mut exposing_bodies: []i32 = []
+    mut in_exposing: []bool = []
+    for _ in 0..n_bodies { in_exposing.push(false) }
 
     // Precompute local provenance masks for every body.
     mut all_masks: [][]u64 = []
     // Also track closure fn_ids created by RvalueKind.Closure in each body (maps local -> closure fn_id, -1 if none/unknown).
     mut all_closure_targets: [][]i32 = []
+    mut has_any_region := false
 
     for bi in 0..n_bodies {
         b := &bodies[bi]
-        masks := compute_local_masks(&prog.types, &b)
-        mut cl_targets: []i32 = []
-        for _ in 0..b.locals.len { cl_targets.push(-1) }
-        for bb in 0..b.blocks.len {
-            blk := b.blocks[bb]
-            for si in blk.stmt_start..blk.stmt_end {
-                st := b.stmts[si]
-                if st.kind != .Assign { continue }
-                rv := b.rvalues[st.rvalue]
-                if rv.kind == .Closure {
-                    cl_targets[b.places[st.place].local] = rv.a
-                } else if rv.kind == .Use || rv.kind == .Cast {
-                    op := b.ops[rv.a]
-                    if op.kind != .Const {
-                        src_loc := b.places[op.id].local
-                        if cl_targets[src_loc] >= 0 { cl_targets[b.places[st.place].local] = cl_targets[src_loc] }
-                    }
-                } else if rv.kind == .AddrOf {
-                    // Base case: taking raw address of a place exposes every parameter flowing into that place!
-                    pm := masks[b.places[rv.a].local].bit_and(param_mask())
-                    exposes_fn[b.fn_id] = exposes_fn[b.fn_id].bit_or(pm)
+        mut body_interesting := false
+        for l in 0..b.locals.len {
+            ty := b.locals[l].ty
+            if ty >= 0 && ty < prog.types.entries.len && prog.types.entries[ty].kind == .RegionSlice {
+                has_any_region = true; body_interesting = true; break
+            }
+        }
+        if !body_interesting {
+            for rvi in 0..b.rvalues.len {
+                rk := b.rvalues[rvi].kind
+                if rk == .AddrOf || rk == .Closure { body_interesting = true; break }
+                if (rk == .Ref || rk == .Slice || rk == .BytesView) && b.loans[b.rvalues[rvi].a].region_scope >= 0 {
+                    has_any_region = true; body_interesting = true; break
                 }
+            }
+        }
+        mut masks: []u64 = []
+        mut cl_targets: []i32 = []
+        if body_interesting {
+            masks = compute_local_masks(&prog.types, &b)
+            for _ in 0..b.locals.len { cl_targets.push(-1) }
+            for bb in 0..b.blocks.len {
+                blk := b.blocks[bb]
+                for si in blk.stmt_start..blk.stmt_end {
+                    st := b.stmts[si]
+                    if st.kind != .Assign { continue }
+                    rv := b.rvalues[st.rvalue]
+                    if rv.kind == .Closure {
+                        cl_targets[b.places[st.place].local] = rv.a
+                    } else if rv.kind == .Use || rv.kind == .Cast {
+                        op := b.ops[rv.a]
+                        if op.kind != .Const {
+                            src_loc := b.places[op.id].local
+                            if cl_targets[src_loc] >= 0 { cl_targets[b.places[st.place].local] = cl_targets[src_loc] }
+                        }
+                    } else if rv.kind == .AddrOf {
+                        // Base case: taking raw address of a place exposes every parameter flowing into that place!
+                        pm := masks[b.places[rv.a].local].bit_and(param_mask())
+                        exposes_fn[b.fn_id] = exposes_fn[b.fn_id].bit_or(pm)
+                    }
+                }
+            }
+            if exposes_fn[b.fn_id] != u64(0) {
+                in_exposing[bi] = true
+                exposing_bodies.push(bi)
             }
         }
         all_masks.push(move masks)
         all_closure_targets.push(move cl_targets)
+    }
+
+    // Fast exit: if no body uses regions or exposes any parameter address, no E4005 is possible!
+    if !has_any_region || exposing_bodies.len == 0 { return true }
+
+    // Ensure masks are computed for any body that might transitively call an exposing function
+    for bi in 0..n_bodies {
+        if all_masks[bi].len == 0 {
+            all_masks[bi] = compute_local_masks(&prog.types, &bodies[bi])
+        }
     }
 
     // Interprocedural fixed-point propagation over BOTH direct and indirect/closure calls.
@@ -180,9 +217,10 @@ pub fn check_program_escapes(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags:
                             cmask = cmask.bit_or(exposes_fn[cl_targets[cl_loc]])
                         }
                     }
-                    // Also union all bodies with compatible canonical signature (unifying FnPtr & ClosureEnv — fixes S-12!)
+                    // Also union all exposing bodies with compatible canonical signature (unifying FnPtr & ClosureEnv — fixes S-12!)
                     if tm.sig_ty >= 0 {
-                        for ob in 0..n_bodies {
+                        for ei in 0..exposing_bodies.len {
+                            ob := exposing_bodies[ei]
                             if sigs_compatible(&prog.types, tm.sig_ty, bodies[ob].sig_ty) {
                                 cmask = cmask.bit_or(exposes_fn[bodies[ob].fn_id])
                             }
@@ -199,7 +237,14 @@ pub fn check_program_escapes(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags:
                 }
                 old := exposes_fn[b.fn_id]
                 nw := old.bit_or(extra)
-                if nw != old { exposes_fn[b.fn_id] = nw; changed = true }
+                if nw != old {
+                    exposes_fn[b.fn_id] = nw
+                    if !in_exposing[bi] {
+                        in_exposing[bi] = true
+                        exposing_bodies.push(bi)
+                    }
+                    changed = true
+                }
             }
         }
     }
@@ -224,7 +269,8 @@ pub fn check_program_escapes(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags:
                     }
                 }
                 if tm.sig_ty >= 0 {
-                    for ob in 0..n_bodies {
+                    for ei in 0..exposing_bodies.len {
+                        ob := exposing_bodies[ei]
                         if sigs_compatible(&prog.types, tm.sig_ty, bodies[ob].sig_ty) {
                             cmask = cmask.bit_or(exposes_fn[bodies[ob].fn_id])
                         }

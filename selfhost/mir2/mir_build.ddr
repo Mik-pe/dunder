@@ -671,29 +671,53 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
             next_arm_bb := if ai + 1 < arm_count { mb.add_block(&mut b.body, cur_scope(&b)) } else { join_bb }
             pat := &f.pats[pat_id]
             is_last_arm := ai + 1 >= arm_count
+            if pat.kind == .Or && pat.child_len > 0 {
+                // OR-pattern: check each alternative -> bind in its own branch -> jump to shared arm_bb
+                for oi in 0..pat.child_len {
+                    alt_id := f.pat_list[pat.child_start + oi]
+                    alt_ok := mb.add_block(&mut b.body, cur_scope(&b))
+                    alt_fail := if oi + 1 < pat.child_len { mb.add_block(&mut b.body, cur_scope(&b)) } else { next_arm_bb }
+                    emit_pat_check(&mut b, &prog, &f, alt_id, subj_pl, if is_enum { discr_op } else { -1 }, alt_ok, alt_fail)
+                    b.cur_bb = alt_ok; b.terminated = false
+                    lower_pat_bind(&mut b, &prog, &f, alt_id, subj_pl, e.b == 1, false, false)
+                    emit_goto(&mut b, arm_bb, pat.span_start, pat.span_end)
+                    b.cur_bb = alt_fail; b.terminated = false
+                }
+                b.cur_bb = arm_bb; b.terminated = false
+                sid := push_scope(&mut b, .Lexical, -1, -1)
+                arm_depth := b.scope_stack.len - 1
+                if guard_e >= 0 {
+                    lock_start := push_match_guard_locks(&mut b, &prog, &f, f.pat_list[pat.child_start], arm_depth, pat.span_start, pat.span_end)
+                    g_op := lower_expr_to_op(&mut b, &prog, &f, guard_e)
+                    release_match_guard_locks(&mut b, &prog.types, lock_start, pat.span_start, pat.span_end)
+                    body_bb := mb.add_block(&mut b.body, sid)
+                    g_fail_bb := mb.add_block(&mut b.body, sid)
+                    g_vals: []i64 = [1]
+                    g_bbs: []i32 = [body_bb]
+                    g_sw := mb.push_switch_targets(&mut b.body, &g_vals, &g_bbs)
+                    _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                        kind: .SwitchInt, call_kind: .Direct, target_bb: g_fail_bb, place_or_op: g_op,
+                        callee: -1, sig_ty: -1, arg_start: g_sw, arg_len: 1,
+                        in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+                    })
+                    b.cur_bb = g_fail_bb; b.terminated = false
+                    emit_unwind_to(&mut b, &prog.types, arm_depth, next_arm_bb, pat.span_start, pat.span_end)
+                    b.cur_bb = body_bb; b.terminated = false
+                }
+                if body_e >= 0 {
+                    lower_expr_into(&mut b, &prog, &f, body_e, dest_place)
+                }
+                if !b.terminated {
+                    emit_unwind_to(&mut b, &prog.types, arm_depth, join_bb, pat.span_start, pat.span_end)
+                }
+                pop_scope(&mut b)
+                b.cur_bb = next_arm_bb; b.terminated = false
+                continue
+            }
             if is_last_arm && guard_e < 0 {
                 emit_goto(&mut b, arm_bb, pat.span_start, pat.span_end)
-            } else if is_enum && pat.kind == .Variant && discr_op >= 0 {
-                vals: []i64 = [i64(pat.tag)]
-                bbs: []i32 = [arm_bb]
-                sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
-                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
-                    kind: .SwitchInt, call_kind: .Direct, target_bb: next_arm_bb, place_or_op: discr_op,
-                    callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
-                    in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
-                })
-            } else if pat.kind == .Lit {
-                s_op := mb.add_op(&mut b.body, .Copy, subj_pl)
-                vals: []i64 = [i64(pat.tag)]
-                bbs: []i32 = [arm_bb]
-                sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
-                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
-                    kind: .SwitchInt, call_kind: .Direct, target_bb: next_arm_bb, place_or_op: s_op,
-                    callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
-                    in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
-                })
             } else {
-                emit_goto(&mut b, arm_bb, pat.span_start, pat.span_end)
+                emit_pat_check(&mut b, &prog, &f, pat_id, subj_pl, if is_enum { discr_op } else { -1 }, arm_bb, next_arm_bb)
             }
             b.cur_bb = arm_bb; b.terminated = false
             sid := push_scope(&mut b, .Lexical, -1, -1)
@@ -941,6 +965,94 @@ fn release_match_guard_locks(b: &mut Builder, types: &ht.TypeTable, lock_start: 
     }
 }
 
+fn emit_pat_check(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i32,
+    subj_pl: i32, pre_discr_op: i32, ok_bb: i32, fail_bb: i32) {
+    if pat_id < 0 || pat_id >= f.pats.len {
+        emit_goto(&mut b, ok_bb, 0, 0)
+        return
+    }
+    pat := &f.pats[pat_id]
+    subj_ty := b.body.places[subj_pl].ty
+    empty_ops: []i32 = []
+    if pat.kind == .Variant && subj_ty >= 0 && subj_ty < prog.types.entries.len && prog.types.entries[subj_ty].kind == .Enum {
+        mut d_op := pre_discr_op
+        if d_op < 0 {
+            d_loc := new_temp(&mut b, &prog.types, ht.TY_I32, pat.span_start, pat.span_end)
+            d_pl := mb.add_local_place(&mut b.body, d_loc)
+            s_op := mb.add_op(&mut b.body, .Copy, subj_pl)
+            rv_d := mb.add_rvalue(&mut b.body, .Discriminant, ht.TY_I32, s_op, -1, &empty_ops)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .Assign, place: d_pl, rvalue: rv_d, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: pat.span_start, span_end: pat.span_end,
+            })
+            d_op = mb.add_op(&mut b.body, .Copy, d_pl)
+        }
+        mut has_sub_check := false
+        for ci in 0..pat.child_len {
+            cp := &f.pats[f.pat_list[pat.child_start + ci]]
+            if cp.kind != .Wild && cp.kind != .Bind { has_sub_check = true; break }
+        }
+        next_bb := if has_sub_check { mb.add_block(&mut b.body, cur_scope(&b)) } else { ok_bb }
+        te := &prog.types.entries[subj_ty]
+        tag_v := if pat.tag >= 0 && pat.tag < te.count { prog.types.variants[te.inner_a + pat.tag].tag_value } else { i64(pat.tag) }
+        vals: []i64 = [tag_v]
+        bbs: []i32 = [next_bb]
+        sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
+        _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+            kind: .SwitchInt, call_kind: .Direct, target_bb: fail_bb, place_or_op: d_op,
+            callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
+            in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+        })
+        if !has_sub_check { return }
+        b.cur_bb = next_bb; b.terminated = false
+        dc := mb.add_projected_place(&mut b.body, subj_pl, .Downcast, pat.tag, subj_ty)
+        for ci in 0..pat.child_len {
+            cid := f.pat_list[pat.child_start + ci]
+            cp := &f.pats[cid]
+            if cp.kind == .Wild || cp.kind == .Bind { continue }
+            pty := ht.variant_payload_type(&prog.types, subj_ty, pat.tag, ci)
+            if pty >= 0 {
+                ppl := mb.add_projected_place(&mut b.body, dc, .Field, ci, pty)
+                step_bb := mb.add_block(&mut b.body, cur_scope(&b))
+                emit_pat_check(&mut b, &prog, &f, cid, ppl, -1, step_bb, fail_bb)
+                b.cur_bb = step_bb; b.terminated = false
+            }
+        }
+        emit_goto(&mut b, ok_bb, pat.span_start, pat.span_end)
+        return
+    }
+    if pat.kind == .Lit {
+        s_op := mb.add_op(&mut b.body, .Copy, subj_pl)
+        vals: []i64 = [i64(pat.tag)]
+        bbs: []i32 = [ok_bb]
+        sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
+        _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+            kind: .SwitchInt, call_kind: .Direct, target_bb: fail_bb, place_or_op: s_op,
+            callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
+            in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+        })
+        return
+    }
+    if pat.kind == .Tuple || pat.kind == .Struct {
+        for ci in 0..pat.child_len {
+            cid := f.pat_list[pat.child_start + ci]
+            cp := &f.pats[cid]
+            if cp.kind == .Wild || cp.kind == .Bind { continue }
+            fidx := if pat.kind == .Struct { cp.tag } else { ci }
+            fty := ht.field_type(&prog.types, subj_ty, fidx)
+            if fty >= 0 {
+                fpl := mb.add_projected_place(&mut b.body, subj_pl, .Field, fidx, fty)
+                step_bb := mb.add_block(&mut b.body, cur_scope(&b))
+                emit_pat_check(&mut b, &prog, &f, cid, fpl, -1, step_bb, fail_bb)
+                b.cur_bb = step_bb; b.terminated = false
+            }
+        }
+        emit_goto(&mut b, ok_bb, pat.span_start, pat.span_end)
+        return
+    }
+    emit_goto(&mut b, ok_bb, pat.span_start, pat.span_end)
+}
+
 fn lower_pat_bind(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i32, subj_pl: i32, is_move: bool, for_guard: bool, commit_only: bool) {
     if pat_id < 0 || pat_id >= f.pats.len { return }
     pat := &f.pats[pat_id]
@@ -965,6 +1077,19 @@ fn lower_pat_bind(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i
             kind: .StorageLive, place: ml, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
             span_start: pat.span_start, span_end: pat.span_end,
         })
+        dst_ty := b.body.locals[ml].ty
+        if dst_ty >= 0 && dst_ty < prog.types.entries.len &&
+            prog.types.entries[dst_ty].kind == .MutRef && prog.types.entries[dst_ty].inner_a == pty {
+            rel := b.body.blocks[b.cur_bb].stmt_end - b.body.blocks[b.cur_bb].stmt_start
+            ln := mb.add_loan(&mut b.body, subj_pl, .Mut, b.cur_bb, rel, b.cur_region_scope, -1, pat.span_start, pat.span_end)
+            rv_ref := mb.add_rvalue(&mut b.body, .Ref, dst_ty, ln, -1, &empty_ops)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .Assign, place: dst_pl, rvalue: rv_ref, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: pat.span_start, span_end: pat.span_end,
+            })
+            b.scope_all_locals.push(ml)
+            return
+        }
         op_k: mb.OpKind = if do_move { .Move } else { .Copy }
         op := mb.add_op(&mut b.body, op_k, subj_pl)
         rv := mb.add_rvalue(&mut b.body, .Use, pty, op, -1, &empty_ops)

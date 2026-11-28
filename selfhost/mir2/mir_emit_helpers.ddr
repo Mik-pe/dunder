@@ -7,6 +7,7 @@
 
 import ..backend.arm64 as arm
 import ..backend.ffi_arm64 as abi
+import ..backend.floats as floats
 import ..runtime.runtime as runtime
 import ..runtime.runtime_intrinsic as ri
 import ..hir.hir_types as ht
@@ -26,6 +27,7 @@ pub struct EmitHelpers {
     trap_panic: i32,
     trap_unreachable: i32,
     eprint_text: i32,
+    fmt_float_label: i32,
     closure_drop: i32,
     map_new: i32,
     map_drop: i32,
@@ -41,6 +43,7 @@ pub struct EmitHelpers {
     fn_labels: []i32,
     drop_labels: []i32,
     clone_labels: []i32,
+    eq_labels: []i32,
     iso_labels: []i32,
     shared_rc_labels: []i32,
     str_texts: []string,
@@ -404,10 +407,12 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
     n_tys := prog.types.entries.len
     mut drop_labels: []i32 = []
     mut clone_labels: []i32 = []
+    mut eq_labels: []i32 = []
     mut iso_labels: []i32 = []
     mut shared_rc_labels: []i32 = []
     drop_labels.reserve(n_tys)
     clone_labels.reserve(n_tys)
+    eq_labels.reserve(n_tys)
     iso_labels.reserve(n_tys)
     shared_rc_labels.reserve(n_tys)
     closure_drop := arm.label(&mut code)
@@ -452,6 +457,7 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         }
         drop_labels.push(dl)
         clone_labels.push(cl)
+        eq_labels.push(-1)
         iso_labels.push(-1)
         shared_rc_labels.push(-1)
     }
@@ -475,6 +481,7 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         trap_panic: arm.label(&mut code),
         trap_unreachable: arm.label(&mut code),
         eprint_text: arm.label(&mut code),
+        fmt_float_label: -1,
         closure_drop: closure_drop,
         map_new: map_new,
         map_drop: map_drop,
@@ -490,6 +497,7 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         fn_labels: move fn_labels,
         drop_labels: move drop_labels,
         clone_labels: move clone_labels,
+        eq_labels: move eq_labels,
         iso_labels: move iso_labels,
         shared_rc_labels: move shared_rc_labels,
         str_texts: [],
@@ -603,7 +611,7 @@ fn emit_clone_field_at(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelper
     store_mem(&mut code, 0, 10, offset)
 }
 
-fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers) {
+fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers, emitted_fn: &[]bool) {
     n_tys := types.entries.len
     for ty in 0..n_tys {
         te := &types.entries[ty]
@@ -717,7 +725,8 @@ fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers)
                 arm.branch(&mut code, shared, 3)
                 arm.store(&mut code, 0, 0)
                 // Run @resource(dispose) method ONLY when rc == 1, passing &slot0 (&self / &mut self), then reload x0!
-                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len {
+                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len &&
+                    te.dispose_fn < emitted_fn.len && emitted_fn[te.dispose_fn] {
                     arm.address(&mut code, 0)
                     arm.branch(&mut code, h.fn_labels[te.dispose_fn], 1)
                 }
@@ -771,7 +780,8 @@ fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers)
                 arm.compare_immediate(&mut code, 1, 1, false)
                 arm.branch(&mut code, shared, 3)
                 arm.store(&mut code, 0, 0)
-                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len {
+                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len &&
+                    te.dispose_fn < emitted_fn.len && emitted_fn[te.dispose_fn] {
                     arm.address(&mut code, 0)
                     arm.branch(&mut code, h.fn_labels[te.dispose_fn], 1)
                     arm.load(&mut code, 0)
@@ -1128,14 +1138,20 @@ fn emit_map_helpers(code: &mut arm.Code, h: &EmitHelpers) {
     hk_mix := arm.label(&mut code)
     hk_bytes := arm.label(&mut code)
     hk_pod := arm.label(&mut code)
+    hk_boxed := arm.label(&mut code)
     hk_loop := arm.label(&mut code)
     arm.compare_immediate(&mut code, 1, 0, false)
-    arm.branch(&mut code, hk_mix, 2) // key_kind == 0 -> scalar
+    arm.branch(&mut code, hk_mix, 2)   // key_kind == 0 -> scalar
+    arm.branch(&mut code, hk_boxed, 13) // key_kind < 0 -> boxed struct/tuple bytes (len = -key_kind)
     arm.compare_immediate(&mut code, 1, 1, false)
-    arm.branch(&mut code, hk_pod, 3) // key_kind >= 2 -> POD bytes
+    arm.branch(&mut code, hk_pod, 3)   // key_kind >= 2 -> POD bytes
     // key_kind == 1: string ptr in x0 -> ptr=x0+8, len=[x0+0]
     load_mem(&mut code, 11, 0, 0)
     arm.integer_binary(&mut code, 1, true, false, 10, 0, -1, 8)
+    arm.branch(&mut code, hk_bytes, 0)
+    arm.mark(&mut code, hk_boxed)
+    arm.mov(&mut code, 10, 0)
+    arm.integer_binary(&mut code, 2, true, false, 11, 31, 1, -1) // len = -key_kind
     arm.branch(&mut code, hk_bytes, 0)
     arm.mark(&mut code, hk_pod)
     arm.mov(&mut code, 10, 0)
@@ -1170,11 +1186,14 @@ fn emit_map_helpers(code: &mut arm.Code, h: &EmitHelpers) {
     arm.frame(&mut code, fr_eq, 0)
     eq_str := arm.label(&mut code)
     eq_pod := arm.label(&mut code)
+    eq_boxed := arm.label(&mut code)
     emit_arr_elem_addr(&mut code, 0, 1, 10) // x10 = &keys_arr[idx]
+    arm.compare_immediate(&mut code, 3, 0, false)
+    arm.branch(&mut code, eq_boxed, 13) // key_kind < 0 -> boxed struct/tuple bytes
     arm.compare_immediate(&mut code, 3, 1, false)
     arm.branch(&mut code, eq_str, 2)
     arm.compare_immediate(&mut code, 3, 2, false)
-    arm.branch(&mut code, eq_pod, 4) // >= 2
+    arm.branch(&mut code, eq_pod, 12) // signed >= 2
     // key_kind == 0: scalar comparison masked to element width (layout in [x0 + 24])
     load_mem(&mut code, 15, 0, 24)
     eq_s1 := arm.label(&mut code); eq_s2 := arm.label(&mut code); eq_s3 := arm.label(&mut code); eq_cmp := arm.label(&mut code)
@@ -1212,6 +1231,13 @@ fn emit_map_helpers(code: &mut arm.Code, h: &EmitHelpers) {
     arm.mov(&mut code, 0, 10)
     arm.mov(&mut code, 1, 2)
     arm.integer_binary(&mut code, 2, true, false, 2, 3, -1, 2)
+    arm.branch(&mut code, h.rt.memory_equal, 1)
+    arm.ret(&mut code)
+    // key_kind < 0: boxed struct/tuple pointer equality by content bytes (len = -key_kind)
+    arm.mark(&mut code, eq_boxed)
+    load_mem(&mut code, 0, 10, 0)
+    arm.mov(&mut code, 1, 2)
+    arm.integer_binary(&mut code, 2, true, false, 2, 31, 3, -1)
     arm.branch(&mut code, h.rt.memory_equal, 1)
     arm.ret(&mut code)
 
@@ -1552,7 +1578,7 @@ fn emit_map_helpers(code: &mut arm.Code, h: &EmitHelpers) {
     load_mem(&mut code, 11, 10, 40) // key_kind
     pk_pod := arm.label(&mut code); pk_done := arm.label(&mut code)
     arm.compare_immediate(&mut code, 11, 2, false)
-    arm.branch(&mut code, pk_pod, 4)
+    arm.branch(&mut code, pk_pod, 12)
     arm.branch(&mut code, h.rt.array_push, 1); arm.branch(&mut code, pk_done, 0)
     arm.mark(&mut code, pk_pod)
     arm.branch(&mut code, h.rt.array_push_pod, 1)
@@ -1737,9 +1763,260 @@ fn emit_embed_blob_data(code: &mut arm.Code, blobs: &[]u8, start: i32, count: i3
     if count == 0 { arm.emit(&mut code, 0) }
 }
 
+pub fn ensure_eq_labels(code: &mut arm.Code, types: &ht.TypeTable, h: &mut EmitHelpers, roots: &[]bool) {
+    n_tys := types.entries.len
+    mut need: []bool = []
+    mut work: []i32 = []
+    for ty in 0..n_tys {
+        r := ty < roots.len && roots[ty]
+        need.push(r)
+        if r { work.push(ty) }
+    }
+    mut head := 0
+    while head < work.len {
+        ty := work[head]
+        head += 1
+        te := &types.entries[ty]
+        if te.kind == .Struct || te.kind == .Tuple {
+            if te.kind == .Struct && ht.find_map_inst(&types, ty) >= 0 { continue }
+            for fi in 0..te.count {
+                ft := types.fields[te.inner_a + fi].ty
+                if ft >= 0 && ft < n_tys && !need[ft] { need[ft] = true; work.push(ft) }
+            }
+        } else if te.kind == .Enum {
+            for vi in 0..te.count {
+                v := &types.variants[te.inner_a + vi]
+                for pi in 0..v.payload_count {
+                    pt := types.fields[v.payload_start + pi].ty
+                    if pt >= 0 && pt < n_tys && !need[pt] { need[pt] = true; work.push(pt) }
+                }
+            }
+        } else if te.kind == .Array || te.kind == .FixedArr || te.kind == .FatSlice || te.kind == .RegionSlice {
+            et := te.inner_a
+            if et >= 0 && et < n_tys && !need[et] { need[et] = true; work.push(et) }
+        }
+    }
+    for ty in 0..n_tys {
+        if !need[ty] || h.eq_labels[ty] >= 0 { continue }
+        te := &types.entries[ty]
+        is_compound := (te.kind == .Struct && ht.find_map_inst(&types, ty) < 0) ||
+            te.kind == .Tuple || te.kind == .Enum ||
+            te.kind == .Array || te.kind == .FixedArr || te.kind == .FatSlice || te.kind == .RegionSlice
+        if is_compound {
+            h.eq_labels[ty] = arm.label(&mut code)
+        }
+    }
+}
+
+fn emit_eq_field_cmp(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers,
+    fty: i32, slot_a: i32, slot_b: i32, off: i32, ne_lbl: i32) {
+    if fty < 0 || fty >= types.entries.len || fty == ht.TY_UNIT { return }
+    fk := types.entries[fty].kind
+    if fk == .String {
+        arm.load_into(&mut code, slot_a, 10)
+        load_mem(&mut code, 0, 10, off)
+        arm.load_into(&mut code, slot_b, 11)
+        load_mem(&mut code, 1, 11, off)
+        arm.branch(&mut code, h.rt.string_compare, 1)
+        arm.compare_immediate(&mut code, 0, 0, false)
+        arm.branch(&mut code, ne_lbl, 3) // b.ne
+        return
+    }
+    if fk == .FatStr {
+        arm.load_into(&mut code, slot_a, 0)
+        if off > 0 && off <= 4095 { arm.integer_binary(&mut code, 1, true, false, 0, 0, -1, i64(off)) }
+        else if off > 4095 { arm.imm(&mut code, 14, i64(off)); arm.integer_binary(&mut code, 1, true, false, 0, 0, 14, -1) }
+        arm.load_into(&mut code, slot_b, 1)
+        if off > 0 && off <= 4095 { arm.integer_binary(&mut code, 1, true, false, 1, 1, -1, i64(off)) }
+        else if off > 4095 { arm.imm(&mut code, 14, i64(off)); arm.integer_binary(&mut code, 1, true, false, 1, 1, 14, -1) }
+        arm.branch(&mut code, h.rt.str_view_compare, 1)
+        arm.compare_immediate(&mut code, 0, 0, false)
+        arm.branch(&mut code, ne_lbl, 3) // b.ne
+        return
+    }
+    if is_float_ty(fty) {
+        arm.load_into(&mut code, slot_a, 10)
+        load_typed_at(&mut code, &types, fty, 1, 10, off)
+        arm.load_into(&mut code, slot_b, 11)
+        load_typed_at(&mut code, &types, fty, 0, 11, off)
+        _ := floats.binary(&mut code, "==", legacy_ty_id(fty), 0)
+        arm.branch(&mut code, ne_lbl, 18) // cbz x0, ne_lbl
+        return
+    }
+    if fty < h.eq_labels.len && h.eq_labels[fty] >= 0 {
+        if is_inline_agg(&types, fty) || is_fat_pair(&types, fty) {
+            arm.load_into(&mut code, slot_a, 0)
+            if off > 0 && off <= 4095 { arm.integer_binary(&mut code, 1, true, false, 0, 0, -1, i64(off)) }
+            else if off > 4095 { arm.imm(&mut code, 14, i64(off)); arm.integer_binary(&mut code, 1, true, false, 0, 0, 14, -1) }
+            arm.load_into(&mut code, slot_b, 1)
+            if off > 0 && off <= 4095 { arm.integer_binary(&mut code, 1, true, false, 1, 1, -1, i64(off)) }
+            else if off > 4095 { arm.imm(&mut code, 14, i64(off)); arm.integer_binary(&mut code, 1, true, false, 1, 1, 14, -1) }
+        } else {
+            arm.load_into(&mut code, slot_a, 10)
+            load_mem(&mut code, 0, 10, off)
+            arm.load_into(&mut code, slot_b, 11)
+            load_mem(&mut code, 1, 11, off)
+        }
+        arm.branch(&mut code, h.eq_labels[fty], 1)
+        arm.branch(&mut code, ne_lbl, 18) // cbz x0, ne_lbl
+        return
+    }
+    arm.load_into(&mut code, slot_a, 10)
+    load_typed_at(&mut code, &types, fty, 0, 10, off)
+    arm.load_into(&mut code, slot_b, 11)
+    load_typed_at(&mut code, &types, fty, 1, 11, off)
+    arm.compare_register(&mut code, 0, 1)
+    arm.branch(&mut code, ne_lbl, 3) // b.ne
+}
+
+fn emit_eq_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers) {
+    n_tys := types.entries.len
+    for ty in 0..n_tys {
+        el := h.eq_labels[ty]
+        if el < 0 { continue }
+        te := &types.entries[ty]
+        arm.mark(&mut code, el)
+        fr := arm.prologue(&mut code)
+        ret_t := arm.label(&mut code)
+        ret_f := arm.label(&mut code)
+
+        if te.kind == .Struct || te.kind == .Tuple {
+            arm.frame(&mut code, fr, 2)
+            if !is_inline_agg(&types, ty) {
+                arm.compare_register(&mut code, 0, 1)
+                arm.branch(&mut code, ret_t, 2) // b.eq
+                arm.branch(&mut code, ret_f, 18) // cbz x0
+                arm.mov(&mut code, 10, 1)
+                arm.compare_immediate(&mut code, 10, 0, false)
+                arm.branch(&mut code, ret_f, 2) // b.eq
+            }
+            arm.store(&mut code, 0, 0)
+            arm.store(&mut code, 1, 1)
+            for fi in 0..te.count {
+                fty := types.fields[te.inner_a + fi].ty
+                emit_eq_field_cmp(&mut code, &types, &h, fty, 0, 1, struct_field_offset(&types, ty, fi), ret_f)
+            }
+            arm.branch(&mut code, ret_t, 0)
+        } else if te.kind == .Enum {
+            arm.frame(&mut code, fr, 3)
+            if !is_inline_agg(&types, ty) {
+                arm.compare_register(&mut code, 0, 1)
+                arm.branch(&mut code, ret_t, 2)
+                arm.branch(&mut code, ret_f, 18)
+                arm.compare_immediate(&mut code, 1, 0, false)
+                arm.branch(&mut code, ret_f, 2)
+            }
+            arm.store(&mut code, 0, 0)
+            arm.store(&mut code, 1, 1)
+            arm.transfer(&mut code, true, 10, 0, 4, 0) // tag A
+            arm.transfer(&mut code, true, 11, 1, 4, 0) // tag B
+            arm.compare_register(&mut code, 10, 11)
+            arm.branch(&mut code, ret_f, 3)
+            arm.store(&mut code, 2, 10)
+            for vi in 0..te.count {
+                v := &types.variants[te.inner_a + vi]
+                if v.payload_count == 0 { continue }
+                next_v := arm.label(&mut code)
+                arm.load_into(&mut code, 2, 10)
+                arm.imm(&mut code, 12, v.tag_value)
+                arm.compare_register(&mut code, 10, 12)
+                arm.branch(&mut code, next_v, 3)
+                for pi in 0..v.payload_count {
+                    pty := types.fields[v.payload_start + pi].ty
+                    emit_eq_field_cmp(&mut code, &types, &h, pty, 0, 1, enum_payload_offset(&types, ty, vi, pi), ret_f)
+                }
+                arm.branch(&mut code, ret_t, 0)
+                arm.mark(&mut code, next_v)
+            }
+            arm.branch(&mut code, ret_t, 0)
+        } else if te.kind == .Array || te.kind == .FatSlice || te.kind == .RegionSlice {
+            arm.frame(&mut code, fr, 3)
+            if te.kind == .Array {
+                arm.compare_register(&mut code, 0, 1)
+                arm.branch(&mut code, ret_t, 2)
+                arm.branch(&mut code, ret_f, 18)
+                arm.compare_immediate(&mut code, 1, 0, false)
+                arm.branch(&mut code, ret_f, 2)
+            }
+            load_mem(&mut code, 10, 0, 8) // len A
+            load_mem(&mut code, 11, 1, 8) // len B
+            arm.compare_register(&mut code, 10, 11)
+            arm.branch(&mut code, ret_f, 3)
+            load_mem(&mut code, 12, 0, 0) // data A
+            load_mem(&mut code, 13, 1, 0) // data B
+            arm.store(&mut code, 0, 12)
+            arm.store(&mut code, 1, 13)
+            arm.store(&mut code, 2, 10)
+            elem_ty := te.inner_a
+            stride := elem_stride(&types, elem_ty)
+            lp := arm.label(&mut code)
+            arm.mark(&mut code, lp)
+            arm.load(&mut code, 2)
+            arm.branch(&mut code, ret_t, 18) // cbz rem -> true
+            emit_eq_field_cmp(&mut code, &types, &h, elem_ty, 0, 1, 0, ret_f)
+            arm.load_into(&mut code, 0, 10)
+            if stride <= 4095 { arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, i64(stride)) }
+            else { arm.imm(&mut code, 14, i64(stride)); arm.integer_binary(&mut code, 1, true, false, 10, 10, 14, -1) }
+            arm.store(&mut code, 0, 10)
+            arm.load_into(&mut code, 1, 11)
+            if stride <= 4095 { arm.integer_binary(&mut code, 1, true, false, 11, 11, -1, i64(stride)) }
+            else { arm.imm(&mut code, 14, i64(stride)); arm.integer_binary(&mut code, 1, true, false, 11, 11, 14, -1) }
+            arm.store(&mut code, 1, 11)
+            arm.load(&mut code, 2)
+            arm.integer_binary(&mut code, 2, true, false, 0, 0, -1, 1)
+            arm.store(&mut code, 2, 0)
+            arm.branch(&mut code, lp, 0)
+        } else if te.kind == .FixedArr {
+            arm.frame(&mut code, fr, 3)
+            if !is_inline_agg(&types, ty) {
+                arm.compare_register(&mut code, 0, 1)
+                arm.branch(&mut code, ret_t, 2)
+                arm.branch(&mut code, ret_f, 18)
+                arm.compare_immediate(&mut code, 1, 0, false)
+                arm.branch(&mut code, ret_f, 2)
+            }
+            arm.store(&mut code, 0, 0)
+            arm.store(&mut code, 1, 1)
+            arm.imm(&mut code, 10, i64(te.count))
+            arm.store(&mut code, 2, 10)
+            elem_ty := te.inner_a
+            stride := elem_stride(&types, elem_ty)
+            lp := arm.label(&mut code)
+            arm.mark(&mut code, lp)
+            arm.load(&mut code, 2)
+            arm.branch(&mut code, ret_t, 18)
+            emit_eq_field_cmp(&mut code, &types, &h, elem_ty, 0, 1, 0, ret_f)
+            arm.load_into(&mut code, 0, 10)
+            if stride <= 4095 { arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, i64(stride)) }
+            else { arm.imm(&mut code, 14, i64(stride)); arm.integer_binary(&mut code, 1, true, false, 10, 10, 14, -1) }
+            arm.store(&mut code, 0, 10)
+            arm.load_into(&mut code, 1, 11)
+            if stride <= 4095 { arm.integer_binary(&mut code, 1, true, false, 11, 11, -1, i64(stride)) }
+            else { arm.imm(&mut code, 14, i64(stride)); arm.integer_binary(&mut code, 1, true, false, 11, 11, 14, -1) }
+            arm.store(&mut code, 1, 11)
+            arm.load(&mut code, 2)
+            arm.integer_binary(&mut code, 2, true, false, 0, 0, -1, 1)
+            arm.store(&mut code, 2, 0)
+            arm.branch(&mut code, lp, 0)
+        } else {
+            arm.frame(&mut code, fr, 0)
+            arm.compare_register(&mut code, 0, 1)
+            arm.branch(&mut code, ret_t, 2)
+            arm.branch(&mut code, ret_f, 0)
+        }
+
+        arm.mark(&mut code, ret_t)
+        arm.imm(&mut code, 0, 1)
+        arm.ret(&mut code)
+        arm.mark(&mut code, ret_f)
+        arm.imm(&mut code, 0, 0)
+        arm.ret(&mut code)
+    }
+}
+
 // Emits all runtime/trap/type helpers and deduplicated literal data.
 // Returns `(data_start, env_site)`.
-pub fn emit_all_helpers(code: &mut arm.Code, prog: &hb.HirProgram, h: &EmitHelpers, environ_slot: i32) -> (i32, i32) {
+pub fn emit_all_helpers(code: &mut arm.Code, prog: &hb.HirProgram, h: &EmitHelpers, environ_slot: i32, emitted_fn: &[]bool) -> (i32, i32) {
     types := &prog.types
     arm.runtime(&mut code, h.print_int, h.print_bool, h.print_text, h.write_stdout,
         h.trap_overflow, h.trap_zero, h.trap_assert, h.trap_io)
@@ -1768,7 +2045,8 @@ pub fn emit_all_helpers(code: &mut arm.Code, prog: &hb.HirProgram, h: &EmitHelpe
 
     emit_closure_drop_dispatcher(&mut code, &h)
     emit_map_helpers(&mut code, &h)
-    emit_type_helpers(&mut code, &types, &h)
+    emit_type_helpers(&mut code, &types, &h, &emitted_fn)
+    emit_eq_helpers(&mut code, &types, &h)
     env_site := runtime.emit_runtime_with_env(&mut code, &h.rt, environ_slot)
 
     data_start := code.words.len

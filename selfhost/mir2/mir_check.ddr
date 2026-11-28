@@ -17,20 +17,24 @@ pub struct CheckResult {
     diagnostics: []diag.Diagnostic,
 }
 
-pub fn check_program(prog: &hb.HirProgram) -> CheckResult {
+struct CheckChunkIn {
+    fn_ids: []i32,
+}
+
+struct CheckChunkOut {
+    ok: bool,
+    bodies: []mb.MirBody,
+    diagnostics: []diag.Diagnostic,
+}
+
+fn check_chunk_worker(move chunk: CheckChunkIn, prog: &hb.HirProgram) -> CheckChunkOut {
     mut bodies: []mb.MirBody = []
-    mut inits: []mir_init.InitState = []
     mut diags: []diag.Diagnostic = []
-    mut ok := prog.ok
-
-    for i in 0..prog.diagnostics.len {
-        diags.push(diag.clone_diag(&prog.diagnostics[i]))
-    }
-
-    for fn_id in 0..prog.fns.len {
-        f := &prog.fns[fn_id]
-        if f.is_extern || f.is_generic_template || f.body_stmt < 0 { continue }
-        body := mir_build.build_body(&prog, fn_id, &mut diags)
+    mut ok := true
+    bodies.reserve(chunk.fn_ids.len)
+    for idx in 0..chunk.fn_ids.len {
+        fn_id := chunk.fn_ids[idx]
+        mut body := mir_build.build_body(&prog, fn_id, &mut diags)
         v1 := mir_verify.verify_body(&prog.types, &body, &mut diags)
         if !v1 { ok = false }
         init := mir_init.check_init(&prog.types, &body, &mut diags)
@@ -38,19 +42,98 @@ pub fn check_program(prog: &hb.HirProgram) -> CheckResult {
         if v1 && !mir_borrowck.check_borrows(&prog.types, &body, &init, &mut diags) {
             ok = false
         }
+        mir_drop_elab.elaborate_drops(&prog.types, &mut body, &init)
+        if !mir_verify.verify_body(&prog.types, &body, &mut diags) {
+            ok = false
+        }
         bodies.push(move body)
-        inits.push(move init)
+    }
+    CheckChunkOut {
+        ok: ok,
+        bodies: move bodies,
+        diagnostics: move diags,
+    }
+}
+
+pub fn check_program(prog: &hb.HirProgram) -> CheckResult {
+    check_program_parallel(&prog, 1)
+}
+
+pub fn check_program_parallel(prog: &hb.HirProgram, jobs: i32) -> CheckResult {
+    mut bodies: []mb.MirBody = []
+    mut diags: []diag.Diagnostic = []
+    mut ok := prog.ok
+
+    for i in 0..prog.diagnostics.len {
+        diags.push(diag.clone_diag(&prog.diagnostics[i]))
+    }
+
+    mut concrete_ids: []i32 = []
+    concrete_ids.reserve(prog.fns.len)
+    for fn_id in 0..prog.fns.len {
+        f := &prog.fns[fn_id]
+        if f.is_extern || f.is_generic_template || f.body_stmt < 0 { continue }
+        concrete_ids.push(fn_id)
+    }
+
+    if jobs <= 1 || concrete_ids.len < 64 {
+        bodies.reserve(concrete_ids.len)
+        for idx in 0..concrete_ids.len {
+            fn_id := concrete_ids[idx]
+            mut body := mir_build.build_body(&prog, fn_id, &mut diags)
+            v1 := mir_verify.verify_body(&prog.types, &body, &mut diags)
+            if !v1 { ok = false }
+            init := mir_init.check_init(&prog.types, &body, &mut diags)
+            if !init.ok { ok = false }
+            if v1 && !mir_borrowck.check_borrows(&prog.types, &body, &init, &mut diags) {
+                ok = false
+            }
+            mir_drop_elab.elaborate_drops(&prog.types, &mut body, &init)
+            if !mir_verify.verify_body(&prog.types, &body, &mut diags) {
+                ok = false
+            }
+            bodies.push(move body)
+        }
+    } else {
+        mut n_chunks := jobs * 2
+        if n_chunks > concrete_ids.len { n_chunks = concrete_ids.len }
+        mut chunks: []CheckChunkIn = []
+        for _ in 0..n_chunks { chunks.push(CheckChunkIn { fn_ids: [] }) }
+        for idx in 0..concrete_ids.len {
+            chunks[idx % n_chunks].fn_ids.push(concrete_ids[idx])
+        }
+        mut outs: []CheckChunkOut = []
+        task scope mir_workers(jobs, shared prog) {
+            mut tasks: []Task<CheckChunkOut> = []
+            for ci in 0..n_chunks {
+                ch := replace(&mut chunks[ci], CheckChunkIn { fn_ids: [] })
+                tasks.push(mir_workers.spawn(check_chunk_worker, move ch))
+            }
+            for _ in 0..n_chunks {
+                outs.push(tasks.remove(0).join())
+            }
+        }
+        // Reassemble bodies in exact deterministic fn_id order!
+        mut cursors: []i32 = []
+        for ci in 0..n_chunks {
+            if !outs[ci].ok { ok = false }
+            for di in 0..outs[ci].diagnostics.len {
+                diags.push(diag.clone_diag(&outs[ci].diagnostics[di]))
+            }
+            cursors.push(0)
+        }
+        bodies.reserve(concrete_ids.len)
+        for idx in 0..concrete_ids.len {
+            ci := idx % n_chunks
+            pos := cursors[ci]
+            cursors[ci] = pos + 1
+            b := replace(&mut outs[ci].bodies[pos], mb.new_body(-1, -1, "", "", -1, 0, 0, false))
+            bodies.push(move b)
+        }
     }
 
     if !mir_escape.check_program_escapes(&prog, &bodies, &mut diags) {
         ok = false
-    }
-
-    for bi in 0..bodies.len {
-        mir_drop_elab.elaborate_drops(&prog.types, &mut bodies[bi], &inits[bi])
-        if !mir_verify.verify_body(&prog.types, &bodies[bi], &mut diags) {
-            ok = false
-        }
     }
 
     CheckResult {

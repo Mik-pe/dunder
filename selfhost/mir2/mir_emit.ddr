@@ -5,13 +5,18 @@
 
 import ..frontend.diagnostics as diag
 import ..frontend.lexer as lexer
+import ..frontend.place_operation as place_op
 import ..backend.arm64 as arm
 import ..backend.floats as floats
 import ..backend.imports as native_imports
 import ..backend.x86 as x86
-import ..backend.wasm_abi as wasm_abi
 import ..backend.wasm_native as wasm
 import ..frontend.unsigned as unsigned
+import ..mir.mir as lmir
+import ..mir.mir_lift as mir_lift
+import ..mir.mir_lower as mir_lower
+import ..mir.mir_pipeline as mir_pipeline
+import ..mir.mir_source as mir_source
 import ..hir.hir_types as ht
 import ..hir.hir_body as hb
 import mir_body as mb
@@ -39,6 +44,7 @@ pub struct EmitResult {
     debug_line_mods: []i32,
     debug_line_spans: []i32,
     debug_line_offsets: []i32,
+    opt_summary: string,
 }
 
 struct DebugEmitBuf {
@@ -62,9 +68,12 @@ struct FnEmitCtx {
     cap_moved: []bool,
     local_slots: []i32,
     local_counts: []i32,
+    local_direct: []bool,
     sret_slot: i32,
     env_slot: i32,
     next_slot: i32,
+    max_slot: i32,
+    pinned_slot: i32,
     bb_labels: []i32,
     region_slots: []i32, // indexed by scope_id: base slot of 3 slots (base, cur, end), -1 if not region
     cb_fn_labels: []i32,
@@ -76,6 +85,13 @@ struct FnEmitCtx {
 fn alloc_slots(fc: &mut FnEmitCtx, count: i32) -> i32 {
     base := fc.next_slot
     fc.next_slot += count
+    if fc.next_slot > fc.max_slot { fc.max_slot = fc.next_slot }
+    base
+}
+
+fn alloc_perm_slots(fc: &mut FnEmitCtx, count: i32) -> i32 {
+    base := alloc_slots(&mut fc, count)
+    if fc.next_slot > fc.pinned_slot { fc.pinned_slot = fc.next_slot }
     base
 }
 
@@ -83,16 +99,57 @@ fn alloc_slot(fc: &mut FnEmitCtx) -> i32 {
     alloc_slots(&mut fc, 1)
 }
 
+fn is_direct_place(body: &mb.MirBody, fc: &FnEmitCtx, place_id: i32) -> bool {
+    pl := body.places[place_id]
+    pl.proj_len == 0 && pl.local >= 0 && pl.local < fc.local_direct.len && fc.local_direct[pl.local]
+}
+
+fn emit_normalize_narrow(code: &mut arm.Code, ty: i32, reg: i32) {
+    if ty == ht.TY_U8 || ty == ht.TY_BOOL {
+        arm.bitfield(&mut code, false, true, reg, reg, 0, 7)
+    } else if ty == ht.TY_U16 {
+        arm.bitfield(&mut code, false, true, reg, reg, 0, 15)
+    } else if ty == ht.TY_U32 || ty == ht.TY_RUNE {
+        arm.bitfield(&mut code, false, true, reg, reg, 0, 31)
+    } else if ty == ht.TY_I8 {
+        arm.bitfield(&mut code, true, true, reg, reg, 0, 7)
+    } else if ty == ht.TY_I16 {
+        arm.bitfield(&mut code, true, true, reg, reg, 0, 15)
+    } else if ty == ht.TY_I32 {
+        arm.sign_extend_i32(&mut code, reg, reg)
+    }
+}
+
+fn is_simple_scalar_op(body: &mb.MirBody, fc: &FnEmitCtx, op_id: i32) -> bool {
+    op := body.ops[op_id]
+    if op.kind == .Const { return true }
+    is_direct_place(&body, &fc, op.id)
+}
+
 // Address of byte 0 of a local's contiguous stack storage.
 // ARM64 frame slots grow downward (slot s is at FP - (s+1)*8), so byte 0 is at slot (base + count - 1).
+// For 1-slot locals under mir_capture, emit place_op BorrowHome so mir_lift.frame_effects marks ONLY
+// this single slot as escaped rather than escaping the entire function frame!
 fn emit_local_addr(code: &mut arm.Code, fc: &FnEmitCtx, local_id: i32, dst_reg: i32) {
-    slot_lo := fc.local_slots[local_id] + fc.local_counts[local_id] - 1
-    arm.address(&mut code, slot_lo)
+    cnt := fc.local_counts[local_id]
+    slot_lo := fc.local_slots[local_id] + cnt - 1
+    if cnt == 1 && code.mir_capture && slot_lo >= 0 && slot_lo < 65535 {
+        arm.operand(&mut code, place_op.header(.BorrowHome, 2, 0, 0))
+        arm.operand(&mut code, place_op.location(slot_lo, 0))
+    } else {
+        arm.address(&mut code, slot_lo)
+    }
     if dst_reg != 0 { arm.mov(&mut code, dst_reg, 0) }
 }
 
 fn emit_slots_addr(code: &mut arm.Code, base_slot: i32, count: i32, dst_reg: i32) {
-    arm.address(&mut code, base_slot + count - 1)
+    slot_lo := base_slot + count - 1
+    if count == 1 && code.mir_capture && slot_lo >= 0 && slot_lo < 65535 {
+        arm.operand(&mut code, place_op.header(.BorrowHome, 2, 0, 0))
+        arm.operand(&mut code, place_op.location(slot_lo, 0))
+    } else {
+        arm.address(&mut code, slot_lo)
+    }
     if dst_reg != 0 { arm.mov(&mut code, dst_reg, 0) }
 }
 
@@ -142,16 +199,16 @@ fn emit_load_const(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         helpers.load_label_addr(&mut code, lbl, dst_reg)
     } else if te.kind == .ExternFn {
         fid := i32(c.int_val)
-        if fid >= 0 && fid < fc.cb_fn_labels.len && fc.cb_fn_labels[fid] >= 0 {
+        if c.text != "" && fid >= 0 && fid < fc.cb_fn_labels.len && fc.cb_fn_labels[fid] >= 0 {
             helpers.load_label_addr(&mut code, fc.cb_fn_labels[fid], dst_reg)
-        } else if fid >= 0 && fid < h.fn_labels.len {
+        } else if c.text != "" && fid >= 0 && fid < h.fn_labels.len && !prog.fns[fid].is_extern && !prog.fns[fid].is_generic_template {
             helpers.load_label_addr(&mut code, h.fn_labels[fid], dst_reg)
         } else {
             arm.imm(&mut code, dst_reg, 0)
         }
     } else if te.kind == .FnPtr {
         fid := i32(c.int_val)
-        if fid >= 0 && fid < h.fn_labels.len {
+        if c.text != "" && fid >= 0 && fid < h.fn_labels.len && !prog.fns[fid].is_extern && !prog.fns[fid].is_generic_template {
             helpers.load_label_addr(&mut code, h.fn_labels[fid], dst_reg)
         } else {
             arm.imm(&mut code, dst_reg, 0)
@@ -169,14 +226,109 @@ fn emit_place_addr(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         emit_local_addr(&mut code, &fc, p.local, dst_reg)
         return
     }
-    addr_slot := alloc_slot(&mut fc)
-    emit_local_addr(&mut code, &fc, p.local, 0)
-    arm.store(&mut code, addr_slot, 0)
-
     mut cur_ty := body.locals[p.local].ty
+    mut start_i := 0
     mut downcast_var := -1
 
-    for i in 0..p.proj_len {
+    // Fast path for single-step Deref / boxed Field / boxed Downcast+Field (zero addr_slot, zero arm.address!)
+    pr0 := body.projs[p.proj_start]
+    if p.proj_len == 1 {
+        if pr0.kind == .Deref {
+            arm.load_into(&mut code, fc.local_slots[p.local], dst_reg)
+            return
+        }
+        if pr0.kind == .Field && helpers.is_boxed_heap(&prog.types, cur_ty) {
+            f_off := helpers.struct_field_offset(&prog.types, cur_ty, pr0.index)
+            arm.load_into(&mut code, fc.local_slots[p.local], dst_reg)
+            emit_add_imm(&mut code, dst_reg, dst_reg, f_off)
+            return
+        }
+        if pr0.kind == .Index && (prog.types.entries[cur_ty].kind == .Array || prog.types.entries[cur_ty].kind == .String) {
+            idx_local := pr0.index
+            mut idx_ty := body.locals[idx_local].ty
+            idx_is_ref := idx_ty >= 0 && idx_ty < prog.types.entries.len &&
+                (prog.types.entries[idx_ty].kind == .Ref || prog.types.entries[idx_ty].kind == .MutRef)
+            if fc.local_direct[idx_local] && !idx_is_ref {
+                arm.load_into(&mut code, fc.local_slots[idx_local], 1)
+            } else if idx_is_ref && fc.local_direct[idx_local] {
+                arm.load_into(&mut code, fc.local_slots[idx_local], 10)
+                idx_ty = prog.types.entries[idx_ty].inner_a
+                helpers.load_typed_at(&mut code, &prog.types, idx_ty, 1, 10, 0)
+            } else {
+                emit_local_addr(&mut code, &fc, idx_local, 10)
+                if idx_is_ref {
+                    helpers.load_mem(&mut code, 10, 10, 0)
+                    idx_ty = prog.types.entries[idx_ty].inner_a
+                }
+                helpers.load_typed_at(&mut code, &prog.types, idx_ty, 1, 10, 0)
+            }
+            arm.load_into(&mut code, fc.local_slots[p.local], 10)
+            if prog.types.entries[cur_ty].kind == .Array {
+                helpers.load_mem(&mut code, 11, 10, 8) // len
+                arm.compare_register(&mut code, 1, 11)
+                arm.branch(&mut code, h.trap_bounds, 4)
+                helpers.load_mem(&mut code, 10, 10, 0) // data_ptr
+                elem_ty := prog.types.entries[cur_ty].inner_a
+                stride := helpers.elem_stride(&prog.types, elem_ty)
+                if stride == 8 {
+                    arm.add_scaled(&mut code, dst_reg, 10, 1, 3)
+                } else if stride == 4 {
+                    arm.add_scaled(&mut code, dst_reg, 10, 1, 2)
+                } else if stride == 1 {
+                    arm.integer_binary(&mut code, 1, true, false, dst_reg, 10, 1, -1)
+                } else {
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
+                    arm.integer_binary(&mut code, 1, true, false, dst_reg, 10, 12, -1)
+                }
+            } else {
+                helpers.load_mem(&mut code, 11, 10, 0) // str len
+                arm.compare_register(&mut code, 1, 11)
+                arm.branch(&mut code, h.trap_bounds, 4)
+                arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 8)
+                arm.integer_binary(&mut code, 1, true, false, dst_reg, 10, 1, -1)
+            }
+            return
+        }
+    } else if p.proj_len == 2 && pr0.kind == .Downcast && body.projs[p.proj_start + 1].kind == .Field && helpers.is_boxed_heap(&prog.types, cur_ty) {
+        pr1 := body.projs[p.proj_start + 1]
+        f_off := helpers.enum_payload_offset(&prog.types, cur_ty, pr0.index, pr1.index)
+        arm.load_into(&mut code, fc.local_slots[p.local], dst_reg)
+        emit_add_imm(&mut code, dst_reg, dst_reg, f_off)
+        return
+    }
+
+    addr_slot := alloc_slot(&mut fc)
+    // Avoid arm.address on direct locals when first projection only loads the pointer!
+    if pr0.kind == .Deref {
+        arm.load_into(&mut code, fc.local_slots[p.local], 0)
+        arm.store(&mut code, addr_slot, 0)
+        cur_ty = prog.types.entries[cur_ty].inner_a
+        start_i = 1
+    } else if pr0.kind == .Field && helpers.is_boxed_heap(&prog.types, cur_ty) {
+        f := &prog.types.fields[prog.types.entries[cur_ty].inner_a + pr0.index]
+        f_off := helpers.struct_field_offset(&prog.types, cur_ty, pr0.index)
+        arm.load_into(&mut code, fc.local_slots[p.local], 0)
+        emit_add_imm(&mut code, 0, 0, f_off)
+        arm.store(&mut code, addr_slot, 0)
+        cur_ty = f.ty
+        start_i = 1
+    } else if pr0.kind == .Downcast && p.proj_len >= 2 && body.projs[p.proj_start + 1].kind == .Field && helpers.is_boxed_heap(&prog.types, cur_ty) {
+        pr1 := body.projs[p.proj_start + 1]
+        v := &prog.types.variants[prog.types.entries[cur_ty].inner_a + pr0.index]
+        pf := &prog.types.fields[v.payload_start + pr1.index]
+        f_off := helpers.enum_payload_offset(&prog.types, cur_ty, pr0.index, pr1.index)
+        arm.load_into(&mut code, fc.local_slots[p.local], 0)
+        emit_add_imm(&mut code, 0, 0, f_off)
+        arm.store(&mut code, addr_slot, 0)
+        cur_ty = pf.ty
+        start_i = 2
+    } else {
+        emit_local_addr(&mut code, &fc, p.local, 0)
+        arm.store(&mut code, addr_slot, 0)
+    }
+
+    for i in start_i..p.proj_len {
         pr := body.projs[p.proj_start + i]
         if pr.kind == .Deref {
             arm.load(&mut code, addr_slot)
@@ -212,13 +364,22 @@ fn emit_place_addr(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             // Load index value from pr.index (MirLocal id) into x1
             idx_local := pr.index
             mut idx_ty := body.locals[idx_local].ty
-            emit_local_addr(&mut code, &fc, idx_local, 10)
-            if idx_ty >= 0 && idx_ty < prog.types.entries.len &&
-                (prog.types.entries[idx_ty].kind == .Ref || prog.types.entries[idx_ty].kind == .MutRef) {
-                helpers.load_mem(&mut code, 10, 10, 0)
+            idx_is_ref := idx_ty >= 0 && idx_ty < prog.types.entries.len &&
+                (prog.types.entries[idx_ty].kind == .Ref || prog.types.entries[idx_ty].kind == .MutRef)
+            if fc.local_direct[idx_local] && !idx_is_ref {
+                arm.load_into(&mut code, fc.local_slots[idx_local], 1)
+            } else if idx_is_ref && fc.local_direct[idx_local] {
+                arm.load_into(&mut code, fc.local_slots[idx_local], 10)
                 idx_ty = prog.types.entries[idx_ty].inner_a
+                helpers.load_typed_at(&mut code, &prog.types, idx_ty, 1, 10, 0)
+            } else {
+                emit_local_addr(&mut code, &fc, idx_local, 10)
+                if idx_is_ref {
+                    helpers.load_mem(&mut code, 10, 10, 0)
+                    idx_ty = prog.types.entries[idx_ty].inner_a
+                }
+                helpers.load_typed_at(&mut code, &prog.types, idx_ty, 1, 10, 0)
             }
-            helpers.load_typed_at(&mut code, &prog.types, idx_ty, 1, 10, 0)
 
             arm.load_into(&mut code, addr_slot, 10)
             k := prog.types.entries[cur_ty].kind
@@ -230,9 +391,17 @@ fn emit_place_addr(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 helpers.load_mem(&mut code, 10, 10, 0) // data_ptr
                 elem_ty := prog.types.entries[cur_ty].inner_a
                 stride := helpers.elem_stride(&prog.types, elem_ty)
-                arm.imm(&mut code, 12, i64(stride))
-                arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
-                arm.integer_binary(&mut code, 1, true, false, 0, 10, 12, -1)
+                if stride == 8 {
+                    arm.add_scaled(&mut code, 0, 10, 1, 3)
+                } else if stride == 4 {
+                    arm.add_scaled(&mut code, 0, 10, 1, 2)
+                } else if stride == 1 {
+                    arm.integer_binary(&mut code, 1, true, false, 0, 10, 1, -1)
+                } else {
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
+                    arm.integer_binary(&mut code, 1, true, false, 0, 10, 12, -1)
+                }
                 arm.store(&mut code, addr_slot, 0)
                 cur_ty = elem_ty
             } else if k == .FatSlice || k == .RegionSlice {
@@ -242,9 +411,17 @@ fn emit_place_addr(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 helpers.load_mem(&mut code, 10, 10, 0) // data_ptr
                 elem_ty := prog.types.entries[cur_ty].inner_a
                 stride := helpers.elem_stride(&prog.types, elem_ty)
-                arm.imm(&mut code, 12, i64(stride))
-                arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
-                arm.integer_binary(&mut code, 1, true, false, 0, 10, 12, -1)
+                if stride == 8 {
+                    arm.add_scaled(&mut code, 0, 10, 1, 3)
+                } else if stride == 4 {
+                    arm.add_scaled(&mut code, 0, 10, 1, 2)
+                } else if stride == 1 {
+                    arm.integer_binary(&mut code, 1, true, false, 0, 10, 1, -1)
+                } else {
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
+                    arm.integer_binary(&mut code, 1, true, false, 0, 10, 12, -1)
+                }
                 arm.store(&mut code, addr_slot, 0)
                 cur_ty = elem_ty
             } else if k == .FatStr {
@@ -312,6 +489,10 @@ fn emit_load_scalar_op(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         emit_load_const(&mut code, &prog, &body, &mut fc, &mut h, op.id, dst_reg)
         return
     }
+    if is_direct_place(&body, &fc, op.id) {
+        arm.load_into(&mut code, fc.local_slots[body.places[op.id].local], dst_reg)
+        return
+    }
     ty := body.places[op.id].ty
     addr_reg := if dst_reg == 10 { 11 } else { 10 }
     emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, addr_reg)
@@ -329,6 +510,20 @@ fn emit_take_scalar_op(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         return
     }
     ty := body.places[op.id].ty
+    if is_direct_place(&body, &fc, op.id) {
+        slot := fc.local_slots[body.places[op.id].local]
+        arm.load_into(&mut code, slot, dst_reg)
+        if helpers.type_needs_drop(&prog.types, ty) {
+            if is_true_move(&body, op_id) {
+                arm.store(&mut code, slot, 31)
+            } else if ty >= 0 && ty < h.clone_labels.len && h.clone_labels[ty] >= 0 {
+                if dst_reg != 0 { arm.mov(&mut code, 0, dst_reg) }
+                arm.branch(&mut code, h.clone_labels[ty], 1)
+                if dst_reg != 0 { arm.mov(&mut code, dst_reg, 0) }
+            }
+        }
+        return
+    }
     addr_reg := if dst_reg == 10 { 11 } else { 10 }
     emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, addr_reg)
     helpers.load_typed_at(&mut code, &prog.types, ty, dst_reg, addr_reg, 0)
@@ -495,14 +690,36 @@ fn emit_cmp_from_threeway(code: &mut arm.Code, op: i32) {
     arm.set_condition(&mut code, 0, cc)
 }
 
+fn emit_store_dest(code: &mut arm.Code, types: &ht.TypeTable, dest_ty: i32,
+    direct_slot: i32, dst_addr_slot: i32, val_reg: i32) {
+    if direct_slot >= 0 {
+        arm.store(&mut code, direct_slot, val_reg)
+    } else {
+        addr_reg := if val_reg == 10 { 11 } else { 10 }
+        arm.load_into(&mut code, dst_addr_slot, addr_reg)
+        helpers.store_typed_at(&mut code, &types, dest_ty, val_reg, addr_reg, 0)
+    }
+}
+
 fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, dest_place: i32, rv_id: i32, stmt_aux: i32) {
     rv := body.rvalues[rv_id]
-    dst_addr_slot := alloc_slot(&mut fc)
-    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_place, 0)
-    arm.store(&mut code, dst_addr_slot, 0)
+    mut direct_slot := -1
+    mut dst_addr_slot := -1
+    if is_direct_place(&body, &fc, dest_place) {
+        direct_slot = fc.local_slots[body.places[dest_place].local]
+    } else {
+        dst_addr_slot = alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_place, 0)
+        arm.store(&mut code, dst_addr_slot, 0)
+    }
 
     if rv.kind == .Use {
+        if direct_slot >= 0 {
+            emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+            arm.store(&mut code, direct_slot, 0)
+            return
+        }
         emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, rv.a, dst_addr_slot)
         return
     }
@@ -510,15 +727,13 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     if rv.kind == .Ref {
         ln := body.loans[rv.a]
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, ln.place, 0)
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_mem(&mut code, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
     if rv.kind == .AddrOf {
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_mem(&mut code, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -544,8 +759,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         } else {
             arm.imm(&mut code, 0, 0)
         }
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -554,6 +768,9 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         oty := operand_type(&body, rv.a)
         if op.kind == .Const {
             arm.imm(&mut code, 0, body.consts[op.id].int_val)
+        } else if is_direct_place(&body, &fc, op.id) && helpers.is_boxed_heap(&prog.types, oty) {
+            arm.load_into(&mut code, fc.local_slots[body.places[op.id].local], 10)
+            arm.transfer(&mut code, true, 0, 10, 4, 0)
         } else {
             emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, 10)
             if helpers.is_boxed_heap(&prog.types, oty) {
@@ -561,8 +778,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             }
             arm.transfer(&mut code, true, 0, 10, 4, 0)
         }
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -727,19 +943,23 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         lty := operand_type(&body, rv.a)
         lk := prog.types.entries[lty].kind
         if lk == .String {
-            lhs_slot := alloc_slot(&mut fc)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
-            arm.store(&mut code, lhs_slot, 0)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 1)
-            arm.load(&mut code, lhs_slot)
+            if is_simple_scalar_op(&body, &fc, rv.a) && is_simple_scalar_op(&body, &fc, rv.b) {
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 1)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+            } else {
+                lhs_slot := alloc_slot(&mut fc)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+                arm.store(&mut code, lhs_slot, 0)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 1)
+                arm.load(&mut code, lhs_slot)
+            }
             if stmt_aux == hb.BINOP_ADD {
                 arm.branch(&mut code, h.rt.string_concat, 1)
             } else {
                 arm.branch(&mut code, h.rt.string_compare, 1)
                 emit_cmp_from_threeway(&mut code, stmt_aux)
             }
-            arm.load_into(&mut code, dst_addr_slot, 10)
-            helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+            emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
             return
         }
         if lk == .FatStr {
@@ -756,16 +976,54 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             arm.load_into(&mut code, v2_addr, 1)
             arm.branch(&mut code, h.rt.str_view_compare, 1)
             emit_cmp_from_threeway(&mut code, stmt_aux)
-            arm.load_into(&mut code, dst_addr_slot, 10)
-            helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+            emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
             return
         }
 
-        lhs_slot := alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
-        arm.store(&mut code, lhs_slot, 0)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 0)
-        arm.load_into(&mut code, lhs_slot, 1) // x1 = LHS, x0 = RHS
+        // Structural equality (`==` / `!=`) on compound types (Struct, Tuple, Enum, Array, FixedArr, FatSlice, RegionSlice)
+        if (stmt_aux == hb.BINOP_EQ || stmt_aux == hb.BINOP_NE) &&
+            lty >= 0 && lty < h.eq_labels.len && h.eq_labels[lty] >= 0 {
+            if helpers.is_inline_agg(&prog.types, lty) || helpers.is_fat_pair(&prog.types, lty) {
+                cnt := helpers.local_slot_count(&prog.types, lty)
+                b1 := alloc_slots(&mut fc, cnt)
+                b2 := alloc_slots(&mut fc, cnt)
+                a1 := alloc_slot(&mut fc)
+                a2 := alloc_slot(&mut fc)
+                emit_slots_addr(&mut code, b1, cnt, 0); arm.store(&mut code, a1, 0)
+                emit_slots_addr(&mut code, b2, cnt, 0); arm.store(&mut code, a2, 0)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, rv.a, a1)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, rv.b, a2)
+                arm.load_into(&mut code, a1, 0)
+                arm.load_into(&mut code, a2, 1)
+            } else if is_simple_scalar_op(&body, &fc, rv.a) && is_simple_scalar_op(&body, &fc, rv.b) {
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 1)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+            } else {
+                lhs_slot := alloc_slot(&mut fc)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+                arm.store(&mut code, lhs_slot, 0)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 1)
+                arm.load(&mut code, lhs_slot)
+            }
+            arm.branch(&mut code, h.eq_labels[lty], 1)
+            if stmt_aux == hb.BINOP_NE {
+                arm.compare_immediate(&mut code, 0, 0, false)
+                arm.set_condition(&mut code, 0, 0)
+            }
+            emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
+            return
+        }
+
+        if is_simple_scalar_op(&body, &fc, rv.a) && is_simple_scalar_op(&body, &fc, rv.b) {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 1)
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 0)
+        } else {
+            lhs_slot := alloc_slot(&mut fc)
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
+            arm.store(&mut code, lhs_slot, 0)
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.b, 0)
+            arm.load_into(&mut code, lhs_slot, 1) // x1 = LHS, x0 = RHS
+        }
 
         if helpers.is_float_ty(lty) {
             _ := floats.binary(&mut code, binop_to_str(stmt_aux), helpers.legacy_ty_id(lty), 0)
@@ -773,14 +1031,12 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             _ := unsigned.binary(&mut code, binop_to_str(stmt_aux), helpers.legacy_ty_id(lty), h.trap_overflow, h.trap_zero)
         } else if lk == .Enum && helpers.is_inline_agg(&prog.types, lty) {
             // Inline tag-only enum comparison (==, !=)
-            arm.load_into(&mut code, lhs_slot, 1)
             arm.compare_register(&mut code, 1, 0)
             arm.set_condition(&mut code, 0, if stmt_aux == hb.BINOP_NE { 1 } else { 0 })
         } else {
             emit_signed_binary(&mut code, &h, stmt_aux, lty)
         }
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -797,12 +1053,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                     arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1)
                 }
             } else {
-                arm.mov(&mut code, 1, 0)
-                arm.imm(&mut code, 0, 0)
-                // Swap: x1 = 0, x0 = val -> 0 - val with overflow check
-                arm.mov(&mut code, 2, 1)
                 arm.imm(&mut code, 1, 0)
-                arm.mov(&mut code, 0, 2)
                 emit_signed_binary(&mut code, &h, hb.BINOP_SUB, oty)
             }
         } else if rv.b == hb.UNOP_NOT {
@@ -811,9 +1062,9 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         } else if rv.b == hb.UNOP_BIT_NOT {
             arm.imm(&mut code, 1, -1)
             arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1)
+            emit_normalize_narrow(&mut code, oty, 0)
         }
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_typed_at(&mut code, &prog.types, rv.ty, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -826,7 +1077,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         // RegionSlice<T> -> []T (wrap 2-word (ptr, len) in a stack-resident 48B array header with immortal RC=0!)
         if from_k == .RegionSlice && to_k == .Array {
             // Allocate 8 contiguous stack slots (64B): [0..16] = zero RC header (rc=0 so array_drop is a no-op!), [16..64] = 48B array header!
-            hdr_slots := alloc_slots(&mut fc, 8)
+            hdr_slots := alloc_perm_slots(&mut fc, 8)
             hdr_base_slot := alloc_slot(&mut fc)
             emit_slots_addr(&mut code, hdr_slots, 8, 0)
             helpers.zero_bytes(&mut code, 0, 64)
@@ -847,8 +1098,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             layout := helpers.array_elem_layout(&prog.types, prog.types.entries[to_ty].inner_a)
             arm.imm(&mut code, 3, i64(layout))
             helpers.store_mem(&mut code, 3, 10, 24) // layout
-            arm.load_into(&mut code, dst_addr_slot, 11)
-            helpers.store_mem(&mut code, 10, 11, 0)
+            emit_store_dest(&mut code, &prog.types, to_ty, direct_slot, dst_addr_slot, 10)
             return
         }
 
@@ -872,8 +1122,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 // Concrete ClosureEnv -> abstract ClosureEnv (same heap env_ptr!)
                 emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, rv.a, 0)
             }
-            arm.load_into(&mut code, dst_addr_slot, 10)
-            helpers.store_mem(&mut code, 0, 10, 0)
+            emit_store_dest(&mut code, &prog.types, to_ty, direct_slot, dst_addr_slot, 0)
             return
         }
 
@@ -889,9 +1138,11 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             } else if from_ty == ht.TY_BOOL && helpers.is_int_ty(to_ty) {
                 // bool is already 0/1
             }
+            if helpers.is_int_ty(to_ty) {
+                emit_normalize_narrow(&mut code, to_ty, 0)
+            }
         }
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_typed_at(&mut code, &prog.types, to_ty, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, to_ty, direct_slot, dst_addr_slot, 0)
         return
     }
 
@@ -927,8 +1178,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                     emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[rv.op_start + fi], f_addr_slot)
                 }
                 arm.load_into(&mut code, obj_slot, 0)
-                arm.load_into(&mut code, dst_addr_slot, 10)
-                helpers.store_mem(&mut code, 0, 10, 0)
+                emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
             }
             return
         }
@@ -968,8 +1218,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                     emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[rv.op_start + pi], f_addr_slot)
                 }
                 arm.load_into(&mut code, obj_slot, 0)
-                arm.load_into(&mut code, dst_addr_slot, 10)
-                helpers.store_mem(&mut code, 0, 10, 0)
+                emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
             }
             return
         }
@@ -1013,8 +1262,15 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 helpers.store_mem(&mut code, 1, 10, 8) // len = rv.op_len
             }
             arm.load_into(&mut code, arr_slot, 0)
+            emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
+            return
+        }
+
+        if k == .FatSlice || k == .RegionSlice {
+            // Empty slice literal `[]` coerced to `&[]T` -> { data = 0, len = 0 }
             arm.load_into(&mut code, dst_addr_slot, 10)
-            helpers.store_mem(&mut code, 0, 10, 0)
+            helpers.store_mem(&mut code, 31, 10, 0)
+            helpers.store_mem(&mut code, 31, 10, 8)
             return
         }
 
@@ -1077,8 +1333,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             }
             if obj_slot >= 0 {
                 arm.load_into(&mut code, obj_slot, 0)
-                arm.load_into(&mut code, dst_addr_slot, 10)
-                helpers.store_mem(&mut code, 0, 10, 0)
+                emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
             }
             return
         }
@@ -1127,8 +1382,7 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             cap_off += helpers.local_slot_count(&prog.types, cty) * 8
         }
         arm.load_into(&mut code, env_obj, 0)
-        arm.load_into(&mut code, dst_addr_slot, 10)
-        helpers.store_mem(&mut code, 0, 10, 0)
+        emit_store_dest(&mut code, &prog.types, rv.ty, direct_slot, dst_addr_slot, 0)
         return
     }
 }
@@ -1142,7 +1396,7 @@ fn emit_print_value(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody
     ty := operand_type(&body, op_id)
     k := prog.types.entries[ty].kind
     if code.platform == 3 || code.platform == 4 {
-        // WASM uses dedicated print sentinel words (4227858432 + legacy_ty_id)
+        // WASM uses dedicated print sentinel words (4227858432 + legacy_ty_id); WASI formats floats via decimal formatter!
         if k == .FatStr {
             v_base := alloc_slots(&mut fc, 2)
             v_addr := alloc_slot(&mut fc)
@@ -1151,6 +1405,17 @@ fn emit_print_value(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody
             arm.load(&mut code, v_addr)
             arm.branch(&mut code, h.rt.str_view_to_string, 1)
             arm.emit(&mut code, 4227858436) // print string
+        } else if code.platform == 4 && helpers.is_float_ty(ty) && h.fmt_float_label >= 0 {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+            if ty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+            arm.imm(&mut code, 1, if ty == ht.TY_F32 { 1 } else { 0 })
+            arm.imm(&mut code, 2, -1)
+            arm.branch(&mut code, h.fmt_float_label, 1)
+            s_tmp := alloc_slot(&mut fc)
+            arm.store(&mut code, s_tmp, 0)
+            arm.emit(&mut code, 4227858436) // print string
+            arm.load(&mut code, s_tmp)
+            arm.branch(&mut code, h.rt.release, 1)
         } else {
             emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
             arm.emit(&mut code, 4227858432 + i64(helpers.legacy_ty_id(ty)))
@@ -1208,6 +1473,17 @@ fn emit_print_value(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody
             arm.imm(&mut code, 8, is_u)
             arm.branch(&mut code, h.print_int, 1)
         }
+    } else if helpers.is_float_ty(ty) && h.fmt_float_label >= 0 {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+        if ty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+        arm.imm(&mut code, 1, if ty == ht.TY_F32 { 1 } else { 0 })
+        arm.imm(&mut code, 2, -1)
+        arm.branch(&mut code, h.fmt_float_label, 1)
+        s_tmp := alloc_slot(&mut fc)
+        arm.store(&mut code, s_tmp, 0)
+        arm.branch(&mut code, if to_stderr { h.eprint_text } else { h.print_text }, 1)
+        arm.load(&mut code, s_tmp)
+        arm.branch(&mut code, h.rt.release, 1)
     }
 }
 
@@ -1236,6 +1512,13 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         if !helpers.type_needs_drop(&prog.types, ty) { return }
         dl := h.drop_labels[ty]
         if dl < 0 { return }
+        if is_direct_place(&body, &fc, op.id) {
+            slot := fc.local_slots[pl.local]
+            arm.load(&mut code, slot)
+            arm.store(&mut code, slot, 31)
+            arm.branch(&mut code, dl, 1)
+            return
+        }
         p_slot := alloc_slot(&mut fc)
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, 10)
         arm.store(&mut code, p_slot, 10)
@@ -1476,6 +1759,34 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
             arm.imm(&mut code, 12, i64(stride))
             arm.integer_binary(&mut code, 3, true, false, 2, 2, 12, -1)
             arm.branch(&mut code, h.rt.memory_copy, 1)
+            // Deep-clone owned elements (e.g. string / []T / struct / enum) so dropping the source slice/array won't free them!
+            if elem_ty >= 0 && elem_ty < h.clone_labels.len && h.clone_labels[elem_ty] >= 0 {
+                ecl := h.clone_labels[elem_ty]
+                ptr_s := alloc_slot(&mut fc)
+                rem_s := alloc_slot(&mut fc)
+                arm.load_into(&mut code, arr_slot, 10)
+                helpers.load_mem(&mut code, 11, 10, 0) // dst_data
+                arm.store(&mut code, ptr_s, 11)
+                arm.load_into(&mut code, len_slot, 11)
+                arm.store(&mut code, rem_s, 11)
+                cl_lp := arm.label(&mut code)
+                cl_done := arm.label(&mut code)
+                arm.mark(&mut code, cl_lp)
+                arm.load(&mut code, rem_s)
+                arm.branch(&mut code, cl_done, 18) // cbz x0, cl_done
+                arm.load_into(&mut code, ptr_s, 10)
+                helpers.load_mem(&mut code, 0, 10, 0)
+                arm.branch(&mut code, ecl, 1)
+                arm.load_into(&mut code, ptr_s, 10)
+                helpers.store_mem(&mut code, 0, 10, 0)
+                arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 8)
+                arm.store(&mut code, ptr_s, 10)
+                arm.load(&mut code, rem_s)
+                arm.integer_binary(&mut code, 2, true, false, 0, 0, -1, 1)
+                arm.store(&mut code, rem_s, 0)
+                arm.branch(&mut code, cl_lp, 0)
+                arm.mark(&mut code, cl_done)
+            }
             arm.load_into(&mut code, arr_slot, 0)
             arm.load_into(&mut code, dst_addr, 10)
             helpers.store_mem(&mut code, 0, 10, 0)
@@ -1522,6 +1833,12 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         } else if ak == .Rune {
             emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
             arm.branch(&mut code, h.rt.string_rune, 1)
+        } else if helpers.is_float_ty(aty) && h.fmt_float_label >= 0 {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
+            if aty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+            arm.imm(&mut code, 1, if aty == ht.TY_F32 { 1 } else { 0 })
+            arm.imm(&mut code, 2, -1)
+            arm.branch(&mut code, h.fmt_float_label, 1)
         } else {
             emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
             arm.imm(&mut code, 2, if helpers.is_unsigned_int(aty) { 1 } else { 0 })
@@ -1690,7 +2007,7 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
 
     // 13c. Map<K, V> and Set<K> runtime intrinsics
     if (id >= hb.INTRINSIC_MAP_FIND_INDEX && id <= hb.INTRINSIC_MAP_NEW) ||
-        (id >= hb.INTRINSIC_SET_INSERT && id <= hb.INTRINSIC_MAP_TAKE) {
+        (id >= hb.INTRINSIC_MAP_TAKE_AT && id <= hb.INTRINSIC_MAP_TAKE) {
         emit_map_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
         return
     }
@@ -1941,8 +2258,14 @@ fn emit_int_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBo
     fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
     dest_pl := tm.place_or_op
     dest_ty := body.places[dest_pl].ty
-    dst_addr := alloc_slot(&mut fc)
-    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+    mut direct_slot := -1
+    mut dst_addr := -1
+    if is_direct_place(&body, &fc, dest_pl) {
+        direct_slot = fc.local_slots[body.places[dest_pl].local]
+    } else {
+        dst_addr = alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+    }
     lhs_op := body.call_args[tm.arg_start]
     lty := operand_type(&body, lhs_op)
     is_u := helpers.is_unsigned_int(lty) || lty == ht.TY_RUNE
@@ -1950,23 +2273,31 @@ fn emit_int_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBo
     bits := if lty == ht.TY_I8 || lty == ht.TY_U8 { 8 }
         else if lty == ht.TY_I16 || lty == ht.TY_U16 { 16 }
         else if is_64 { 64 } else { 32 }
-    lhs_s := alloc_slot(&mut fc)
-    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, lhs_op, 0)
-    arm.store(&mut code, lhs_s, 0)
-    mut rhs_s := -1
-    if tm.arg_len >= 2 {
-        rhs_s = alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0)
-        arm.store(&mut code, rhs_s, 0)
-    }
     mut arg2_s := -1
-    if tm.arg_len >= 3 {
-        arg2_s = alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0)
-        arm.store(&mut code, arg2_s, 0)
+    if tm.arg_len == 1 && is_simple_scalar_op(&body, &fc, lhs_op) {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, lhs_op, 0)
+        arm.imm(&mut code, 1, 0)
+    } else if tm.arg_len == 2 && is_simple_scalar_op(&body, &fc, lhs_op) && is_simple_scalar_op(&body, &fc, body.call_args[tm.arg_start + 1]) {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, lhs_op, 0)
+    } else {
+        lhs_s := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, lhs_op, 0)
+        arm.store(&mut code, lhs_s, 0)
+        mut rhs_s := -1
+        if tm.arg_len >= 2 {
+            rhs_s = alloc_slot(&mut fc)
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0)
+            arm.store(&mut code, rhs_s, 0)
+        }
+        if tm.arg_len >= 3 {
+            arg2_s = alloc_slot(&mut fc)
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0)
+            arm.store(&mut code, arg2_s, 0)
+        }
+        arm.load(&mut code, lhs_s)
+        if rhs_s >= 0 { arm.load_into(&mut code, rhs_s, 1) } else { arm.imm(&mut code, 1, 0) }
     }
-    arm.load(&mut code, lhs_s)
-    if rhs_s >= 0 { arm.load_into(&mut code, rhs_s, 1) } else { arm.imm(&mut code, 1, 0) }
     if id == hb.INTRINSIC_INT_BIT_AND { arm.integer_binary(&mut code, 8, true, false, 0, 0, 1, -1) }
     else if id == hb.INTRINSIC_INT_BIT_OR { arm.integer_binary(&mut code, 9, true, false, 0, 0, 1, -1) }
     else if id == hb.INTRINSIC_INT_BIT_XOR { arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1) }
@@ -2114,8 +2445,7 @@ fn emit_int_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBo
         else if !is_u && bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
         else if !is_u && bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
     }
-    arm.load_into(&mut code, dst_addr, 10)
-    helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+    emit_store_dest(&mut code, &prog.types, dest_ty, direct_slot, dst_addr, 0)
 }
 
 fn emit_opt_res_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
@@ -2319,6 +2649,50 @@ fn emit_misc_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         }
         arm.load_into(&mut code, dst_addr, 10)
         helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_FORMAT_FIXED && tm.arg_len >= 2 && h.fmt_float_label >= 0 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        val_op := body.call_args[tm.arg_start]
+        vty := operand_type(&body, val_op)
+        spec_op := body.ops[body.call_args[tm.arg_start + 1]]
+        spec_txt := if spec_op.kind == .Const { body.consts[spec_op.id].text.clone() } else { "" }
+        decimals := lexer.fixed_precision(spec_txt)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+        if vty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+        arm.imm(&mut code, 1, if vty == ht.TY_F32 { 1 } else { 0 })
+        arm.imm(&mut code, 2, i64(decimals))
+        arm.branch(&mut code, h.fmt_float_label, 1)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_PTR_AS_REF && tm.arg_len >= 1 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        ptr_s := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
+        arm.store(&mut code, ptr_s, 0)
+        is_null_l := arm.label(&mut code)
+        done_l := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 0, 0, false)
+        arm.branch(&mut code, is_null_l, 2)
+        // Non-null -> Option::Some(ptr) (tag = 0, payload = ptr)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+        arm.load(&mut code, ptr_s)
+        arm.load_into(&mut code, dst_addr, 10)
+        poff := helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0)
+        helpers.store_mem(&mut code, 0, 10, poff)
+        arm.branch(&mut code, done_l, 0)
+        // Null -> Option::None (tag = 1)
+        arm.mark(&mut code, is_null_l)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+        arm.imm(&mut code, 0, 1)
+        arm.transfer(&mut code, false, 0, 10, 2, 0)
+        arm.mark(&mut code, done_l)
         return
     }
     if id >= hb.INTRINSIC_LOAD_U64 && id <= hb.INTRINSIC_LOAD_PTR && tm.arg_len >= 1 {
@@ -2628,6 +3002,13 @@ fn map_key_kind_for(types: &ht.TypeTable, key_ty: i32) -> i64 {
     if key_ty == ht.TY_STRING { return 1 }
     if helpers.is_inline_agg(&types, key_ty) { return i64(2 + helpers.type_byte_size(&types, key_ty)) }
     if helpers.is_fat_pair(&types, key_ty) { return 18 }
+    if key_ty >= 0 && key_ty < types.entries.len {
+        k := types.entries[key_ty].kind
+        if k == .Struct || k == .Tuple {
+            sz := helpers.type_byte_size(&types, key_ty)
+            if sz > 0 { return i64(-sz) }
+        }
+    }
     0
 }
 
@@ -2946,8 +3327,8 @@ fn emit_map_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBo
         return
     }
 
-    // 6. key_at / value_at / value_at_mut / keys / values
-    if (id == hb.INTRINSIC_MAP_KEY_AT || id == hb.INTRINSIC_MAP_VAL_AT || id == hb.INTRINSIC_MAP_VAL_AT_MUT) && tm.arg_len >= 2 {
+    // 6. key_at / value_at / value_at_mut / value_at_ref / take_at / keys / values
+    if (id == hb.INTRINSIC_MAP_KEY_AT || id == hb.INTRINSIC_MAP_VAL_AT || id == hb.INTRINSIC_MAP_VAL_AT_MUT || id == hb.INTRINSIC_MAP_VAL_AT_REF) && tm.arg_len >= 2 {
         emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
         arr_off := if id == hb.INTRINSIC_MAP_KEY_AT { 0 } else { 8 }
         e_ty := if id == hb.INTRINSIC_MAP_KEY_AT { k_ty } else { v_ty }
@@ -2961,12 +3342,93 @@ fn emit_map_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBo
         arm.imm(&mut code, 12, i64(stride))
         arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
         arm.integer_binary(&mut code, 1, true, false, 11, 10, 12, -1)
-        if id == hb.INTRINSIC_MAP_VAL_AT_MUT {
+        if id == hb.INTRINSIC_MAP_VAL_AT_MUT || id == hb.INTRINSIC_MAP_VAL_AT_REF {
             arm.load_into(&mut code, dst_addr, 10)
             helpers.store_mem(&mut code, 11, 10, 0)
         } else {
             emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, e_ty, 11, dst_addr)
         }
+        return
+    }
+    if id == hb.INTRINSIC_MAP_TAKE_AT && tm.arg_len >= 2 {
+        idx_s := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.store(&mut code, idx_s, 1)
+        miss_l := arm.label(&mut code); done_l := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 1, 0, false)
+        arm.branch(&mut code, miss_l, 13) // < 0
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 10, 10, 0) // keys array
+        helpers.load_mem(&mut code, 11, 10, 8) // len
+        arm.load_into(&mut code, idx_s, 1)
+        arm.compare_register(&mut code, 1, 11)
+        arm.branch(&mut code, miss_l, 4) // >= len
+        // Load key pointer (for map_remove) and target element pointer
+        k_s := alloc_slot(&mut fc)
+        k_stride := helpers.elem_stride(&prog.types, k_ty)
+        helpers.load_mem(&mut code, 10, 10, 0) // keys data
+        arm.imm(&mut code, 12, i64(k_stride))
+        arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
+        arm.integer_binary(&mut code, 1, true, false, 11, 10, 12, -1)
+        if helpers.is_inline_agg(&prog.types, k_ty) || helpers.is_fat_pair(&prog.types, k_ty) {
+            arm.store(&mut code, k_s, 11)
+        } else {
+            helpers.load_typed_at(&mut code, &prog.types, k_ty, 0, 11, 0)
+            arm.store(&mut code, k_s, 0)
+        }
+        elem_ptr_s := alloc_slot(&mut fc)
+        arr_off := if is_set { 0 } else { 8 }
+        arr_e_ty := if is_set { k_ty } else { v_ty }
+        pay_ty := ht.variant_payload_type(&prog.types, dest_ty, 0, 0)
+        e_stride := helpers.elem_stride(&prog.types, arr_e_ty)
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 10, 10, arr_off)
+        helpers.load_mem(&mut code, 10, 10, 0)
+        arm.imm(&mut code, 11, i64(e_stride))
+        arm.load_into(&mut code, idx_s, 12)
+        arm.integer_binary(&mut code, 3, true, false, 11, 12, 11, -1)
+        arm.integer_binary(&mut code, 1, true, false, 11, 10, 11, -1)
+        arm.store(&mut code, elem_ptr_s, 11)
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            p_dst := alloc_slot(&mut fc)
+            arm.load_into(&mut code, dst_addr, 10)
+            emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+            arm.store(&mut code, p_dst, 10)
+            arm.load_into(&mut code, elem_ptr_s, 11)
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, pay_ty, 11, p_dst)
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            obj_s := alloc_slot(&mut fc)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            arm.store(&mut code, obj_s, 0); helpers.zero_bytes(&mut code, 0, alloc_sz)
+            p_dst := alloc_slot(&mut fc)
+            arm.load_into(&mut code, obj_s, 10)
+            emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+            arm.store(&mut code, p_dst, 10)
+            arm.load_into(&mut code, elem_ptr_s, 11)
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, pay_ty, 11, p_dst)
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        arm.load(&mut code, hdr_s)
+        arm.load_into(&mut code, k_s, 1)
+        arm.branch(&mut code, h.map_remove, 1)
+        arm.branch(&mut code, done_l, 0)
+        arm.mark(&mut code, miss_l)
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            arm.imm(&mut code, 0, 1); arm.transfer(&mut code, false, 0, 10, 2, 0)
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            obj_s := alloc_slot(&mut fc); arm.store(&mut code, obj_s, 0)
+            helpers.zero_bytes(&mut code, 0, alloc_sz)
+            arm.imm(&mut code, 1, 1); arm.transfer(&mut code, false, 1, 0, 2, 0)
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        arm.mark(&mut code, done_l)
         return
     }
     if id == hb.INTRINSIC_MAP_KEYS || id == hb.INTRINSIC_MAP_VALUES {
@@ -3266,11 +3728,11 @@ fn emit_call_term(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         ffi_emit.emit_extern_call_v2(&mut code, &prog.types, &mut ffi, &h.rt, &ext_fn,
             &arg_tys, &arg_slots, dest_ty, ret_addr_slot, cb_ctx_slot)
         if dest_ty != ht.TY_UNIT && !ret_is_rec {
-            val_s := alloc_slot(&mut fc)
-            arm.store(&mut code, val_s, 0)
-            emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
-            arm.load(&mut code, val_s)
             if ffi_emit.is_opt_extern_fn(&prog.types, dest_ty) {
+                val_s := alloc_slot(&mut fc)
+                arm.store(&mut code, val_s, 0)
+                emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
+                arm.load(&mut code, val_s)
                 is_null := arm.label(&mut code); done_r := arm.label(&mut code)
                 arm.branch(&mut code, is_null, 18) // cbz x0, is_null
                 arm.imm(&mut code, 1, 0)
@@ -3282,7 +3744,14 @@ fn emit_call_term(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 arm.imm(&mut code, 1, 1)
                 arm.transfer(&mut code, false, 1, 10, 4, 0)
                 arm.mark(&mut code, done_r)
+            } else if is_direct_place(&body, &fc, dest_pl) {
+                emit_normalize_narrow(&mut code, dest_ty, 0)
+                arm.store(&mut code, fc.local_slots[body.places[dest_pl].local], 0)
             } else {
+                val_s := alloc_slot(&mut fc)
+                arm.store(&mut code, val_s, 0)
+                emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
+                arm.load(&mut code, val_s)
                 helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
             }
         }
@@ -3301,74 +3770,110 @@ fn emit_call_term(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         arm.store(&mut code, callee_slot, 0)
     }
 
-    // 2. Materialize all argument words into temporary frame slots (strict left-to-right!)
-    mut arg_word_slots: []i32 = []
-    for ai in 0..tm.arg_len {
-        aop := body.call_args[tm.arg_start + ai]
-        aty := operand_type(&body, aop)
-        if helpers.is_fat_pair(&prog.types, aty) {
-            b := alloc_slots(&mut fc, 2)
-            a_slot := alloc_slot(&mut fc)
-            emit_slots_addr(&mut code, b, 2, 0); arm.store(&mut code, a_slot, 0)
-            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, aop, a_slot)
-            // Byte 0 (ptr) is at slot b+1, byte 8 (len) is at slot b
-            arg_word_slots.push(b + 1)
-            arg_word_slots.push(b)
-        } else if helpers.is_inline_agg(&prog.types, aty) {
-            cnt := helpers.local_slot_count(&prog.types, aty)
-            b := alloc_slots(&mut fc, cnt)
-            a_slot := alloc_slot(&mut fc)
-            emit_slots_addr(&mut code, b, cnt, 0); arm.store(&mut code, a_slot, 0)
-            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, aop, a_slot)
-            arg_word_slots.push(a_slot) // passes pointer to caller-staged inline aggregate
-        } else {
-            s := alloc_slot(&mut fc)
-            mut is_move_param := false
+    // 2. Check fast path: <= 8 simple scalar args (non-fat, non-inline-agg, non-move-owned) -> load directly into x0..x7!
+    mut fast_direct_args := tm.arg_len <= 8 && !helpers.is_inline_agg(&prog.types, dest_ty)
+    if fast_direct_args {
+        for ai in 0..tm.arg_len {
+            aop := body.call_args[tm.arg_start + ai]
+            aty := operand_type(&body, aop)
+            if helpers.is_fat_pair(&prog.types, aty) || helpers.is_inline_agg(&prog.types, aty) || !is_simple_scalar_op(&body, &fc, aop) {
+                fast_direct_args = false; break
+            }
             if tm.sig_ty >= 0 && tm.sig_ty < prog.types.entries.len {
                 pcnt := ht.callable_param_count(&prog.types, tm.sig_ty)
                 if ai < pcnt {
                     pstart := ht.callable_param_start(&prog.types, tm.sig_ty)
-                    is_move_param = prog.types.params[pstart + ai].mode == .MoveVal
+                    if prog.types.params[pstart + ai].mode == .MoveVal && helpers.type_needs_drop(&prog.types, aty) {
+                        fast_direct_args = false; break
+                    }
                 }
             }
-            if is_move_param {
-                emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
-            } else {
-                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
-            }
-            arm.store(&mut code, s, 0)
-            arg_word_slots.push(s)
         }
     }
 
-    // 3. Prepare sret pointer in x8 if return type is inline aggregate
+    // 3. Prepare sret / dest address before fast-path register loading!
     use_sret := helpers.is_inline_agg(&prog.types, dest_ty)
+    mut dest_direct_slot := -1
     mut dest_addr_slot := -1
     if dest_ty != ht.TY_UNIT {
-        dest_addr_slot = alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0)
-        arm.store(&mut code, dest_addr_slot, 0)
-    }
-
-    // 4. Push stack overflow args if total_words > 8
-    total_words := arg_word_slots.len
-    mut stack_bytes := 0
-    if total_words > 8 {
-        stack_bytes = (((total_words - 8) * 8) + 15) / 16 * 16
-        arm.integer_binary(&mut code, 2, true, false, 31, 31, -1, i64(stack_bytes))
-        for wi in 8..total_words {
-            arm.load_into(&mut code, arg_word_slots[wi], 10)
-            helpers.store_mem(&mut code, 10, 31, (wi - 8) * 8)
+        if !use_sret && is_direct_place(&body, &fc, dest_pl) {
+            dest_direct_slot = fc.local_slots[body.places[dest_pl].local]
+        } else {
+            dest_addr_slot = alloc_slot(&mut fc)
+            emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0)
+            arm.store(&mut code, dest_addr_slot, 0)
         }
     }
 
-    // 5. Load register args x0..x7, x8 (sret), x9 (closure env)
-    reg_limit := if total_words < 8 { total_words } else { 8 }
-    for wi in 0..reg_limit {
-        arm.load_into(&mut code, arg_word_slots[wi], wi)
-    }
-    if use_sret {
-        arm.load_into(&mut code, dest_addr_slot, 8)
+    mut stack_bytes := 0
+    if fast_direct_args {
+        // Load args in reverse order (n-1 down to 0) directly into x0..x{n-1} so load_label_addr's x0 clobber never overwrites x0!
+        mut ai := tm.arg_len - 1
+        while ai >= 0 {
+            aop := body.call_args[tm.arg_start + ai]
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, ai)
+            ai -= 1
+        }
+    } else {
+        // Materialize all argument words into temporary frame slots (strict left-to-right!)
+        mut arg_word_slots: []i32 = []
+        for ai in 0..tm.arg_len {
+            aop := body.call_args[tm.arg_start + ai]
+            aty := operand_type(&body, aop)
+            if helpers.is_fat_pair(&prog.types, aty) {
+                b := alloc_slots(&mut fc, 2)
+                a_slot := alloc_slot(&mut fc)
+                emit_slots_addr(&mut code, b, 2, 0); arm.store(&mut code, a_slot, 0)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, aop, a_slot)
+                // Byte 0 (ptr) is at slot b+1, byte 8 (len) is at slot b
+                arg_word_slots.push(b + 1)
+                arg_word_slots.push(b)
+            } else if helpers.is_inline_agg(&prog.types, aty) {
+                cnt := helpers.local_slot_count(&prog.types, aty)
+                b := alloc_slots(&mut fc, cnt)
+                a_slot := alloc_slot(&mut fc)
+                emit_slots_addr(&mut code, b, cnt, 0); arm.store(&mut code, a_slot, 0)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, aop, a_slot)
+                arg_word_slots.push(a_slot) // passes pointer to caller-staged inline aggregate
+            } else {
+                s := alloc_slot(&mut fc)
+                mut is_move_param := false
+                if tm.sig_ty >= 0 && tm.sig_ty < prog.types.entries.len {
+                    pcnt := ht.callable_param_count(&prog.types, tm.sig_ty)
+                    if ai < pcnt {
+                        pstart := ht.callable_param_start(&prog.types, tm.sig_ty)
+                        is_move_param = prog.types.params[pstart + ai].mode == .MoveVal
+                    }
+                }
+                if is_move_param {
+                    emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
+                } else {
+                    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
+                }
+                arm.store(&mut code, s, 0)
+                arg_word_slots.push(s)
+            }
+        }
+
+        // 4. Push stack overflow args if total_words > 8
+        total_words := arg_word_slots.len
+        if total_words > 8 {
+            stack_bytes = (((total_words - 8) * 8) + 15) / 16 * 16
+            arm.integer_binary(&mut code, 2, true, false, 31, 31, -1, i64(stack_bytes))
+            for wi in 8..total_words {
+                arm.load_into(&mut code, arg_word_slots[wi], 10)
+                helpers.store_mem(&mut code, 10, 31, (wi - 8) * 8)
+            }
+        }
+
+        // 5. Load register args x0..x7, x8 (sret), x9 (closure env)
+        reg_limit := if total_words < 8 { total_words } else { 8 }
+        for wi in 0..reg_limit {
+            arm.load_into(&mut code, arg_word_slots[wi], wi)
+        }
+        if use_sret {
+            arm.load_into(&mut code, dest_addr_slot, 8)
+        }
     }
 
     // 6. Emit call
@@ -3392,7 +3897,9 @@ fn emit_call_term(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
 
     // 7. Store return value into dest_pl (unless sret already wrote it directly!)
     if dest_ty != ht.TY_UNIT && !use_sret {
-        if helpers.is_fat_pair(&prog.types, dest_ty) {
+        if dest_direct_slot >= 0 {
+            arm.store(&mut code, dest_direct_slot, 0)
+        } else if helpers.is_fat_pair(&prog.types, dest_ty) {
             r0 := alloc_slot(&mut fc); r1 := alloc_slot(&mut fc)
             arm.store(&mut code, r0, 0); arm.store(&mut code, r1, 1)
             arm.load_into(&mut code, dest_addr_slot, 10)
@@ -3573,6 +4080,69 @@ fn compute_live_blocks(body: &mb.MirBody, platform: i32) -> []bool {
     live
 }
 
+fn compute_local_direct(types: &ht.TypeTable, body: &mb.MirBody, is_cl: bool, cap_cnt: i32) -> []bool {
+    n := body.locals.len
+    mut direct: []bool = []
+    direct.reserve(n)
+    for l in 0..n {
+        ty := body.locals[l].ty
+        ok := ty >= 0 && ty < types.entries.len &&
+            ty != ht.TY_UNIT &&
+            !helpers.is_fat_pair(&types, ty) &&
+            !helpers.is_inline_agg(&types, ty) &&
+            (helpers.is_boxed_heap(&types, ty) || helpers.type_byte_size(&types, ty) == 8 ||
+                ty == ht.TY_BOOL || ty == ht.TY_I32 || ty == ht.TY_U8 || ty == ht.TY_U32 || ty == ht.TY_RUNE)
+        direct.push(ok)
+    }
+    if is_cl && cap_cnt > 0 {
+        for ci in 0..cap_cnt {
+            loc_id := 1 + body.param_count + ci
+            if loc_id >= 0 && loc_id < n { direct[loc_id] = false }
+        }
+    }
+    // Narrow (< 8B) locals whose address is taken (Ref, AddrOf, Slice, BytesView) may be written via 1/2/4B stores,
+    // leaving upper bits dirty; disqualify narrow locals, while keeping full 8-byte locals direct (BorrowHome marks them escaped).
+    for rvi in 0..body.rvalues.len {
+        rv := body.rvalues[rvi]
+        if rv.kind == .Ref || rv.kind == .Slice || rv.kind == .BytesView {
+            ln := body.loans[rv.a]
+            pl := body.places[ln.place]
+            if pl.proj_len == 0 && pl.local >= 0 && pl.local < n {
+                lty := body.locals[pl.local].ty
+                if !helpers.is_boxed_heap(&types, lty) && helpers.type_byte_size(&types, lty) < 8 {
+                    direct[pl.local] = false
+                }
+            }
+        } else if rv.kind == .AddrOf {
+            pl := body.places[rv.a]
+            if pl.proj_len == 0 && pl.local >= 0 && pl.local < n {
+                lty := body.locals[pl.local].ty
+                if !helpers.is_boxed_heap(&types, lty) && helpers.type_byte_size(&types, lty) < 8 {
+                    direct[pl.local] = false
+                }
+            }
+        }
+    }
+    // Narrow locals (< 8 bytes) written via Intrinsic calls (other than emit_int_intrinsic) use store_typed_at (1/2/4B),
+    // so keep them indirect to avoid reading stale upper bits.
+    for ti in 0..body.terms.len {
+        tm := body.terms[ti]
+        if tm.kind == .Call && tm.call_kind == .Intrinsic {
+            is_int_op := tm.callee <= hb.INTRINSIC_INT_BIT_OR && tm.callee >= hb.INTRINSIC_INT_COUNT_ZEROS
+            if !is_int_op && tm.place_or_op >= 0 && tm.place_or_op < body.places.len {
+                pl := body.places[tm.place_or_op]
+                if pl.proj_len == 0 && pl.local >= 0 && pl.local < n {
+                    dty := body.locals[pl.local].ty
+                    if !helpers.is_boxed_heap(&types, dty) && helpers.type_byte_size(&types, dty) < 8 {
+                        direct[pl.local] = false
+                    }
+                }
+            }
+        }
+    }
+    direct
+}
+
 fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     h: &mut helpers.EmitHelpers, ffi: &mut ffi_emit.FfiState, ts: &mut task_emit.TaskEmitState,
     cb_fn_labels: &[]i32, ext_static_slots: &[]i32, dbg: &mut DebugEmitBuf) {
@@ -3600,9 +4170,12 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         cap_moved: if is_cl { detect_moved_captures(&body, cap_cnt) } else { [] },
         local_slots: [],
         local_counts: [],
+        local_direct: compute_local_direct(&prog.types, &body, is_cl, cap_cnt),
         sret_slot: -1,
         env_slot: -1,
         next_slot: 0,
+        max_slot: 0,
+        pinned_slot: 0,
         bb_labels: [],
         region_slots: [],
         cb_fn_labels: move cb_copy,
@@ -3611,18 +4184,18 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         imp_slots: [],
     }
 
-    // 1. Pre-allocate static frame slots for all MirLocals
-    for l in 0..body.locals.len {
-        cnt := helpers.local_slot_count(&prog.types, body.locals[l].ty)
-        base := alloc_slots(&mut fc, cnt)
-        fc.local_slots.push(base)
-        fc.local_counts.push(cnt)
-    }
+    // 1. Pre-allocate static frame slots (sret & env first so env_slot < 32 for mir_capture!)
     if helpers.is_inline_agg(&prog.types, body.ret_ty) {
         fc.sret_slot = alloc_slot(&mut fc)
     }
     if is_cl {
         fc.env_slot = alloc_slot(&mut fc)
+    }
+    for l in 0..body.locals.len {
+        cnt := helpers.local_slot_count(&prog.types, body.locals[l].ty)
+        base := alloc_slots(&mut fc, cnt)
+        fc.local_slots.push(base)
+        fc.local_counts.push(cnt)
     }
     for s in 0..body.scopes.len {
         if body.scopes[s].kind == .Region {
@@ -3632,6 +4205,7 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             fc.region_slots.push(-1)
         }
     }
+    fc.pinned_slot = fc.next_slot
     for _ in 0..body.blocks.len {
         fc.bb_labels.push(arm.label(&mut code))
     }
@@ -3667,6 +4241,7 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             arg_word_idx += 1
         } else if helpers.is_inline_agg(&prog.types, pty) {
             // 1 word pointer to caller-staged inline aggregate -> copy into local slots
+            p_mark := fc.next_slot
             ptr_s := alloc_slot(&mut fc)
             if arg_word_idx < 8 { arm.store(&mut code, ptr_s, arg_word_idx) }
             else {
@@ -3677,6 +4252,7 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             emit_local_addr(&mut code, &fc, loc_id, 10)
             arm.load_into(&mut code, ptr_s, 11)
             helpers.copy_bytes(&mut code, 10, 11, helpers.type_byte_size(&prog.types, pty))
+            fc.next_slot = p_mark
         } else {
             b := fc.local_slots[loc_id]
             if arg_word_idx < 8 { arm.store(&mut code, b, arg_word_idx) }
@@ -3730,12 +4306,19 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         }
 
         for si in blk.stmt_start..blk.stmt_end {
+            stmt_mark := fc.next_slot
             st := body.stmts[si]
             if dbg.enabled && st.span_start >= 0 && st.span_start != last_dbg_span {
                 last_dbg_span = st.span_start
                 dbg.line_mods.push(hf.owner_mod)
                 dbg.line_spans.push(st.span_start)
-                dbg.line_offsets.push(arm.position(&code))
+                if code.platform == 2 {
+                    llbl := arm.label(&mut code)
+                    arm.mark(&mut code, llbl)
+                    dbg.line_offsets.push(llbl)
+                } else {
+                    dbg.line_offsets.push(arm.position(&code))
+                }
             }
             if st.kind == .Assign {
                 // Skip synthetic zero-init Assign for closure capture locals in bb 0
@@ -3755,10 +4338,12 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 arm.imm(&mut code, 0, i64(st.aux))
                 arm.store(&mut code, fc.local_slots[st.place], 0)
             }
+            fc.next_slot = if fc.pinned_slot > stmt_mark { fc.pinned_slot } else { stmt_mark }
             // StorageLive / StorageDead / Nop: no machine code needed (slots are statically allocated)
         }
 
         if blk.term_id < 0 { continue }
+        term_mark := fc.next_slot
         tm := body.terms[blk.term_id]
 
         if tm.kind == .Goto {
@@ -3911,6 +4496,8 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 arm.load_into(&mut code, fc.sret_slot, 10)
                 emit_local_addr(&mut code, &fc, 0, 11)
                 helpers.copy_bytes(&mut code, 10, 11, helpers.type_byte_size(&prog.types, body.ret_ty))
+            } else if fc.local_direct[0] {
+                arm.load_into(&mut code, fc.local_slots[0], 0)
             } else {
                 emit_local_addr(&mut code, &fc, 0, 10)
                 helpers.load_typed_at(&mut code, &prog.types, body.ret_ty, 0, 10, 0)
@@ -3919,10 +4506,11 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         } else if tm.kind == .Trap {
             arm.branch(&mut code, h.trap_unreachable, 0)
         }
+        fc.next_slot = if fc.pinned_slot > term_mark { fc.pinned_slot } else { term_mark }
     }
 
     // 5. Patch final frame size & flush extern-static import sites
-    arm.frame(&mut code, frame_at, fc.next_slot)
+    arm.frame(&mut code, frame_at, fc.max_slot)
     for ii in 0..fc.imp_sites.len {
         ffi.sites.push(fc.imp_sites[ii])
         ffi.slots.push(fc.imp_slots[ii])
@@ -3931,8 +4519,15 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         dbg.fn_names.push(hf.name.clone())
         dbg.fn_mods.push(hf.owner_mod)
         dbg.fn_spans.push(hf.span_start)
-        dbg.fn_starts.push(fn_start_word)
-        dbg.fn_ends.push(arm.position(&code))
+        if code.platform == 2 {
+            end_lbl := arm.label(&mut code)
+            arm.mark(&mut code, end_lbl)
+            dbg.fn_starts.push(h.fn_labels[fid])
+            dbg.fn_ends.push(end_lbl)
+        } else {
+            dbg.fn_starts.push(fn_start_word)
+            dbg.fn_ends.push(arm.position(&code))
+        }
     }
 }
 
@@ -3940,7 +4535,56 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
 // Public Entry Point
 // =========================================================================
 
-fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) -> []bool {
+fn mark_ty_reachable(prog: &hb.HirProgram, root_ty: i32, used_tys: &mut []bool,
+    fn_to_body: &[]i32, reach: &mut []bool, work: &mut []i32) {
+    if root_ty < 0 || root_ty >= used_tys.len || used_tys[root_ty] { return }
+    mut q: []i32 = [root_ty]
+    used_tys[root_ty] = true
+    mut head := 0
+    while head < q.len {
+        ty := q[head]
+        head += 1
+        te := &prog.types.entries[ty]
+        df := te.dispose_fn
+        if df >= 0 && df < reach.len && fn_to_body[df] >= 0 && !reach[df] {
+            reach[df] = true
+            work.push(df)
+        }
+        if te.kind == .Struct || te.kind == .Tuple {
+            mi := ht.find_map_inst(&prog.types, ty)
+            if mi >= 0 {
+                kt := prog.types.map_insts[mi].key_ty
+                vt := prog.types.map_insts[mi].val_ty
+                if kt >= 0 && kt < used_tys.len && !used_tys[kt] { used_tys[kt] = true; q.push(kt) }
+                if vt >= 0 && vt < used_tys.len && !used_tys[vt] { used_tys[vt] = true; q.push(vt) }
+            } else {
+                for fi in 0..te.count {
+                    ft := prog.types.fields[te.inner_a + fi].ty
+                    if ft >= 0 && ft < used_tys.len && !used_tys[ft] { used_tys[ft] = true; q.push(ft) }
+                }
+            }
+        } else if te.kind == .Enum {
+            for vi in 0..te.count {
+                v := &prog.types.variants[te.inner_a + vi]
+                for pi in 0..v.payload_count {
+                    pt := prog.types.fields[v.payload_start + pi].ty
+                    if pt >= 0 && pt < used_tys.len && !used_tys[pt] { used_tys[pt] = true; q.push(pt) }
+                }
+            }
+        } else if te.kind == .Array || te.kind == .FixedArr || te.kind == .FatSlice || te.kind == .RegionSlice ||
+            te.kind == .Ref || te.kind == .MutRef || te.kind == .RawConst || te.kind == .RawMut || te.kind == .Task {
+            it := te.inner_a
+            if it >= 0 && it < used_tys.len && !used_tys[it] { used_tys[it] = true; q.push(it) }
+        } else if te.kind == .ClosureEnv {
+            for ci in 0..te.count {
+                ct := prog.types.fields[te.inner_a + ci].ty
+                if ct >= 0 && ct < used_tys.len && !used_tys[ct] { used_tys[ct] = true; q.push(ct) }
+            }
+        }
+    }
+}
+
+fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32, fmt_float_fid: i32) -> []bool {
     n_fns := prog.fns.len
     mut fn_to_body: []i32 = []
     mut reach: []bool = []
@@ -3949,17 +4593,12 @@ fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: 
         fid := bodies[bi].fn_id
         if fid >= 0 && fid < n_fns { fn_to_body[fid] = bi }
     }
+    mut used_tys: []bool = []
+    for _ in 0..prog.types.entries.len { used_tys.push(false) }
     mut work: []i32 = []
     if prog.entry_fn >= 0 && prog.entry_fn < n_fns {
         reach[prog.entry_fn] = true
         work.push(prog.entry_fn)
-    }
-    for ti in 0..prog.types.entries.len {
-        df := prog.types.entries[ti].dispose_fn
-        if df >= 0 && df < n_fns && !reach[df] {
-            reach[df] = true
-            work.push(df)
-        }
     }
     mut head := 0
     while head < work.len {
@@ -3968,6 +4607,9 @@ fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: 
         bi := fn_to_body[fid]
         if bi < 0 { continue }
         b := &bodies[bi]
+        for li in 0..b.locals.len {
+            mark_ty_reachable(&prog, b.locals[li].ty, &mut used_tys, &fn_to_body, &mut reach, &mut work)
+        }
         bb_live := compute_live_blocks(&b, platform)
         for bb in 0..b.blocks.len {
             if !bb_live[bb] { continue }
@@ -3977,6 +4619,14 @@ fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: 
                 if tm.kind == .Call && tm.call_kind == .Direct && tm.callee >= 0 && tm.callee < n_fns && !reach[tm.callee] {
                     reach[tm.callee] = true
                     work.push(tm.callee)
+                } else if tm.kind == .Call && tm.call_kind == .Intrinsic && fmt_float_fid >= 0 && !reach[fmt_float_fid] &&
+                    (tm.callee == hb.INTRINSIC_TO_STR || tm.callee == hb.INTRINSIC_PRINT || tm.callee == hb.INTRINSIC_EPRINT || tm.callee == hb.INTRINSIC_FORMAT_FIXED) &&
+                    tm.arg_len >= 1 {
+                    aty := operand_type(&b, b.call_args[tm.arg_start])
+                    if helpers.is_float_ty(aty) {
+                        reach[fmt_float_fid] = true
+                        work.push(fmt_float_fid)
+                    }
                 }
             }
             for si in blk.stmt_start..blk.stmt_end {
@@ -3997,9 +4647,9 @@ fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: 
             c := &b.consts[ci]
             if c.ty >= 0 && c.ty < prog.types.entries.len {
                 ck := prog.types.entries[c.ty].kind
-                if (ck == .FnPtr || ck == .ExternFn) && c.int_val >= 0 && i32(c.int_val) < n_fns {
+                if (ck == .FnPtr || ck == .ExternFn) && c.text != "" && c.int_val >= 0 && i32(c.int_val) < n_fns {
                     tf := i32(c.int_val)
-                    if !reach[tf] {
+                    if !prog.fns[tf].is_extern && !prog.fns[tf].is_generic_template && fn_to_body[tf] >= 0 && !reach[tf] {
                         reach[tf] = true
                         work.push(tf)
                     }
@@ -4019,14 +4669,85 @@ fn fail_emit(msg: string) -> EmitResult {
         debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
         debug_fn_starts: [], debug_fn_ends: [],
         debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
+        opt_summary: "",
+    }
+}
+
+struct OptPolicy {
+    opts: mir_pipeline.Options,
+    terminals: mir_pipeline.Terminals,
+}
+
+struct OptBatchIn {
+    src: mir_source.Batch,
+    body_indices: []i32,
+}
+
+struct OptBatchOut {
+    body_indices: []i32,
+    statuses: []i32,       // 0 = ok, 1 = lift_fail, 2 = pipe_fail, 3 = lower_fail
+    objs: []mir_lower.ObjectData,
+    promoted: i32,
+    ssa_opt: i32,
+    val_opt: i32,
+}
+
+fn opt_batch_worker(move batch: OptBatchIn, policy: &OptPolicy) -> OptBatchOut {
+    n := mir_source.count(&batch.src)
+    mut mf := lmir.new()
+    mut lift_work := mir_lift.new_work()
+    mut pipe_work := mir_pipeline.new()
+    mut statuses: []i32 = []
+    mut objs: []mir_lower.ObjectData = []
+    statuses.reserve(n)
+    objs.reserve(n)
+    mut st_promoted := 0
+    mut st_ssa := 0
+    mut st_val := 0
+    for idx in 0..n {
+        mut obj := mir_lower.new_data()
+        lerr := mir_lift.lift_item(&mut mf, &mut lift_work, &batch.src, idx)
+        if lerr != 0 {
+            statuses.push(1)
+            objs.push(move obj)
+            continue
+        }
+        st := mir_pipeline.run_into(&mut mf, &mut pipe_work, &policy.opts, &policy.terminals)
+        if st.error != 0 {
+            statuses.push(2)
+            objs.push(move obj)
+            continue
+        }
+        if !mir_lower.lower_data_into(&mut obj, &mf) {
+            statuses.push(3)
+            objs.push(move obj)
+            continue
+        }
+        st_promoted += st.stats.promoted
+        st_ssa += st.stats.ssa_optimized
+        st_val += st.stats.values_optimized
+        statuses.push(0)
+        objs.push(move obj)
+    }
+    OptBatchOut {
+        body_indices: move batch.body_indices,
+        statuses: move statuses,
+        objs: move objs,
+        promoted: st_promoted,
+        ssa_opt: st_ssa,
+        val_opt: st_val,
     }
 }
 
 pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) -> EmitResult {
-    emit_program_with_debug(&prog, &bodies, platform, false)
+    emit_program_with_jobs(&prog, &bodies, platform, false, 1)
 }
 
 pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32, debug_info: bool) -> EmitResult {
+    emit_program_with_jobs(&prog, &bodies, platform, debug_info, 1)
+}
+
+pub fn emit_program_with_jobs(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32, debug_info: bool, jobs: i32) -> EmitResult {
     if !prog.ok {
         return fail_emit("HIR/MIR verification failed")
     }
@@ -4039,51 +4760,329 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
     mut ffi := ffi_emit.new_ffi()
     mut ts := task_emit.new_task_state(&mut code, &prog)
     mut dbg := DebugEmitBuf {
-        enabled: debug_info && (platform == 0 || platform == 1),
+        enabled: debug_info && (platform == 0 || platform == 1 || platform == 2),
         fn_names: [], fn_mods: [], fn_spans: [], fn_starts: [], fn_ends: [],
         line_mods: [], line_spans: [], line_offsets: [],
     }
 
-    // Pre-scan reachable bodies for ExternFn callbacks (sets ffi.has_callbacks before any extern call!)
-    reachable := collect_reachable_fns(&prog, &bodies, platform)
+    // Locate synthetic format_float_bits helper (if present) and compute reachable bodies
+    mut fmt_float_fid := -1
+    for fi in 0..prog.fns.len {
+        if prog.fns[fi].name == "format_float_bits" {
+            fmt_float_fid = fi
+            h.fmt_float_label = h.fn_labels[fi]
+            break
+        }
+    }
+
+    // Pre-scan live blocks of reachable bodies for ExternFn callbacks, sys.envp, extern statics, and structural `==`/`!=`
+    reachable := collect_reachable_fns(&prog, &bodies, platform, fmt_float_fid)
     mut cb_fn_labels: []i32 = []
     for _ in 0..prog.fns.len { cb_fn_labels.push(-1) }
+    mut eq_needed: []bool = []
+    for _ in 0..prog.types.entries.len { eq_needed.push(false) }
+    mut used_ext_static: []bool = []
+    for _ in 0..prog.extern_statics.len { used_ext_static.push(false) }
     mut needs_envp := false
     for bi in 0..bodies.len {
         fid := bodies[bi].fn_id
         if fid < 0 || fid >= reachable.len || !reachable[fid] { continue }
         b := &bodies[bi]
-        for ti in 0..b.terms.len {
-            if b.terms[ti].kind == .Call && b.terms[ti].call_kind == .Intrinsic && b.terms[ti].callee == hb.INTRINSIC_SYS_ENVP {
-                needs_envp = true
+        bb_live := compute_live_blocks(&b, platform)
+        for bb in 0..b.blocks.len {
+            if !bb_live[bb] { continue }
+            blk := b.blocks[bb]
+            if blk.term_id >= 0 {
+                tm := b.terms[blk.term_id]
+                if tm.kind == .Call && tm.call_kind == .Intrinsic && tm.callee == hb.INTRINSIC_SYS_ENVP {
+                    needs_envp = true
+                }
+                if tm.kind == .Call {
+                    for ai in 0..tm.arg_len {
+                        op_id := b.call_args[tm.arg_start + ai]
+                        if op_id >= 0 && op_id < b.ops.len && b.ops[op_id].kind == .Const {
+                            c := &b.consts[b.ops[op_id].id]
+                            if c.ext_static_mode != 0 && c.int_val >= 0 && i32(c.int_val) < used_ext_static.len {
+                                used_ext_static[i32(c.int_val)] = true
+                            }
+                        }
+                    }
+                }
+            }
+            for si in blk.stmt_start..blk.stmt_end {
+                st := b.stmts[si]
+                if st.kind == .Assign && st.rvalue >= 0 {
+                    rv := b.rvalues[st.rvalue]
+                    if rv.kind == .Binary && (st.aux == hb.BINOP_EQ || st.aux == hb.BINOP_NE) {
+                        lty := operand_type(&b, rv.a)
+                        if lty >= 0 && lty < eq_needed.len { eq_needed[lty] = true }
+                    }
+                    // Scan operands of live statements for used extern statics
+                    if rv.a >= 0 && rv.a < b.ops.len && b.ops[rv.a].kind == .Const {
+                        c := &b.consts[b.ops[rv.a].id]
+                        if c.ext_static_mode != 0 && c.int_val >= 0 && i32(c.int_val) < used_ext_static.len {
+                            used_ext_static[i32(c.int_val)] = true
+                        }
+                    }
+                    if rv.b >= 0 && rv.b < b.ops.len && b.ops[rv.b].kind == .Const {
+                        c := &b.consts[b.ops[rv.b].id]
+                        if c.ext_static_mode != 0 && c.int_val >= 0 && i32(c.int_val) < used_ext_static.len {
+                            used_ext_static[i32(c.int_val)] = true
+                        }
+                    }
+                    for ai in 0..rv.op_len {
+                        op_id := b.call_args[rv.op_start + ai]
+                        if op_id >= 0 && op_id < b.ops.len && b.ops[op_id].kind == .Const {
+                            c := &b.consts[b.ops[op_id].id]
+                            if c.ext_static_mode != 0 && c.int_val >= 0 && i32(c.int_val) < used_ext_static.len {
+                                used_ext_static[i32(c.int_val)] = true
+                            }
+                        }
+                    }
+                }
             }
         }
         for ci in 0..b.consts.len {
             c := &b.consts[ci]
-            if c.ty >= 0 && c.ty < prog.types.entries.len && prog.types.entries[c.ty].kind == .ExternFn {
+            if c.ty >= 0 && c.ty < prog.types.entries.len && prog.types.entries[c.ty].kind == .ExternFn && c.text != "" {
                 cfid := i32(c.int_val)
-                if cfid >= 0 && cfid < prog.fns.len && cb_fn_labels[cfid] < 0 {
+                if cfid >= 0 && cfid < prog.fns.len && !prog.fns[cfid].is_extern && !prog.fns[cfid].is_generic_template && cb_fn_labels[cfid] < 0 {
                     cb_fn_labels[cfid] = ffi_emit.register_callback(&mut code, &mut ffi, cfid)
                 }
             }
         }
     }
+    helpers.ensure_eq_labels(&mut code, &prog.types, &mut h, &eq_needed)
     mut ext_static_slots: []i32 = []
     for ei in 0..prog.extern_statics.len {
-        es := &prog.extern_statics[ei]
-        sym := if es.extern_symbol != "" { es.extern_symbol.clone() } else { es.name.clone() }
-        slot := ffi_emit.ensure_import(&mut ffi, platform, es.extern_lib.clone(), sym, true, es.link_weak, es.link_delay)
-        ext_static_slots.push(slot)
+        if used_ext_static[ei] {
+            es := &prog.extern_statics[ei]
+            sym := if es.extern_symbol != "" { es.extern_symbol.clone() } else { es.name.clone() }
+            slot := ffi_emit.ensure_import(&mut ffi, platform, es.extern_lib.clone(), sym, true, es.link_weak, es.link_delay)
+            ext_static_slots.push(slot)
+        } else {
+            ext_static_slots.push(-1)
+        }
     }
 
     main_label := h.fn_labels[prog.entry_fn]
     helpers.emit_start(&mut code, &h, main_label)
 
     // Emit reachable concrete post-drop MirBodies (avoids linking dead cross-target extern imports!)
+    // Route non-debug functions through mir_lift -> mir_pipeline.run_into (frame promotion + SSA + value prop;
+    // NO mir_owners since mir_drop_elab already elaborated drops!) -> mir_lower with clean fallback.
+    mut mf := lmir.new()
+    mut lift_work := mir_lift.new_work()
+    mut pipe_work := mir_pipeline.new()
+    mut obj_data := mir_lower.new_data()
+    mut pipe_opts := mir_pipeline.options()
+    pipe_opts.optimize = true
+    pipe_opts.source_abi = true
+    pipe_opts.source_objects = true
+    pipe_opts.source_inputs = true
+    pipe_opts.ssa = true
+    pipe_opts.values = true
+    terminals := mir_pipeline.Terminals {
+        version: 1,
+        overflow: h.trap_overflow,
+        zero: h.trap_zero,
+        assertion: h.trap_assert,
+        io: h.trap_io,
+        bounds: h.trap_bounds,
+        float_trap: h.trap_overflow,
+    }
+    use_mir_opt := !dbg.enabled
+    mut st_opt_ok := 0
+    mut st_lift_fail := 0
+    mut st_pipe_fail := 0
+    mut st_lower_fail := 0
+    mut st_promoted := 0
+    mut st_ssa_opt := 0
+    mut st_val_opt := 0
+
+    mut reach_bis: []i32 = []
+    reach_bis.reserve(bodies.len)
     for bi in 0..bodies.len {
         fid := bodies[bi].fn_id
-        if fid >= 0 && fid < reachable.len && reachable[fid] {
+        if fid >= 0 && fid < reachable.len && reachable[fid] { reach_bis.push(bi) }
+    }
+
+    if !use_mir_opt {
+        for ri in 0..reach_bis.len {
+            bi := reach_bis[ri]
             emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
+        }
+    } else if jobs > 1 && reach_bis.len >= 32 {
+        mut n_batches := jobs * 2
+        if n_batches > reach_bis.len { n_batches = reach_bis.len }
+        mut batches: []OptBatchIn = []
+        for _ in 0..n_batches {
+            batches.push(OptBatchIn { src: mir_source.new(), body_indices: [] })
+        }
+        mut saved_imp_starts: []i32 = []
+        mut saved_imp_counts: []i32 = []
+        mut saved_imp_slots: []i32 = []
+        mut saved_first_labels: []i32 = []
+        mut saved_end_labels: []i32 = []
+        saved_imp_starts.reserve(reach_bis.len)
+        saved_imp_counts.reserve(reach_bis.len)
+        saved_first_labels.reserve(reach_bis.len)
+        saved_end_labels.reserve(reach_bis.len)
+
+        // 1. Fast serial raw emission + capture into strided batches (truncating code.words per fn!)
+        for ri in 0..reach_bis.len {
+            bi := reach_bis[ri]
+            fid := bodies[bi].fn_id
+            first_word := code.words.len
+            first_label := code.labels.len
+            first_reloc := code.at.len
+            first_import := ffi.sites.len
+            fn_lbl := h.fn_labels[fid]
+            arm.begin_mir(&mut code, true)
+            emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
+            arm.end_mir(&mut code)
+
+            b_idx := ri % n_batches
+            _ := mir_source.capture(&mut batches[b_idx].src, &code, first_word, first_label, first_reloc, &ffi.sites, first_import, fn_lbl)
+            batches[b_idx].body_indices.push(bi)
+
+            saved_imp_starts.push(saved_imp_slots.len)
+            saved_imp_counts.push(ffi.slots.len - first_import)
+            for ii in first_import..ffi.slots.len { saved_imp_slots.push(ffi.slots[ii]) }
+            saved_first_labels.push(first_label)
+            saved_end_labels.push(code.labels.len)
+
+            // Roll back code.words/relocs/imports (keeping allocated code.labels IDs!)
+            code.words.truncate(first_word)
+            code.at.truncate(first_reloc)
+            code.target.truncate(first_reloc)
+            code.kinds.truncate(first_reloc)
+            ffi.sites.truncate(first_import)
+            ffi.slots.truncate(first_import)
+            code.labels[fn_lbl] = -1
+            for l in first_label..code.labels.len { code.labels[l] = -1 }
+        }
+
+        // 2. Parallel mir_lift -> mir_pipeline.run_into -> mir_lower across workers!
+        policy := OptPolicy { opts: pipe_opts, terminals: terminals }
+        mut outs: []OptBatchOut = []
+        task scope opt_workers(jobs, shared policy) {
+            mut tasks: []Task<OptBatchOut> = []
+            for b_idx in 0..n_batches {
+                bt := replace(&mut batches[b_idx], OptBatchIn { src: mir_source.new(), body_indices: [] })
+                tasks.push(opt_workers.spawn(opt_batch_worker, move bt))
+            }
+            for _ in 0..n_batches {
+                outs.push(tasks.remove(0).join())
+            }
+        }
+        for b_idx in 0..n_batches {
+            st_promoted += outs[b_idx].promoted
+            st_ssa_opt += outs[b_idx].ssa_opt
+            st_val_opt += outs[b_idx].val_opt
+        }
+
+        // 3. Deterministic splice back in exact reach_bis order (100% byte-identical to serial!)
+        mut cursors: []i32 = []
+        for _ in 0..n_batches { cursors.push(0) }
+        for ri in 0..reach_bis.len {
+            bi := reach_bis[ri]
+            b_idx := ri % n_batches
+            pos := cursors[b_idx]
+            cursors[b_idx] = pos + 1
+            st_code := outs[b_idx].statuses[pos]
+            if st_code == 0 {
+                st_opt_ok += 1
+                obj := &outs[b_idx].objs[pos]
+                first_word := code.words.len
+                for wi in 0..obj.output.words.len { code.words.push(obj.output.words[wi]) }
+                for rli in 0..obj.output.at.len {
+                    code.at.push(first_word + obj.output.at[rli])
+                    code.target.push(obj.output.target[rli])
+                    code.kinds.push(obj.output.kinds[rli])
+                }
+                for li in 0..obj.label_ids.len {
+                    lid := obj.label_ids[li]
+                    lat := obj.label_at[li]
+                    code.labels[lid] = if lat >= 0 { first_word + lat } else { -1 }
+                }
+                imp_s := saved_imp_starts[ri]
+                imp_c := saved_imp_counts[ri]
+                for ii in 0..obj.import_at.len {
+                    ffi.sites.push(first_word * 4 + obj.import_at[ii])
+                    if ii < imp_c { ffi.slots.push(saved_imp_slots[imp_s + ii]) }
+                }
+            } else {
+                if st_code == 1 { st_lift_fail += 1 }
+                else if st_code == 2 { st_pipe_fail += 1 }
+                else { st_lower_fail += 1 }
+                emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
+            }
+        }
+    } else {
+        for ri in 0..reach_bis.len {
+            bi := reach_bis[ri]
+            fid := bodies[bi].fn_id
+            first_word := code.words.len
+            first_label := code.labels.len
+            first_reloc := code.at.len
+            first_import := ffi.sites.len
+            fn_lbl := h.fn_labels[fid]
+            arm.begin_mir(&mut code, true)
+            emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
+            arm.end_mir(&mut code)
+            mut opt_ok := false
+            if mir_lift.build_into(&mut mf, &mut lift_work, &code, first_word, first_label, first_reloc, &ffi.sites, first_import) &&
+                mir_lift.own_entry(&mut mf, &code, fn_lbl) {
+                st := mir_pipeline.run_into(&mut mf, &mut pipe_work, &pipe_opts, &terminals)
+                if st.error == 0 {
+                    if mir_lower.lower_data_into(&mut obj_data, &mf) {
+                        opt_ok = true
+                        st_opt_ok += 1
+                        st_promoted += st.stats.promoted
+                        st_ssa_opt += st.stats.ssa_optimized
+                        st_val_opt += st.stats.values_optimized
+                    } else {
+                        st_lower_fail += 1
+                    }
+                } else {
+                    st_pipe_fail += 1
+                }
+            } else {
+                st_lift_fail += 1
+            }
+            if opt_ok {
+                code.words.truncate(first_word)
+                code.at.truncate(first_reloc)
+                code.target.truncate(first_reloc)
+                code.kinds.truncate(first_reloc)
+                ffi.sites.truncate(first_import)
+                for wi in 0..obj_data.output.words.len { code.words.push(obj_data.output.words[wi]) }
+                for rli in 0..obj_data.output.at.len {
+                    code.at.push(first_word + obj_data.output.at[rli])
+                    code.target.push(obj_data.output.target[rli])
+                    code.kinds.push(obj_data.output.kinds[rli])
+                }
+                for li in 0..obj_data.label_ids.len {
+                    lid := obj_data.label_ids[li]
+                    lat := obj_data.label_at[li]
+                    code.labels[lid] = if lat >= 0 { first_word + lat } else { -1 }
+                }
+                for ii in 0..obj_data.import_at.len {
+                    ffi.sites.push(first_word * 4 + obj_data.import_at[ii])
+                }
+            } else {
+                // Rollback captured emission and re-emit directly without mir_capture
+                code.words.truncate(first_word)
+                code.at.truncate(first_reloc)
+                code.target.truncate(first_reloc)
+                code.kinds.truncate(first_reloc)
+                ffi.sites.truncate(first_import)
+                ffi.slots.truncate(first_import)
+                code.labels[fn_lbl] = -1
+                for l in first_label..code.labels.len { code.labels[l] = -1 }
+                emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
+            }
         }
     }
 
@@ -4094,12 +5093,18 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
     task_emit.emit_iso_and_freeze_helpers(&mut code, &prog.types, &mut ts, &h)
 
     mut env_source_slot := -1
-    if needs_envp && (platform == 1 || platform == 2) {
+    if needs_envp && (platform == 1 || platform == 2) && ffi.symbols.len > 0 {
         env_source_slot = ffi_emit.ensure_import(&mut ffi, platform, "c", "environ", true, false, false)
     }
 
     // Emit runtime, type drop/clone helpers, traps, and deduplicated string/cstr/wstr/embed literals
-    (data_start, env_site) := helpers.emit_all_helpers(&mut code, &prog, &h, env_source_slot)
+    mut emitted_fn: []bool = []
+    for _ in 0..prog.fns.len { emitted_fn.push(false) }
+    for ri in 0..reach_bis.len {
+        efid := bodies[reach_bis[ri]].fn_id
+        if efid >= 0 && efid < emitted_fn.len { emitted_fn[efid] = true }
+    }
+    (data_start, env_site) := helpers.emit_all_helpers(&mut code, &prog, &h, env_source_slot, &emitted_fn)
     if env_site >= 0 && env_source_slot >= 0 {
         ffi.sites.push(env_site)
         ffi.slots.push(env_source_slot)
@@ -4119,6 +5124,7 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
         ffi.slots[sj + 1] = k_slot
     }
 
+    opt_summary := f"mir_opt={st_opt_ok} lift_fail={st_lift_fail} pipe_fail={st_pipe_fail} lower_fail={st_lower_fail} promoted={st_promoted} ssa={st_ssa_opt} val={st_val_opt}"
     // Finalize machine code for all 6 platforms
     if platform == 0 || platform == 1 {
         shift := arm.relax_branches(&mut code)
@@ -4140,7 +5146,7 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
                 if wl >= 0 && wl < shift.len { dbg.line_offsets[i] = (wl - shift[wl]) * 4 } else { dbg.line_offsets[i] = wl * 4 }
             }
         }
-        has_dynamic := ffi.symbols.len > 0 || ffi.globals > 0
+        has_dynamic := ffi.symbols.len > 0 || ffi.globals > 0 || dbg.enabled
         text := arm.finish_for(&mut code, has_dynamic)
         return EmitResult {
             ok: true, error: "", text: move text,
@@ -4160,10 +5166,23 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
             debug_line_mods: move dbg.line_mods,
             debug_line_spans: move dbg.line_spans,
             debug_line_offsets: move dbg.line_offsets,
+            opt_summary: move opt_summary,
         }
     }
     if platform == 2 {
         res := x86.finish(&code, data_start, &ffi.sites, &ffi.slots)
+        if dbg.enabled && res.ok {
+            for i in 0..dbg.fn_starts.len {
+                sl := dbg.fn_starts[i]
+                el := dbg.fn_ends[i]
+                dbg.fn_starts[i] = if sl >= 0 && sl < res.label_bytes.len { res.label_bytes[sl] } else { 0 }
+                dbg.fn_ends[i] = if el >= 0 && el < res.label_bytes.len { res.label_bytes[el] } else { 0 }
+            }
+            for i in 0..dbg.line_offsets.len {
+                ll := dbg.line_offsets[i]
+                dbg.line_offsets[i] = if ll >= 0 && ll < res.label_bytes.len { res.label_bytes[ll] } else { 0 }
+            }
+        }
         return EmitResult {
             ok: res.ok, error: res.error, text: move res.text,
             imports_globals: ffi.globals,
@@ -4174,16 +5193,45 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
             imports_slots: move res.slots,
             env_source_slot: env_source_slot,
             diagnostics: [],
-            debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
-            debug_fn_starts: [], debug_fn_ends: [],
-            debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
+            debug_fn_names: move dbg.fn_names,
+            debug_fn_mods: move dbg.fn_mods,
+            debug_fn_spans: move dbg.fn_spans,
+            debug_fn_starts: move dbg.fn_starts,
+            debug_fn_ends: move dbg.fn_ends,
+            debug_line_mods: move dbg.line_mods,
+            debug_line_spans: move dbg.line_spans,
+            debug_line_offsets: move dbg.line_offsets,
+            opt_summary: move opt_summary,
         }
     }
     if platform == 5 {
-        win := x86.WindowsImports {
-            virtual_alloc: -1, std_handle: -1, write_file: -1, exit_process: -1,
+        mut win := x86.WindowsImports {
+            virtual_alloc: ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "VirtualAlloc", false, false, false),
+            std_handle: ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "GetStdHandle", false, false, false),
+            write_file: ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "WriteFile", false, false, false),
+            exit_process: ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "ExitProcess", false, false, false),
             wide_args: -1, utf8: -1, malloc: -1, crt_write: -1, crt_setmode: -1,
             virtual_protect: -1, wait_address: -1, wake_address: -1,
+        }
+        if ts.used {
+            win.virtual_protect = ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "VirtualProtect", false, false, false)
+            win.wait_address = ffi_emit.ensure_import(&mut ffi, 5, "api-ms-win-core-synch-l1-2-0.dll", "WaitOnAddress", false, false, false)
+            win.wake_address = ffi_emit.ensure_import(&mut ffi, 5, "api-ms-win-core-synch-l1-2-0.dll", "WakeByAddressSingle", false, false, false)
+        }
+        mut needs_args := false
+        mut writes_fds := false
+        for tgt in &code.target {
+            if tgt == h.rt.sys_arg_count || tgt == h.rt.sys_arg || tgt == h.rt.sys_envp { needs_args = true }
+            if tgt == h.rt.sys_fd_write { writes_fds = true }
+        }
+        if writes_fds {
+            win.crt_write = ffi_emit.ensure_import(&mut ffi, 5, "msvcrt.dll", "_write", false, false, false)
+            win.crt_setmode = ffi_emit.ensure_import(&mut ffi, 5, "msvcrt.dll", "_setmode", false, false, false)
+        }
+        if needs_args {
+            win.wide_args = ffi_emit.ensure_import(&mut ffi, 5, "msvcrt.dll", "__wgetmainargs", false, false, false)
+            win.utf8 = ffi_emit.ensure_import(&mut ffi, 5, "kernel32.dll", "WideCharToMultiByte", false, false, false)
+            win.malloc = ffi_emit.ensure_import(&mut ffi, 5, "msvcrt.dll", "malloc", false, false, false)
         }
         res := x86.finish_windows(&code, data_start, &ffi.sites, &ffi.slots, win)
         return EmitResult {
@@ -4199,13 +5247,13 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
             debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
             debug_fn_starts: [], debug_fn_ends: [],
             debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
+            opt_summary: move opt_summary,
         }
     }
     if platform == 3 || platform == 4 {
-        w_abi := wasm_abi.new()
         empty_link := wasm.empty_linked()
         main_ret_tag := if prog.fns[prog.entry_fn].ret_ty == ht.TY_UNIT { 0 } else { helpers.legacy_ty_id(prog.fns[prog.entry_fn].ret_ty) }
-        res := wasm.image_linked_for(&code, data_start, main_label, main_ret_tag, &w_abi, &empty_link, platform == 4)
+        res := wasm.image_linked_for(&code, data_start, main_label, main_ret_tag, &ffi.w_abi, &empty_link, platform == 4)
         return EmitResult {
             ok: res.ok, error: res.error, text: move res.text,
             imports_globals: 0,
@@ -4216,6 +5264,7 @@ pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, plat
             debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
             debug_fn_starts: [], debug_fn_ends: [],
             debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
+            opt_summary: move opt_summary,
         }
     }
     fail_emit("unsupported platform " + platform.str())

@@ -7,6 +7,7 @@ import cache_io
 import agent
 import cli
 import fmt
+import ..bundled as bundled
 import ..frontend.compile as compiler
 import ..frontend.diagnostics as diag
 import ..frontend.parser as parser
@@ -333,44 +334,183 @@ fn emit_native_image(loaded: &modules.Loaded, result: &compiler.Result, platform
     elf.image(&result.text)
 }
 
-fn run_check_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32) -> i32 {
-    t0 := if options.timings { time.monotonic_ns() } else { 0 }
-    mut mods: []hir_body.ModuleInput = []
-    mut edges: []hir_body.ImportEdge = []
-    for i in 0..loaded.paths.len {
-        path := loaded.paths[i].clone()
-        source := if i < loaded.sources.len { loaded.sources[i].clone() } else { "" }
-        caps := if i < loaded.module_caps.len { loaded.module_caps[i] } else { 0 }
-        tree := parser.parse_source(path.clone(), source.clone())
-        for ii in 0..tree.items.len {
-            it := &tree.items[ii]
-            if it.kind == .Import && it.name != "" {
-                mut alias := it.name.clone()
-                mut last_dot := -1
-                for ci in 0..alias.len {
-                    if alias[ci] == 46 { last_dot = ci }
+struct ParseChunkIn {
+    indices: []i32,
+    paths: []string,
+    sources: []string,
+    caps: []i32,
+}
+
+struct ParseChunkOut {
+    mods: []hir_body.ModuleInput,
+}
+
+fn parse_chunk_worker(move chunk: ParseChunkIn) -> ParseChunkOut {
+    mut out: []hir_body.ModuleInput = []
+    out.reserve(chunk.indices.len)
+    for k in 0..chunk.indices.len {
+        p := chunk.paths[k].clone()
+        s := chunk.sources[k].clone()
+        tree := parser.parse_source(p.clone(), s.clone())
+        out.push(hir_body.ModuleInput {
+            mod_id: chunk.indices[k],
+            path: move p,
+            source: move s,
+            caps_mask: chunk.caps[k],
+            ast: move tree,
+        })
+    }
+    ParseChunkOut { mods: move out }
+}
+
+fn parse_v2_modules(loaded: &modules.Loaded, mods: &mut []hir_body.ModuleInput, edges: &mut []hir_body.ImportEdge, jobs: i32) {
+    n := loaded.paths.len
+    if jobs > 1 && n >= 16 {
+        mut n_chunks := jobs * 2
+        if n_chunks > n { n_chunks = n }
+        mut chunks: []ParseChunkIn = []
+        for _ in 0..n_chunks {
+            chunks.push(ParseChunkIn { indices: [], paths: [], sources: [], caps: [] })
+        }
+        for i in 0..n {
+            c := i % n_chunks
+            chunks[c].indices.push(i)
+            chunks[c].paths.push(loaded.paths[i].clone())
+            chunks[c].sources.push(if i < loaded.sources.len { loaded.sources[i].clone() } else { "" })
+            chunks[c].caps.push(if i < loaded.module_caps.len { loaded.module_caps[i] } else { 0 })
+        }
+        mut outs: []ParseChunkOut = []
+        task scope parse_workers(jobs) {
+            mut tasks: []Task<ParseChunkOut> = []
+            for ci in 0..n_chunks {
+                ch := replace(&mut chunks[ci], ParseChunkIn { indices: [], paths: [], sources: [], caps: [] })
+                tasks.push(parse_workers.spawn(parse_chunk_worker, move ch))
+            }
+            for _ in 0..n_chunks {
+                outs.push(tasks.remove(0).join())
+            }
+        }
+        mut cursors: []i32 = []
+        for _ in 0..n_chunks { cursors.push(0) }
+        mods.reserve(n + 1)
+        for i in 0..n {
+            ci := i % n_chunks
+            pos := cursors[ci]
+            cursors[ci] = pos + 1
+            m_in := replace(&mut outs[ci].mods[pos], hir_body.ModuleInput {
+                mod_id: 0, path: "", source: "", caps_mask: 0,
+                ast: parser.parse_source("", ""),
+            })
+            for ii in 0..m_in.ast.items.len {
+                it := &m_in.ast.items[ii]
+                if it.kind == .Import && it.name != "" {
+                    mut alias := it.name.clone()
+                    mut last_dot := -1
+                    for cidx in 0..alias.len {
+                        if alias[cidx] == 46 { last_dot = cidx }
+                    }
+                    if last_dot >= 0 && last_dot + 1 < alias.len {
+                        alias = alias[(last_dot + 1)..alias.len]
+                    }
+                    tmod := modules.imported_module(&loaded, i, alias)
+                    if tmod >= 0 {
+                        edges.push(hir_body.ImportEdge {
+                            owner_mod: i,
+                            alias: move alias,
+                            target_mod: tmod,
+                        })
+                    }
                 }
-                if last_dot >= 0 && last_dot + 1 < alias.len {
-                    alias = alias[(last_dot + 1)..alias.len]
+            }
+            mods.push(move m_in)
+        }
+    } else {
+        for i in 0..n {
+            path := loaded.paths[i].clone()
+            source := if i < loaded.sources.len { loaded.sources[i].clone() } else { "" }
+            caps := if i < loaded.module_caps.len { loaded.module_caps[i] } else { 0 }
+            tree := parser.parse_source(path.clone(), source.clone())
+            for ii in 0..tree.items.len {
+                it := &tree.items[ii]
+                if it.kind == .Import && it.name != "" {
+                    mut alias := it.name.clone()
+                    mut last_dot := -1
+                    for ci in 0..alias.len {
+                        if alias[ci] == 46 { last_dot = ci }
+                    }
+                    if last_dot >= 0 && last_dot + 1 < alias.len {
+                        alias = alias[(last_dot + 1)..alias.len]
+                    }
+                    tmod := modules.imported_module(&loaded, i, alias)
+                    if tmod >= 0 {
+                        edges.push(hir_body.ImportEdge {
+                            owner_mod: i,
+                            alias: move alias,
+                            target_mod: tmod,
+                        })
+                    }
                 }
-                tmod := modules.imported_module(&loaded, i, alias)
+            }
+            mods.push(hir_body.ModuleInput {
+                mod_id: i,
+                path: move path,
+                source: move source,
+                caps_mask: caps,
+                ast: move tree,
+            })
+        }
+    }
+    imp_keys := loaded.imports.keys()
+    for ki in 0..imp_keys.len {
+        k := &imp_keys[ki]
+        if k.len > 6 && k[0..6] == "__sym:" {
+            rest := k[6..k.len]
+            mut c1 := -1; mut c2 := -1
+            for ci in 0..rest.len {
+                if rest[ci] == 58 {
+                    if c1 < 0 { c1 = ci } else if c2 < 0 { c2 = ci; break }
+                }
+            }
+            if c1 > 0 && c2 > c1 + 1 && c2 + 1 < rest.len {
+                mut own := 0
+                for di in 0..c1 { own = own * 10 + i32(rest[di] - 48) }
+                al_sym := "__sym:" + rest[(c1 + 1)..rest.len]
+                tmod := i32(loaded.imports.get_or(k.clone(), -1))
                 if tmod >= 0 {
                     edges.push(hir_body.ImportEdge {
-                        owner_mod: i,
-                        alias: move alias,
+                        owner_mod: own,
+                        alias: move al_sym,
                         target_mod: tmod,
                     })
                 }
             }
         }
-        mods.push(hir_body.ModuleInput {
-            mod_id: i,
-            path: move path,
-            source: move source,
-            caps_mask: caps,
-            ast: move tree,
-        })
     }
+    pre_src := bundled.core_prelude()
+    pre_tree := parser.parse_source("<core_prelude>", pre_src.clone())
+    mods.push(hir_body.ModuleInput {
+        mod_id: loaded.paths.len,
+        path: "<core_prelude>",
+        source: move pre_src,
+        caps_mask: 0,
+        ast: move pre_tree,
+    })
+    ff_src := bundled.float_formatter()
+    ff_tree := parser.parse_source("<float_formatter>", ff_src.clone())
+    mods.push(hir_body.ModuleInput {
+        mod_id: loaded.paths.len + 1,
+        path: "<float_formatter>",
+        source: move ff_src,
+        caps_mask: 0,
+        ast: move ff_tree,
+    })
+}
+
+fn run_check_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32, compile_jobs: i32) -> i32 {
+    t0 := if options.timings { time.monotonic_ns() } else { 0 }
+    mut mods: []hir_body.ModuleInput = []
+    mut edges: []hir_body.ImportEdge = []
+    parse_v2_modules(&loaded, &mut mods, &mut edges, compile_jobs)
 
     t1 := if options.timings { time.monotonic_ns() } else { 0 }
     mut prog := hir_lower.lower_modules(&mods, &edges, platform)
@@ -382,14 +522,14 @@ fn run_check_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32) -
     if ok {
         hir_mono.monomorphize(&mut prog)
         t3 = if options.timings { time.monotonic_ns() } else { 0 }
-        res := mir_check.check_program(&prog)
+        res := mir_check.check_program_parallel(&prog, compile_jobs)
         t4 = if options.timings { time.monotonic_ns() } else { 0 }
         ok = res.ok
         for i in 0..res.diagnostics.len { items.push(diag.clone_diag(&res.diagnostics[i])) }
     } else {
         for i in 0..prog.diagnostics.len { items.push(diag.clone_diag(&prog.diagnostics[i])) }
     }
-    if options.timings && !options.timings_json {
+    if options.timings && !options.timings_json && !options.run && !options.run_tests {
         p_ms := (t1 - t0) / 1000000
         l_ms := (t2 - t1) / 1000000
         m_ms := (t3 - t2) / 1000000
@@ -424,42 +564,11 @@ fn run_build_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32,
     t0 := if options.timings { time.monotonic_ns() } else { 0 }
     mut mods: []hir_body.ModuleInput = []
     mut edges: []hir_body.ImportEdge = []
-    for i in 0..loaded.paths.len {
-        path := loaded.paths[i].clone()
-        source := if i < loaded.sources.len { loaded.sources[i].clone() } else { "" }
-        caps := if i < loaded.module_caps.len { loaded.module_caps[i] } else { 0 }
-        tree := parser.parse_source(path.clone(), source.clone())
-        for ii in 0..tree.items.len {
-            it := &tree.items[ii]
-            if it.kind == .Import && it.name != "" {
-                mut alias := it.name.clone()
-                mut last_dot := -1
-                for ci in 0..alias.len {
-                    if alias[ci] == 46 { last_dot = ci }
-                }
-                if last_dot >= 0 && last_dot + 1 < alias.len {
-                    alias = alias[(last_dot + 1)..alias.len]
-                }
-                tmod := modules.imported_module(&loaded, i, alias)
-                if tmod >= 0 {
-                    edges.push(hir_body.ImportEdge {
-                        owner_mod: i,
-                        alias: move alias,
-                        target_mod: tmod,
-                    })
-                }
-            }
-        }
-        mods.push(hir_body.ModuleInput {
-            mod_id: i,
-            path: move path,
-            source: move source,
-            caps_mask: caps,
-            ast: move tree,
-        })
-    }
+    parse_v2_modules(&loaded, &mut mods, &mut edges, compile_jobs)
 
+    t1 := if options.timings { time.monotonic_ns() } else { 0 }
     mut prog := hir_lower.lower_modules(&mods, &edges, platform)
+    t2 := if options.timings { time.monotonic_ns() } else { 0 }
     mut items: []diag.Diagnostic = []
     if !prog.ok {
         for i in 0..prog.diagnostics.len { items.push(diag.clone_diag(&prog.diagnostics[i])) }
@@ -471,11 +580,17 @@ fn run_build_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32,
         }
         return 1
     }
+    if options.list_groups {
+        for i in 0..loaded.groups.len { print(f"{i} {loaded.groups[i]}") }
+        return 0
+    }
     if options.tests {
         _ := hir_lower.synthesize_test_entry(&mut prog, &loaded.groups, options.group, options.group >= 0 || is_wasm)
     }
     hir_mono.monomorphize(&mut prog)
-    chk := mir_check.check_program(&prog)
+    t3 := if options.timings { time.monotonic_ns() } else { 0 }
+    chk := mir_check.check_program_parallel(&prog, compile_jobs)
+    t4 := if options.timings { time.monotonic_ns() } else { 0 }
     for i in 0..chk.diagnostics.len { items.push(diag.clone_diag(&chk.diagnostics[i])) }
     if !chk.ok {
         if options.agent {
@@ -487,7 +602,8 @@ fn run_build_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32,
         return 1
     }
 
-    emitted := mir_emit.emit_program_with_debug(&prog, &chk.bodies, platform, options.debug_info)
+    emitted := mir_emit.emit_program_with_jobs(&prog, &chk.bodies, platform, options.debug_info, compile_jobs)
+    t5 := if options.timings { time.monotonic_ns() } else { 0 }
     if !emitted.ok {
         return failure("build-v2 emit failed: " + emitted.error)
     }
@@ -568,9 +684,16 @@ fn run_build_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32,
         if !published.ok { _ := sys.remove_file(temporary); return failure(sys.error_message(published.error)) }
     }
 
-    if options.timings && !options.timings_json {
-        ms := (time.monotonic_ns() - t0) / 1000000
-        print(f"build-v2 timings: total={ms}ms (types={prog.types.entries.len} fns={prog.fns.len} bodies={chk.bodies.len})")
+    if options.timings && !options.timings_json && !options.run && !options.run_tests {
+        t6 := time.monotonic_ns()
+        p_ms := (t1 - t0) / 1000000
+        l_ms := (t2 - t1) / 1000000
+        m_ms := (t3 - t2) / 1000000
+        c_ms := (t4 - t3) / 1000000
+        e_ms := (t5 - t4) / 1000000
+        i_ms := (t6 - t5) / 1000000
+        ms := (t6 - t0) / 1000000
+        print(f"build-v2 timings: parse={p_ms}ms lower={l_ms}ms mono={m_ms}ms mir2={c_ms}ms emit={e_ms}ms image={i_ms}ms total={ms}ms (types={prog.types.entries.len} fns={prog.fns.len} bodies={chk.bodies.len}; {emitted.opt_summary})")
     }
     if options.run {
         if options.app { output = output + "/Contents/MacOS/" + bundle.executable_name(bundle.name(output)) }
@@ -578,16 +701,26 @@ fn run_build_v2(loaded: &modules.Loaded, options: &cli.Options, platform: i32,
     }
     if options.run_tests {
         mut keys: []string = []
-        result_code := process.tests_parallel(output, &loaded.groups, &keys, false, options.timeout_ms, default_target, options.workers)
+        if options.affected || sys.metadata(options.output + "/.affected").is_dir {
+            mut policy := receipts.policy()
+            policy.scalar_enabled = options.scalar_opt; policy.ownership_enabled = options.ownership_opt; policy.runtime_profile = options.runtime_profile
+            policy.const_div_enabled = options.const_div_opt; policy.frame_free_enabled = options.frame_free; policy.range_enabled = options.range_opt; policy.inline_enabled = options.inline_opt; policy.mir_opt_enabled = options.mir_opt && options.mir_pass
+            policy.mir_memory_enabled = options.mir_memory; policy.mir_ssa_enabled = options.mir_ssa; policy.mir_values_enabled = options.mir_values
+            keys = receipts.keys_configured(&loaded, options.output, platform, options.timeout_ms, &policy)
+        }
+        result_code := process.tests_parallel(output, &loaded.groups, &keys, options.affected, options.timeout_ms, default_target, options.workers)
         _ := sys.remove_file(output)
         return result_code
     }
     if options.agent {
         empty_records := compiler.bindings()
         agent.report_result(&loaded, &empty_records, &items, true)
+    } else if options.install {
+        if !options.timings_json { _ := emit_human_diagnostics(&loaded, &items, false) }
+        print("installed " + output)
     } else {
         if !options.timings_json { _ := emit_human_diagnostics(&loaded, &items, false) }
-        print("built (v2) " + output)
+        print("built " + output)
     }
     0
 }
@@ -749,7 +882,7 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
     config.debug_info = options.debug_info
     if options.checking {
         if options.check_v2 {
-            return run_check_v2(&loaded, &options, platform)
+            return run_check_v2(&loaded, &options, platform, compile_jobs)
         }
         mut records := compiler.bindings()
         mut check_setup: i64 = 0
