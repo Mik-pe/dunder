@@ -310,6 +310,277 @@ fn emit_native_image_for_options(m: &obj.ObjectModule, opts: &BuildOptions) -> [
 // Core End-to-End Compilation Pipeline
 // =========================================================================
 
+fn target_is_matches(name: string, platform: i32) -> bool {
+    (name == "macos" && platform == 0) ||
+    (name == "arm64-macos" && platform == 0) ||
+    (name == "arm64-linux" && platform == 1) ||
+    (name == "x86_64-linux" && platform == 2) ||
+    (name == "wasm32-wasi" && platform == 4) ||
+    (name == "x86_64-windows" && platform == 5) ||
+    (name == "linux" && (platform == 1 || platform == 2)) ||
+    (name == "windows" && platform == 5) ||
+    (name == "wasm" && (platform == 3 || platform == 4)) ||
+    (name == "wasi" && platform == 4) ||
+    (name == "arm64" && (platform == 0 || platform == 1)) ||
+    (name == "x86_64" && (platform == 2 || platform == 5)) ||
+    (name == "wasm32" && (platform == 3 || platform == 4)) ||
+    (name == "native" && platform != 3 && platform != 4)
+}
+
+fn trace_const_str_ssa(f: &ssa.SsaFunc, v_in: i32) -> (bool, string) {
+    mut v := v_in
+    mut steps := 0
+    while v >= 0 && v < f.vals.len && steps < 8 {
+        steps += 1
+        di := f.vals[v].def_inst
+        if di < 0 || di >= f.insts.len { return (false, "") }
+        ins := f.insts[di]
+        if (ins.kind == .ConstStr || ins.kind == .ConstCStr) &&
+            ins.str_idx >= 0 && ins.str_idx < f.const_strs.len {
+            return (true, f.const_strs[ins.str_idx].clone())
+        }
+        if ins.kind == .Copy {
+            v = ins.op_a
+            continue
+        }
+        if ins.kind == .Load && ins.aux >= 0 {
+            slot := ins.aux
+            bb := f.vals[v].def_bb
+            if bb >= 0 && bb < f.blocks.len {
+                s0 := f.blocks[bb].inst_start
+                n0 := f.blocks[bb].inst_len
+                mut found_v := -1
+                for k in 0..n0 {
+                    iid := f.block_insts[s0 + k]
+                    if iid == di { break }
+                    si := f.insts[iid]
+                    if si.kind == .Store && si.aux == slot { found_v = si.op_b }
+                }
+                if found_v >= 0 { v = found_v; continue }
+            }
+        }
+        return (false, "")
+    }
+    (false, "")
+}
+
+// Fold `target_is("...")` IntrinsicCalls to constant bools before SSA optimization so
+// CFG simplification & dead-function pruning eliminate inactive platform branches (e.g. win32 on macOS).
+fn fold_target_is_program(sp: &mut ssa.SsaProgram, platform: i32) {
+    for fi in 0..sp.funcs.len {
+        f := &mut sp.funcs[fi]
+        mut folded_any := false
+        for bb in 0..f.blocks.len {
+            tid := f.blocks[bb].term_id
+            if tid < 0 { continue }
+            tm := f.terms[tid]
+            if tm.kind != .IntrinsicCall || tm.callee != hb.INTRINSIC_TARGET_IS || tm.dest_val < 0 || tm.target_a < 0 {
+                continue
+            }
+            mut matched := false
+            mut known := false
+            if tm.arg_len > 0 {
+                (ok_s, txt) := trace_const_str_ssa(&f, f.val_args[tm.arg_start])
+                if ok_s {
+                    known = true
+                    matched = target_is_matches(txt, platform)
+                }
+            }
+            if !known { continue }
+            folded_any = true
+            // Replace IntrinsicCall terminator with ConstInt defining dest_val + Goto target_a
+            mut ci := ssa.make_inst(.ConstInt, ht.TY_BOOL, -1, -1, -1, 0, -1,
+                if matched { 1 } else { 0 }, -1, 0, 0, tm.span_start, tm.span_end)
+            ci.res = tm.dest_val
+            iid := f.insts.len
+            f.insts.push(ci)
+            f.vals[tm.dest_val].def_bb = bb
+            f.vals[tm.dest_val].def_inst = iid
+            // Append iid to bb's instruction slice
+            old_s := f.blocks[bb].inst_start
+            old_n := f.blocks[bb].inst_len
+            new_s := f.block_insts.len
+            for k in 0..old_n { f.block_insts.push(f.block_insts[old_s + k]) }
+            f.block_insts.push(iid)
+            f.blocks[bb].inst_start = new_s
+            f.blocks[bb].inst_len = old_n + 1
+            f.terms[tid].kind = .Goto
+            f.terms[tid].callee = -1
+            f.terms[tid].arg_start = 0
+            f.terms[tid].arg_len = 0
+            f.terms[tid].dest_val = -1
+        }
+        // Fold any Branch whose cond_val traces to a ConstInt (including via pre-Mem2Reg Store/Load of dest_val!)
+        mut cfg_changed := false
+        if folded_any {
+            for bb in 0..f.blocks.len {
+                tid := f.blocks[bb].term_id
+                if tid < 0 { continue }
+                tm := f.terms[tid]
+                if tm.kind == .Branch && tm.cond_val >= 0 && tm.cond_val < f.vals.len {
+                    // Trace cond_val through Copy / single-pred Store->Load
+                    mut cv := tm.cond_val
+                    mut is_const := false
+                    mut cval: i64 = 0
+                    mut csteps := 0
+                    while cv >= 0 && cv < f.vals.len && csteps < 8 {
+                        csteps += 1
+                        di := f.vals[cv].def_inst
+                        if di < 0 || di >= f.insts.len { break }
+                        ins := f.insts[di]
+                        if ins.kind == .ConstInt { is_const = true; cval = ins.imm_i64; break }
+                        if ins.kind == .Copy { cv = ins.op_a; continue }
+                        if ins.kind == .Load && ins.aux >= 0 {
+                            slot := ins.aux
+                            lbb := f.vals[cv].def_bb
+                            if lbb >= 0 && lbb < f.blocks.len {
+                                s0 := f.blocks[lbb].inst_start
+                                n0 := f.blocks[lbb].inst_len
+                                mut fv := -1
+                                for k in 0..n0 {
+                                    iid := f.block_insts[s0 + k]
+                                    if iid == di { break }
+                                    si := f.insts[iid]
+                                    if si.kind == .Store && si.aux == slot { fv = si.op_b }
+                                }
+                                if fv >= 0 { cv = fv; continue }
+                            }
+                        }
+                        break
+                    }
+                    if is_const {
+                        take_a := cval != 0
+                        f.terms[tid].kind = .Goto
+                        f.terms[tid].cond_val = -1
+                        if take_a {
+                            f.terms[tid].target_b = -1
+                            f.terms[tid].arg2_start = 0
+                            f.terms[tid].arg2_len = 0
+                        } else {
+                            f.terms[tid].target_a = tm.target_b
+                            f.terms[tid].arg_start = tm.arg2_start
+                            f.terms[tid].arg_len = tm.arg2_len
+                            f.terms[tid].target_b = -1
+                            f.terms[tid].arg2_start = 0
+                            f.terms[tid].arg2_len = 0
+                        }
+                        cfg_changed = true
+                    }
+                }
+            }
+        }
+        if cfg_changed { ssa.compute_preds(&mut f) }
+    }
+}
+
+// Prune functions unreachable from `entry_fn` so dead platform helpers (e.g. Win32 imports on macOS)
+// are not emitted into ObjectModule.
+fn prune_unreachable_fns(sp: &mut ssa.SsaProgram, hir: &hb.HirProgram, target: obj.TargetKind) {
+    if target == .Wasm32 { return }
+    types := &hir.types
+    if sp.entry_fn < 0 || sp.entry_fn >= sp.fn_id_to_idx.len { return }
+    eidx := sp.fn_id_to_idx[sp.entry_fn]
+    if eidx < 0 || eidx >= sp.funcs.len { return }
+
+    mut visited: []bool = []
+    for _ in 0..sp.funcs.len { visited.push(false) }
+    mut queue: []i32 = []
+    visited[eidx] = true
+    queue.push(eidx)
+
+    mut qi := 0
+    while qi < queue.len {
+        cur := queue[qi]
+        qi += 1
+        sf := &sp.funcs[cur]
+        if sf.blocks.len == 0 { continue }
+        // BFS only reachable blocks within `sf` so dead target_is branches never pull in dead callees!
+        mut bvis: []bool = []
+        for _ in 0..sf.blocks.len { bvis.push(false) }
+        mut bq: []i32 = [0]
+        bvis[0] = true
+        mut bqi := 0
+        mut succs: []i32 = []
+        while bqi < bq.len {
+            bi := bq[bqi]
+            bqi += 1
+            blk := sf.blocks[bi]
+            for ii in 0..blk.inst_len {
+                ins := sf.insts[sf.block_insts[blk.inst_start + ii]]
+                if ins.kind == .ConstFn && ins.aux >= 0 && ins.aux < sp.fn_id_to_idx.len {
+                    tidx := sp.fn_id_to_idx[ins.aux]
+                    if tidx >= 0 && tidx < sp.funcs.len && !visited[tidx] {
+                        visited[tidx] = true
+                        queue.push(tidx)
+                    }
+                } else if ins.kind == .ClosureMake {
+                    te := &types.entries[ins.ty]
+                    cfid := if te.closure_fn_id >= 0 { te.closure_fn_id } else { ins.aux }
+                    if cfid >= 0 && cfid < sp.fn_id_to_idx.len {
+                        tidx := sp.fn_id_to_idx[cfid]
+                        if tidx >= 0 && tidx < sp.funcs.len && !visited[tidx] {
+                            visited[tidx] = true
+                            queue.push(tidx)
+                        }
+                    }
+                }
+            }
+            if blk.term_id >= 0 {
+                tm := sf.terms[blk.term_id]
+                if tm.kind == .Call && tm.callee >= 0 && tm.callee < sp.fn_id_to_idx.len {
+                    tidx := sp.fn_id_to_idx[tm.callee]
+                    if tidx >= 0 && tidx < sp.funcs.len && !visited[tidx] {
+                        visited[tidx] = true
+                        queue.push(tidx)
+                    }
+                } else if tm.kind == .IntrinsicCall && tm.callee == hb.INTRINSIC_DROP && tm.arg_len > 0 {
+                    av := sf.val_args[tm.arg_start]
+                    mut ty := sf.vals[av].ty
+                    if types.entries[ty].kind == .Ref || types.entries[ty].kind == .MutRef {
+                        ty = types.entries[ty].inner_a
+                    }
+                    if ty >= 0 && ty < types.entries.len && types.entries[ty].dispose_fn >= 0 {
+                        dfid := types.entries[ty].dispose_fn
+                        if dfid < sp.fn_id_to_idx.len {
+                            tidx := sp.fn_id_to_idx[dfid]
+                            if tidx >= 0 && tidx < sp.funcs.len && !visited[tidx] {
+                                visited[tidx] = true
+                                queue.push(tidx)
+                            }
+                        }
+                    }
+                }
+            }
+            ssa.term_succs(&sf, bi, &mut succs)
+            for si in 0..succs.len {
+                sb := succs[si]
+                if sb >= 0 && sb < sf.blocks.len && !bvis[sb] {
+                    bvis[sb] = true
+                    bq.push(sb)
+                }
+            }
+        }
+    }
+
+    // Compact sp.funcs to keep only reachable functions (and rebuild fn_id_to_idx)
+    mut kept: []ssa.SsaFunc = []
+    for fi in 0..sp.fn_id_to_idx.len { sp.fn_id_to_idx[fi] = -1 }
+    old_funcs := replace(&mut sp.funcs, [])
+    mut idx := 0
+    for sf in move old_funcs {
+        if visited[idx] {
+            fid := sf.fn_id
+            new_i := kept.len
+            if fid >= 0 && fid < sp.fn_id_to_idx.len {
+                sp.fn_id_to_idx[fid] = new_i
+            }
+            kept.push(move sf)
+        }
+        idx += 1
+    }
+    sp.funcs = move kept
+}
+
 pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
     opts: &BuildOptions) -> CompileOutput {
     mut diags: []diag.Diagnostic = []
@@ -324,6 +595,10 @@ pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
         return fail_output(opts.target, err, move diags)
     }
 
+    // Fold target_is("...") & prune unreachable functions BEFORE opt/verify
+    fold_target_is_program(&mut sp, obj.target_to_platform(opts.target))
+    prune_unreachable_fns(&mut sp, &prog.hir, opts.target)
+
     // 2. Verify pre-opt SSA invariants
     if opts.verify_ssa {
         if !ssa_verify.verify_program(&tt, &sp, &mut diags) || diags.len > 0 {
@@ -334,7 +609,7 @@ pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
 
     // 3. Run unified SSA optimization pipeline (Mem2Reg, Inliner, GVN/ConstFold, Bounds/Ovf Elision, CFG/DCE)
     if opts.run_opt {
-        if !ssa_opt.optimize_program(&tt, &mut sp, opts.verify_ssa, &mut diags) || diags.len > 0 {
+        if !ssa_opt.optimize_program(&tt, &mut sp, false, &mut diags) || diags.len > 0 {
             err := "ssa_opt failed: " + format_diags_summary(&diags)
             return fail_output(opts.target, err, move diags)
         }
@@ -345,6 +620,8 @@ pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
             }
         }
     }
+
+    prune_unreachable_fns(&mut sp, &prog.hir, opts.target)
 
     total_fns := sp.funcs.len
 
@@ -370,7 +647,8 @@ pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
             }
         }
         mut obj_mod := if opts.target == .Arm64Macos || opts.target == .Arm64Linux {
-            arm64_isel.emit_program_with_sources(&sp, &rt_hir, opts.target, &prog.sources)
+            if opts.debug_info { arm64_isel.emit_program_with_sources(&sp, &rt_hir, opts.target, &prog.sources) }
+            else { arm64_isel.emit_program(&sp, &rt_hir, opts.target) }
         } else {
             x86_isel.emit_program(&sp, &rt_hir, opts.target)
         }
@@ -396,7 +674,8 @@ pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
     }
 
     obj_mod := if opts.target == .Arm64Macos || opts.target == .Arm64Linux {
-        arm64_isel.emit_program_with_sources(&sp, &prog.hir, opts.target, &prog.sources)
+        if opts.debug_info { arm64_isel.emit_program_with_sources(&sp, &prog.hir, opts.target, &prog.sources) }
+        else { arm64_isel.emit_program(&sp, &prog.hir, opts.target) }
     } else {
         x86_isel.emit_program(&sp, &prog.hir, opts.target)
     }

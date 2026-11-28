@@ -13,6 +13,7 @@
 //     and native Win64 ABI (rcx/xmm0..r9/xmm3 + 32B shadow space / rax+xmm0 / sret in rcx for >8B).
 
 import std.bytes as bytes
+import ..frontend.lexer as lexer
 import ..hir.hir_types as ht
 import ..hir.hir_body as hb
 import ..ssa.ssa_ir as ssa
@@ -115,6 +116,7 @@ pub fn classify_repr(types: &ht.TypeTable, ty: i32, is_win64: bool) -> i32 {
     if k == .Unit || k == .Error || te.size == 0 { return REPR_VOID }
     if k == .F32 || k == .F64 { return REPR_FP }
     if k == .FatStr || k == .FatSlice || k == .RegionSlice { return REPR_PAIR }
+    if k == .Struct && ht.find_map_inst(&types, ty) >= 0 { return REPR_GP }
     if is_agg_kind(k) {
         if te.size <= 8 { return REPR_GP }
         if !is_win64 && te.size <= 16 { return REPR_PAIR }
@@ -562,7 +564,7 @@ pub fn alloc_regs_for_func(types: &ht.TypeTable, f: &ssa.SsaFunc, target: obj.Ta
         if iv_end[v] < iv_start[v] { continue }
         for ci in 0..call_pts.len {
             cp := call_pts[ci]
-            if iv_start[v] < cp && iv_end[v] > cp {
+            if iv_start[v] < cp && iv_end[v] >= cp {
                 crosses_call[v] = true
                 break
             }
@@ -1212,6 +1214,24 @@ struct RuntimeSyms {
     mem_equal_sym: i32,
     write_fd_sym: i32,
     print_i64_sym: i32,
+    arr_alloc_sym: i32,
+    arr_grow_sym: i32,
+    hash_key_sym: i32,
+    key_eq_sym: i32,
+    map_new_sym: i32,
+    map_find_sym: i32,
+    map_put_sym: i32,
+    map_remove_sym: i32,
+    fmt_int_sym: i32,
+    fmt_str_sym: i32,
+    str_slice_sym: i32,
+    str_runes_sym: i32,
+    utf8_valid_sym: i32,
+    sys_now_ms_sym: i32,
+    sys_read_all_sym: i32,
+    sys_write_file_sym: i32,
+    sys_stat_sym: i32,
+    bss_args_off: i32,
     // Windows kernel32 imports (-1 on Linux)
     win_exit_imp: i32,
     win_valloc_imp: i32,
@@ -1553,6 +1573,925 @@ fn emit_start_and_runtime(ctx: &mut EmitCtx, entry_fn_sym: i32, entry_returns_in
     p_relocs.push(PendingReloc { local_off: wcall, kind: .X86Rel32, sym_id: ctx.rt.write_fd_sym, addend: 0 })
     x64.emit_epilogue(&mut pb)
     _ := commit_code_block(&mut ctx, ctx.rt.print_i64_sym, &mut pb, &p_relocs, &empty_i, 16)
+
+    a0 := gp_arg_reg(ctx.is_win64, 0)
+    a1 := gp_arg_reg(ctx.is_win64, 1)
+    a2 := gp_arg_reg(ctx.is_win64, 2)
+    a3 := gp_arg_reg(ctx.is_win64, 3)
+
+    // 9. __dunder_arr_alloc(cap, stride) -> ptr to elem 0 ([-24]=rc, [-16]=cap, [-8]=len=0)
+    mut aa := x64.new()
+    mut aa_r: []PendingReloc = []
+    x64.emit_prologue(&mut aa, 32, ctx.is_win64)
+    x64.mov_store(&mut aa, x64.RBP, -8, a0, 8)
+    x64.mov_store(&mut aa, x64.RBP, -16, a1, 8)
+    x64.mov_rr(&mut aa, true, SCRATCH_A, a0)
+    x64.cmp_ri(&mut aa, true, SCRATCH_A, 4)
+    aa_ok := x64.label(&mut aa)
+    _ := x64.jcc_lbl(&mut aa, x64.CC_GE, aa_ok)
+    x64.mov_imm(&mut aa, true, SCRATCH_A, 4)
+    x64.mark(&mut aa, aa_ok)
+    x64.mov_store(&mut aa, x64.RBP, -8, SCRATCH_A, 8)
+    x64.imul_rr(&mut aa, true, SCRATCH_A, a1)
+    x64.add_ri(&mut aa, true, SCRATCH_A, 24)
+    x64.mov_rr(&mut aa, true, a0, SCRATCH_A)
+    ac_aa := x64.call_lbl(&mut aa, -1)
+    aa_r.push(PendingReloc { local_off: ac_aa, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    x64.mov_imm(&mut aa, true, SCRATCH_B, 1)
+    x64.mov_store(&mut aa, x64.RAX, 0, SCRATCH_B, 8)
+    x64.mov_load(&mut aa, SCRATCH_B, x64.RBP, -8, 8, false)
+    x64.mov_store(&mut aa, x64.RAX, 8, SCRATCH_B, 8)
+    x64.mov_imm(&mut aa, true, SCRATCH_B, 0)
+    x64.mov_store(&mut aa, x64.RAX, 16, SCRATCH_B, 8)
+    x64.add_ri(&mut aa, true, x64.RAX, 24)
+    x64.emit_epilogue(&mut aa)
+    _ := commit_code_block(&mut ctx, ctx.rt.arr_alloc_sym, &mut aa, &aa_r, &empty_i, 16)
+
+    // 10. __dunder_arr_grow(old_ptr, need_cap, stride) -> new_ptr
+    mut ag := x64.new()
+    mut ag_r: []PendingReloc = []
+    x64.emit_prologue(&mut ag, 48, ctx.is_win64)
+    x64.mov_store(&mut ag, x64.RBP, -8, a0, 8)  // old_ptr
+    x64.mov_store(&mut ag, x64.RBP, -16, a1, 8) // need_cap
+    x64.mov_store(&mut ag, x64.RBP, -24, a2, 8) // stride
+    x64.mov_load(&mut ag, SCRATCH_A, a0, -16, 8, false) // old_cap
+    x64.cmp_rr(&mut ag, true, SCRATCH_A, a1)
+    ag_keep := x64.label(&mut ag)
+    _ := x64.jcc_lbl(&mut ag, x64.CC_GE, ag_keep)
+    x64.add_rr(&mut ag, true, SCRATCH_A, SCRATCH_A) // old_cap * 2
+    x64.cmp_rr(&mut ag, true, SCRATCH_A, a1)
+    ag_use := x64.label(&mut ag)
+    _ := x64.jcc_lbl(&mut ag, x64.CC_GE, ag_use)
+    x64.mov_rr(&mut ag, true, SCRATCH_A, a1)
+    x64.mark(&mut ag, ag_use)
+    x64.mov_rr(&mut ag, true, a0, SCRATCH_A)
+    x64.mov_load(&mut ag, a1, x64.RBP, -24, 8, false)
+    ac_ag := x64.call_lbl(&mut ag, -1)
+    ag_r.push(PendingReloc { local_off: ac_ag, kind: .X86Rel32, sym_id: ctx.rt.arr_alloc_sym, addend: 0 })
+    x64.mov_store(&mut ag, x64.RBP, -32, x64.RAX, 8) // new_ptr
+    x64.mov_load(&mut ag, SCRATCH_A, x64.RBP, -8, 8, false) // old_ptr
+    x64.mov_load(&mut ag, SCRATCH_B, SCRATCH_A, -8, 8, false) // old_len
+    x64.mov_store(&mut ag, x64.RAX, -8, SCRATCH_B, 8)
+    x64.mov_rr(&mut ag, true, a0, x64.RAX)
+    x64.mov_rr(&mut ag, true, a1, SCRATCH_A)
+    x64.mov_load(&mut ag, a2, x64.RBP, -24, 8, false)
+    x64.imul_rr(&mut ag, true, a2, SCRATCH_B)
+    mc_ag := x64.call_lbl(&mut ag, -1)
+    ag_r.push(PendingReloc { local_off: mc_ag, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mov_load(&mut ag, x64.RAX, x64.RBP, -32, 8, false)
+    x64.emit_epilogue(&mut ag)
+    x64.mark(&mut ag, ag_keep)
+    x64.mov_load(&mut ag, x64.RAX, x64.RBP, -8, 8, false)
+    x64.emit_epilogue(&mut ag)
+    _ := commit_code_block(&mut ctx, ctx.rt.arr_grow_sym, &mut ag, &ag_r, &empty_i, 16)
+
+    // 11. __dunder_hash_key(ptr, len, kkind) -> i64 (FNV-1a 64-bit)
+    mut hk := x64.new()
+    hk_s := x64.label(&mut hk)
+    hk_f := x64.label(&mut hk)
+    hk_go := x64.label(&mut hk)
+    hk_loop := x64.label(&mut hk)
+    hk_done := x64.label(&mut hk)
+    x64.cmp_ri(&mut hk, false, a2, 1)
+    _ := x64.jcc_lbl(&mut hk, x64.CC_E, hk_s)
+    x64.cmp_ri(&mut hk, false, a2, 2)
+    _ := x64.jcc_lbl(&mut hk, x64.CC_E, hk_f)
+    _ := x64.jmp_lbl(&mut hk, hk_go)
+    x64.mark(&mut hk, hk_s)
+    x64.mov_load(&mut hk, a0, a0, 0, 8, false)
+    x64.mov_load(&mut hk, a1, a0, -8, 8, false)
+    _ := x64.jmp_lbl(&mut hk, hk_go)
+    x64.mark(&mut hk, hk_f)
+    x64.mov_load(&mut hk, a1, a0, 8, 8, false)
+    x64.mov_load(&mut hk, a0, a0, 0, 8, false)
+    x64.mark(&mut hk, hk_go)
+    x64.mov_imm(&mut hk, true, x64.RAX, -3750763034362895579)
+    x64.mov_imm(&mut hk, true, SCRATCH_A, 0)
+    x64.mov_imm(&mut hk, true, a2, 1099511628211)
+    x64.mark(&mut hk, hk_loop)
+    x64.cmp_rr(&mut hk, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut hk, x64.CC_GE, hk_done)
+    x64.mov_load_sib(&mut hk, SCRATCH_B, a0, SCRATCH_A, 1, 0, 1, false)
+    x64.xor_rr(&mut hk, true, x64.RAX, SCRATCH_B)
+    x64.imul_rr(&mut hk, true, x64.RAX, a2)
+    x64.add_ri(&mut hk, true, SCRATCH_A, 1)
+    _ := x64.jmp_lbl(&mut hk, hk_loop)
+    x64.mark(&mut hk, hk_done)
+    x64.ret(&mut hk)
+    _ := commit_code_block(&mut ctx, ctx.rt.hash_key_sym, &mut hk, &empty_r, &empty_i, 16)
+
+    // 12. __dunder_key_eq(ap, bp, len, kkind) -> bool
+    mut ke := x64.new()
+    mut ke_r: []PendingReloc = []
+    ke_s := x64.label(&mut ke)
+    ke_f := x64.label(&mut ke)
+    ke_go := x64.label(&mut ke)
+    ke_no := x64.label(&mut ke)
+    x64.cmp_ri(&mut ke, false, a3, 1)
+    _ := x64.jcc_lbl(&mut ke, x64.CC_E, ke_s)
+    x64.cmp_ri(&mut ke, false, a3, 2)
+    _ := x64.jcc_lbl(&mut ke, x64.CC_E, ke_f)
+    _ := x64.jmp_lbl(&mut ke, ke_go)
+    x64.mark(&mut ke, ke_s)
+    x64.mov_load(&mut ke, a0, a0, 0, 8, false)
+    x64.mov_load(&mut ke, a1, a1, 0, 8, false)
+    x64.mov_load(&mut ke, a2, a0, -8, 8, false)
+    x64.mov_load(&mut ke, SCRATCH_A, a1, -8, 8, false)
+    x64.cmp_rr(&mut ke, true, a2, SCRATCH_A)
+    _ := x64.jcc_lbl(&mut ke, x64.CC_NE, ke_no)
+    _ := x64.jmp_lbl(&mut ke, ke_go)
+    x64.mark(&mut ke, ke_f)
+    x64.mov_load(&mut ke, a2, a0, 8, 8, false)
+    x64.mov_load(&mut ke, SCRATCH_A, a1, 8, 8, false)
+    x64.cmp_rr(&mut ke, true, a2, SCRATCH_A)
+    _ := x64.jcc_lbl(&mut ke, x64.CC_NE, ke_no)
+    x64.mov_load(&mut ke, a0, a0, 0, 8, false)
+    x64.mov_load(&mut ke, a1, a1, 0, 8, false)
+    x64.mark(&mut ke, ke_go)
+    eq_ke := x64.jmp_lbl(&mut ke, -1)
+    ke_r.push(PendingReloc { local_off: eq_ke, kind: .X86Rel32, sym_id: ctx.rt.mem_equal_sym, addend: 0 })
+    x64.mark(&mut ke, ke_no)
+    x64.mov_imm(&mut ke, true, x64.RAX, 0)
+    x64.ret(&mut ke)
+    _ := commit_code_block(&mut ctx, ctx.rt.key_eq_sym, &mut ke, &ke_r, &empty_i, 16)
+
+    // 13. __dunder_map_new(k_stride, v_stride, k_kind) -> MapHdr* (64B)
+    mut mn := x64.new()
+    mut mn_r: []PendingReloc = []
+    x64.emit_prologue(&mut mn, 48, ctx.is_win64)
+    x64.mov_store(&mut mn, x64.RBP, -8, a0, 8)  // ks
+    x64.mov_store(&mut mn, x64.RBP, -16, a1, 8) // vs
+    x64.mov_store(&mut mn, x64.RBP, -24, a2, 8) // kk
+    x64.mov_imm(&mut mn, true, a0, 64)
+    c_mn1 := x64.call_lbl(&mut mn, -1)
+    mn_r.push(PendingReloc { local_off: c_mn1, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    x64.mov_store(&mut mn, x64.RBP, -32, x64.RAX, 8) // hdr
+    x64.mov_imm(&mut mn, true, a0, 8)
+    x64.mov_load(&mut mn, a1, x64.RBP, -8, 8, false)
+    c_mn2 := x64.call_lbl(&mut mn, -1)
+    mn_r.push(PendingReloc { local_off: c_mn2, kind: .X86Rel32, sym_id: ctx.rt.arr_alloc_sym, addend: 0 })
+    x64.mov_load(&mut mn, SCRATCH_A, x64.RBP, -32, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 0, x64.RAX, 8) // keys_arr
+    x64.mov_imm(&mut mn, true, a0, 8)
+    x64.mov_load(&mut mn, a1, x64.RBP, -16, 8, false)
+    x64.cmp_ri(&mut mn, true, a1, 1)
+    mn_vok := x64.label(&mut mn)
+    _ := x64.jcc_lbl(&mut mn, x64.CC_GE, mn_vok)
+    x64.mov_imm(&mut mn, true, a1, 1)
+    x64.mark(&mut mn, mn_vok)
+    c_mn3 := x64.call_lbl(&mut mn, -1)
+    mn_r.push(PendingReloc { local_off: c_mn3, kind: .X86Rel32, sym_id: ctx.rt.arr_alloc_sym, addend: 0 })
+    x64.mov_load(&mut mn, SCRATCH_A, x64.RBP, -32, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 8, x64.RAX, 8) // vals_arr
+    x64.mov_imm(&mut mn, true, a0, 64) // 16 i32 buckets
+    c_mn4 := x64.call_lbl(&mut mn, -1)
+    mn_r.push(PendingReloc { local_off: c_mn4, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    // Fill 16 i32 buckets with -1
+    x64.mov_imm(&mut mn, true, SCRATCH_A, 0)
+    x64.mov_imm(&mut mn, true, SCRATCH_B, -1)
+    mn_fl := x64.label(&mut mn)
+    x64.mark(&mut mn, mn_fl)
+    x64.mov_store_sib(&mut mn, x64.RAX, SCRATCH_A, 4, 0, SCRATCH_B, 4)
+    x64.add_ri(&mut mn, true, SCRATCH_A, 1)
+    x64.cmp_ri(&mut mn, true, SCRATCH_A, 16)
+    _ := x64.jcc_lbl(&mut mn, x64.CC_L, mn_fl)
+    x64.mov_load(&mut mn, SCRATCH_A, x64.RBP, -32, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 16, x64.RAX, 8) // buckets
+    x64.mov_imm(&mut mn, true, SCRATCH_B, 16)
+    x64.mov_store(&mut mn, SCRATCH_A, 24, SCRATCH_B, 8) // bcap
+    x64.mov_imm(&mut mn, true, SCRATCH_B, 0)
+    x64.mov_store(&mut mn, SCRATCH_A, 32, SCRATCH_B, 8) // len
+    x64.mov_load(&mut mn, SCRATCH_B, x64.RBP, -8, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 40, SCRATCH_B, 8) // k_stride
+    x64.mov_load(&mut mn, SCRATCH_B, x64.RBP, -16, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 48, SCRATCH_B, 8) // v_stride
+    x64.mov_load(&mut mn, SCRATCH_B, x64.RBP, -24, 8, false)
+    x64.mov_store(&mut mn, SCRATCH_A, 56, SCRATCH_B, 8) // k_kind
+    x64.mov_rr(&mut mn, true, x64.RAX, SCRATCH_A)
+    x64.emit_epilogue(&mut mn)
+    _ := commit_code_block(&mut ctx, ctx.rt.map_new_sym, &mut mn, &mn_r, &empty_i, 16)
+
+    // 14. __dunder_map_find(hdr, kptr) -> dense idx (>=0) or -1
+    mut mf := x64.new()
+    mut mf_r: []PendingReloc = []
+    x64.emit_prologue(&mut mf, 48, ctx.is_win64)
+    x64.mov_store(&mut mf, x64.RBP, -8, a0, 8)  // hdr
+    x64.mov_store(&mut mf, x64.RBP, -16, a1, 8) // kptr
+    x64.mov_load(&mut mf, a2, a0, 56, 8, false) // k_kind
+    x64.mov_load(&mut mf, SCRATCH_A, a0, 40, 8, false) // k_stride
+    x64.mov_rr(&mut mf, true, a0, a1)
+    x64.mov_rr(&mut mf, true, a1, SCRATCH_A)
+    c_mfh := x64.call_lbl(&mut mf, -1)
+    mf_r.push(PendingReloc { local_off: c_mfh, kind: .X86Rel32, sym_id: ctx.rt.hash_key_sym, addend: 0 })
+    x64.mov_load(&mut mf, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mf, SCRATCH_B, SCRATCH_A, 24, 8, false) // bcap
+    x64.sub_ri(&mut mf, true, SCRATCH_B, 1) // mask
+    x64.and_rr(&mut mf, true, x64.RAX, SCRATCH_B)
+    x64.mov_store(&mut mf, x64.RBP, -24, x64.RAX, 8) // slot
+    x64.mov_imm(&mut mf, true, SCRATCH_A, 0)
+    x64.mov_store(&mut mf, x64.RBP, -32, SCRATCH_A, 8) // probes
+    mf_lp := x64.label(&mut mf)
+    mf_next := x64.label(&mut mf)
+    mf_miss := x64.label(&mut mf)
+    x64.mark(&mut mf, mf_lp)
+    x64.mov_load(&mut mf, SCRATCH_A, x64.RBP, -8, 8, false) // hdr
+    x64.mov_load(&mut mf, SCRATCH_B, x64.RBP, -32, 8, false) // probes
+    x64.mov_load(&mut mf, x64.RAX, SCRATCH_A, 24, 8, false) // bcap
+    x64.cmp_rr(&mut mf, true, SCRATCH_B, x64.RAX)
+    _ := x64.jcc_lbl(&mut mf, x64.CC_GE, mf_miss)
+    x64.mov_load(&mut mf, x64.RAX, SCRATCH_A, 16, 8, false) // buckets
+    x64.mov_load(&mut mf, SCRATCH_B, x64.RBP, -24, 8, false) // slot
+    x64.mov_load_sib(&mut mf, x64.RAX, x64.RAX, SCRATCH_B, 4, 0, 4, true) // entry
+    x64.cmp_ri(&mut mf, true, x64.RAX, -1)
+    _ := x64.jcc_lbl(&mut mf, x64.CC_E, mf_miss)
+    x64.cmp_ri(&mut mf, true, x64.RAX, 0)
+    _ := x64.jcc_lbl(&mut mf, x64.CC_L, mf_next)
+    x64.mov_store(&mut mf, x64.RBP, -40, x64.RAX, 8) // entry
+    x64.mov_load(&mut mf, a2, SCRATCH_A, 40, 8, false) // k_stride
+    x64.imul_rr(&mut mf, true, x64.RAX, a2)
+    x64.mov_load(&mut mf, a0, SCRATCH_A, 0, 8, false) // keys_arr
+    x64.add_rr(&mut mf, true, a0, x64.RAX)
+    x64.mov_load(&mut mf, a1, x64.RBP, -16, 8, false) // kptr
+    x64.mov_load(&mut mf, a3, SCRATCH_A, 56, 8, false) // k_kind
+    c_mfe := x64.call_lbl(&mut mf, -1)
+    mf_r.push(PendingReloc { local_off: c_mfe, kind: .X86Rel32, sym_id: ctx.rt.key_eq_sym, addend: 0 })
+    x64.test_rr(&mut mf, false, x64.RAX, x64.RAX)
+    _ := x64.jcc_lbl(&mut mf, x64.CC_E, mf_next)
+    x64.mov_load(&mut mf, x64.RAX, x64.RBP, -40, 8, false)
+    x64.emit_epilogue(&mut mf)
+    x64.mark(&mut mf, mf_next)
+    x64.mov_load(&mut mf, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mf, SCRATCH_B, SCRATCH_A, 24, 8, false)
+    x64.sub_ri(&mut mf, true, SCRATCH_B, 1)
+    x64.mov_load(&mut mf, x64.RAX, x64.RBP, -24, 8, false)
+    x64.add_ri(&mut mf, true, x64.RAX, 1)
+    x64.and_rr(&mut mf, true, x64.RAX, SCRATCH_B)
+    x64.mov_store(&mut mf, x64.RBP, -24, x64.RAX, 8)
+    x64.mov_load(&mut mf, x64.RAX, x64.RBP, -32, 8, false)
+    x64.add_ri(&mut mf, true, x64.RAX, 1)
+    x64.mov_store(&mut mf, x64.RBP, -32, x64.RAX, 8)
+    _ := x64.jmp_lbl(&mut mf, mf_lp)
+    x64.mark(&mut mf, mf_miss)
+    x64.mov_imm(&mut mf, true, x64.RAX, -1)
+    x64.emit_epilogue(&mut mf)
+    _ := commit_code_block(&mut ctx, ctx.rt.map_find_sym, &mut mf, &mf_r, &empty_i, 16)
+
+    // 15. __dunder_map_put(hdr, kptr, vptr, overwrite) -> bool (1 if inserted new)
+    mut mp := x64.new()
+    mut mp_r: []PendingReloc = []
+    x64.emit_prologue(&mut mp, 64, ctx.is_win64)
+    x64.mov_store(&mut mp, x64.RBP, -8, a0, 8)  // hdr
+    x64.mov_store(&mut mp, x64.RBP, -16, a1, 8) // kptr
+    x64.mov_store(&mut mp, x64.RBP, -24, a2, 8) // vptr
+    x64.mov_store(&mut mp, x64.RBP, -32, a3, 8) // overwrite
+    c_mpf := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpf, kind: .X86Rel32, sym_id: ctx.rt.map_find_sym, addend: 0 })
+    mp_new := x64.label(&mut mp)
+    mp_ret0 := x64.label(&mut mp)
+    x64.cmp_ri(&mut mp, true, x64.RAX, 0)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_L, mp_new)
+    // Found at RAX: if overwrite && v_stride > 0 copy vptr -> vals[idx]
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -32, 8, false)
+    x64.test_rr(&mut mp, false, SCRATCH_A, SCRATCH_A)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_E, mp_ret0)
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false) // hdr
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 48, 8, false) // v_stride
+    x64.cmp_ri(&mut mp, true, a2, 0)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_LE, mp_ret0)
+    x64.imul_rr(&mut mp, true, x64.RAX, a2)
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 8, 8, false) // vals_arr
+    x64.add_rr(&mut mp, true, a0, x64.RAX)
+    x64.mov_load(&mut mp, a1, x64.RBP, -24, 8, false)
+    c_mpcp := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpcp, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mark(&mut mp, mp_ret0)
+    x64.mov_imm(&mut mp, true, x64.RAX, 0)
+    x64.emit_epilogue(&mut mp)
+    x64.mark(&mut mp, mp_new)
+    // Rehash if (len + 1) * 10 >= bcap * 7
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, x64.RAX, SCRATCH_A, 32, 8, false) // len
+    x64.add_ri(&mut mp, true, x64.RAX, 1)
+    x64.imul_rri(&mut mp, true, x64.RAX, x64.RAX, 10)
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 24, 8, false) // bcap
+    x64.imul_rri(&mut mp, true, SCRATCH_B, SCRATCH_B, 7)
+    mp_norh := x64.label(&mut mp)
+    x64.cmp_rr(&mut mp, true, x64.RAX, SCRATCH_B)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_L, mp_norh)
+    // Double bcap & rehash existing keys
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 24, 8, false)
+    x64.add_rr(&mut mp, true, SCRATCH_B, SCRATCH_B)
+    x64.mov_store(&mut mp, SCRATCH_A, 24, SCRATCH_B, 8)
+    x64.mov_rr(&mut mp, true, a0, SCRATCH_B)
+    x64.imul_rri(&mut mp, true, a0, a0, 4)
+    c_mprh := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mprh, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_store(&mut mp, SCRATCH_A, 16, x64.RAX, 8)
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 24, 8, false) // new bcap
+    x64.mov_imm(&mut mp, true, a0, 0)
+    x64.mov_imm(&mut mp, true, a1, -1)
+    mp_rf := x64.label(&mut mp)
+    x64.mark(&mut mp, mp_rf)
+    x64.mov_store_sib(&mut mp, x64.RAX, a0, 4, 0, a1, 4)
+    x64.add_ri(&mut mp, true, a0, 1)
+    x64.cmp_rr(&mut mp, true, a0, SCRATCH_B)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_L, mp_rf)
+    x64.mov_imm(&mut mp, true, SCRATCH_A, 0)
+    x64.mov_store(&mut mp, x64.RBP, -40, SCRATCH_A, 8) // i = 0
+    mp_rl := x64.label(&mut mp)
+    x64.mark(&mut mp, mp_rl)
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, SCRATCH_B, x64.RBP, -40, 8, false)
+    x64.mov_load(&mut mp, x64.RAX, SCRATCH_A, 32, 8, false) // len
+    x64.cmp_rr(&mut mp, true, SCRATCH_B, x64.RAX)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_GE, mp_norh)
+    x64.mov_load(&mut mp, a1, SCRATCH_A, 40, 8, false) // ks
+    x64.mov_rr(&mut mp, true, x64.RAX, SCRATCH_B)
+    x64.imul_rr(&mut mp, true, x64.RAX, a1)
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 0, 8, false)
+    x64.add_rr(&mut mp, true, a0, x64.RAX)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 56, 8, false)
+    c_mph2 := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mph2, kind: .X86Rel32, sym_id: ctx.rt.hash_key_sym, addend: 0 })
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 24, 8, false)
+    x64.sub_ri(&mut mp, true, SCRATCH_B, 1) // mask
+    x64.and_rr(&mut mp, true, x64.RAX, SCRATCH_B) // slot
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 16, 8, false) // buckets
+    mp_rp := x64.label(&mut mp)
+    x64.mark(&mut mp, mp_rp)
+    x64.mov_load_sib(&mut mp, a1, a0, x64.RAX, 4, 0, 4, true)
+    mp_rins := x64.label(&mut mp)
+    x64.cmp_ri(&mut mp, true, a1, 0)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_L, mp_rins)
+    x64.add_ri(&mut mp, true, x64.RAX, 1)
+    x64.and_rr(&mut mp, true, x64.RAX, SCRATCH_B)
+    _ := x64.jmp_lbl(&mut mp, mp_rp)
+    x64.mark(&mut mp, mp_rins)
+    x64.mov_load(&mut mp, a1, x64.RBP, -40, 8, false)
+    x64.mov_store_sib(&mut mp, a0, x64.RAX, 4, 0, a1, 4)
+    x64.add_ri(&mut mp, true, a1, 1)
+    x64.mov_store(&mut mp, x64.RBP, -40, a1, 8)
+    _ := x64.jmp_lbl(&mut mp, mp_rl)
+    x64.mark(&mut mp, mp_norh)
+    // Grow keys_arr & vals_arr to len+1
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 0, 8, false)
+    x64.mov_load(&mut mp, a1, SCRATCH_A, 32, 8, false)
+    x64.add_ri(&mut mp, true, a1, 1)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 40, 8, false)
+    c_mpgk := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpgk, kind: .X86Rel32, sym_id: ctx.rt.arr_grow_sym, addend: 0 })
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_store(&mut mp, SCRATCH_A, 0, x64.RAX, 8)
+    // Copy key into keys_arr[len]
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 32, 8, false) // len
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 40, 8, false) // ks
+    x64.imul_rr(&mut mp, true, SCRATCH_B, a2)
+    x64.mov_rr(&mut mp, true, a0, x64.RAX)
+    x64.add_rr(&mut mp, true, a0, SCRATCH_B)
+    x64.mov_load(&mut mp, a1, x64.RBP, -16, 8, false)
+    c_mpck := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpck, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    // Grow & copy val if v_stride > 0
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 48, 8, false) // vs
+    mp_nov := x64.label(&mut mp)
+    x64.cmp_ri(&mut mp, true, a2, 0)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_LE, mp_nov)
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 8, 8, false)
+    x64.mov_load(&mut mp, a1, SCRATCH_A, 32, 8, false)
+    x64.add_ri(&mut mp, true, a1, 1)
+    c_mpgv := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpgv, kind: .X86Rel32, sym_id: ctx.rt.arr_grow_sym, addend: 0 })
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_store(&mut mp, SCRATCH_A, 8, x64.RAX, 8)
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 32, 8, false)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 48, 8, false)
+    x64.imul_rr(&mut mp, true, SCRATCH_B, a2)
+    x64.mov_rr(&mut mp, true, a0, x64.RAX)
+    x64.add_rr(&mut mp, true, a0, SCRATCH_B)
+    x64.mov_load(&mut mp, a1, x64.RBP, -24, 8, false)
+    c_mpcv := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mpcv, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mark(&mut mp, mp_nov)
+    // Insert dense idx `len` into buckets
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, a0, x64.RBP, -16, 8, false)
+    x64.mov_load(&mut mp, a1, SCRATCH_A, 40, 8, false)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 56, 8, false)
+    c_mph3 := x64.call_lbl(&mut mp, -1)
+    mp_r.push(PendingReloc { local_off: c_mph3, kind: .X86Rel32, sym_id: ctx.rt.hash_key_sym, addend: 0 })
+    x64.mov_load(&mut mp, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mp, SCRATCH_B, SCRATCH_A, 24, 8, false)
+    x64.sub_ri(&mut mp, true, SCRATCH_B, 1)
+    x64.and_rr(&mut mp, true, x64.RAX, SCRATCH_B)
+    x64.mov_load(&mut mp, a0, SCRATCH_A, 16, 8, false)
+    mp_ip := x64.label(&mut mp)
+    mp_ii := x64.label(&mut mp)
+    x64.mark(&mut mp, mp_ip)
+    x64.mov_load_sib(&mut mp, a1, a0, x64.RAX, 4, 0, 4, true)
+    x64.cmp_ri(&mut mp, true, a1, 0)
+    _ := x64.jcc_lbl(&mut mp, x64.CC_L, mp_ii)
+    x64.add_ri(&mut mp, true, x64.RAX, 1)
+    x64.and_rr(&mut mp, true, x64.RAX, SCRATCH_B)
+    _ := x64.jmp_lbl(&mut mp, mp_ip)
+    x64.mark(&mut mp, mp_ii)
+    x64.mov_load(&mut mp, a1, SCRATCH_A, 32, 8, false) // len
+    x64.mov_store_sib(&mut mp, a0, x64.RAX, 4, 0, a1, 4)
+    x64.add_ri(&mut mp, true, a1, 1)
+    x64.mov_store(&mut mp, SCRATCH_A, 32, a1, 8)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 0, 8, false)
+    x64.mov_store(&mut mp, a2, -8, a1, 8)
+    x64.mov_load(&mut mp, a2, SCRATCH_A, 8, 8, false)
+    x64.mov_store(&mut mp, a2, -8, a1, 8)
+    x64.mov_imm(&mut mp, true, x64.RAX, 1)
+    x64.emit_epilogue(&mut mp)
+    _ := commit_code_block(&mut ctx, ctx.rt.map_put_sym, &mut mp, &mp_r, &empty_i, 16)
+
+    // 16. __dunder_map_remove(hdr, kptr) -> bool
+    mut mr := x64.new()
+    mut mr_r: []PendingReloc = []
+    x64.emit_prologue(&mut mr, 48, ctx.is_win64)
+    x64.mov_store(&mut mr, x64.RBP, -8, a0, 8)
+    c_mrf := x64.call_lbl(&mut mr, -1)
+    mr_r.push(PendingReloc { local_off: c_mrf, kind: .X86Rel32, sym_id: ctx.rt.map_find_sym, addend: 0 })
+    mr_miss := x64.label(&mut mr)
+    x64.cmp_ri(&mut mr, true, x64.RAX, 0)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_L, mr_miss)
+    x64.mov_store(&mut mr, x64.RBP, -16, x64.RAX, 8) // idx
+    x64.mov_load(&mut mr, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mr, SCRATCH_B, SCRATCH_A, 32, 8, false)
+    x64.sub_ri(&mut mr, true, SCRATCH_B, 1) // last
+    x64.mov_store(&mut mr, x64.RBP, -24, SCRATCH_B, 8)
+    mr_noswap := x64.label(&mut mr)
+    x64.cmp_rr(&mut mr, true, x64.RAX, SCRATCH_B)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_E, mr_noswap)
+    x64.mov_load(&mut mr, a2, SCRATCH_A, 40, 8, false)
+    x64.imul_rr(&mut mr, true, x64.RAX, a2)
+    x64.imul_rr(&mut mr, true, SCRATCH_B, a2)
+    x64.mov_load(&mut mr, a0, SCRATCH_A, 0, 8, false)
+    x64.mov_rr(&mut mr, true, a1, a0)
+    x64.add_rr(&mut mr, true, a0, x64.RAX)
+    x64.add_rr(&mut mr, true, a1, SCRATCH_B)
+    c_mrk := x64.call_lbl(&mut mr, -1)
+    mr_r.push(PendingReloc { local_off: c_mrk, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mov_load(&mut mr, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mr, a2, SCRATCH_A, 48, 8, false)
+    x64.cmp_ri(&mut mr, true, a2, 0)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_LE, mr_noswap)
+    x64.mov_load(&mut mr, x64.RAX, x64.RBP, -16, 8, false)
+    x64.mov_load(&mut mr, SCRATCH_B, x64.RBP, -24, 8, false)
+    x64.imul_rr(&mut mr, true, x64.RAX, a2)
+    x64.imul_rr(&mut mr, true, SCRATCH_B, a2)
+    x64.mov_load(&mut mr, a0, SCRATCH_A, 8, 8, false)
+    x64.mov_rr(&mut mr, true, a1, a0)
+    x64.add_rr(&mut mr, true, a0, x64.RAX)
+    x64.add_rr(&mut mr, true, a1, SCRATCH_B)
+    c_mrv := x64.call_lbl(&mut mr, -1)
+    mr_r.push(PendingReloc { local_off: c_mrv, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mark(&mut mr, mr_noswap)
+    // Scan buckets: idx -> -2, last -> idx
+    x64.mov_load(&mut mr, SCRATCH_A, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut mr, a0, SCRATCH_A, 16, 8, false) // buckets
+    x64.mov_load(&mut mr, a1, SCRATCH_A, 24, 8, false) // bcap
+    x64.mov_load(&mut mr, a2, x64.RBP, -16, 8, false) // idx
+    x64.mov_load(&mut mr, a3, x64.RBP, -24, 8, false) // last
+    x64.mov_imm(&mut mr, true, SCRATCH_B, 0)
+    mr_bl := x64.label(&mut mr)
+    mr_bn := x64.label(&mut mr)
+    mr_bd := x64.label(&mut mr)
+    mr_bchk := x64.label(&mut mr)
+    x64.mark(&mut mr, mr_bl)
+    x64.cmp_rr(&mut mr, true, SCRATCH_B, a1)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_GE, mr_bd)
+    x64.mov_load_sib(&mut mr, x64.RAX, a0, SCRATCH_B, 4, 0, 4, true)
+    x64.cmp_rr(&mut mr, true, x64.RAX, a2)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_NE, mr_bchk)
+    x64.mov_imm(&mut mr, true, x64.RAX, -2)
+    x64.mov_store_sib(&mut mr, a0, SCRATCH_B, 4, 0, x64.RAX, 4)
+    _ := x64.jmp_lbl(&mut mr, mr_bn)
+    x64.mark(&mut mr, mr_bchk)
+    x64.cmp_rr(&mut mr, true, x64.RAX, a3)
+    _ := x64.jcc_lbl(&mut mr, x64.CC_NE, mr_bn)
+    x64.mov_store_sib(&mut mr, a0, SCRATCH_B, 4, 0, a2, 4)
+    x64.mark(&mut mr, mr_bn)
+    x64.add_ri(&mut mr, true, SCRATCH_B, 1)
+    _ := x64.jmp_lbl(&mut mr, mr_bl)
+    x64.mark(&mut mr, mr_bd)
+    x64.mov_store(&mut mr, SCRATCH_A, 32, a3, 8)
+    x64.mov_load(&mut mr, a0, SCRATCH_A, 0, 8, false)
+    x64.mov_store(&mut mr, a0, -8, a3, 8)
+    x64.mov_load(&mut mr, a0, SCRATCH_A, 8, 8, false)
+    x64.mov_store(&mut mr, a0, -8, a3, 8)
+    x64.mov_imm(&mut mr, true, x64.RAX, 1)
+    x64.emit_epilogue(&mut mr)
+    x64.mark(&mut mr, mr_miss)
+    x64.mov_imm(&mut mr, true, x64.RAX, 0)
+    x64.emit_epilogue(&mut mr)
+    _ := commit_code_block(&mut ctx, ctx.rt.map_remove_sym, &mut mr, &mr_r, &empty_i, 16)
+
+    // 17. __dunder_fmt_int(val, base, width, flags) -> String ptr (flags: bit0=upper, bit1=unsigned, bit2=zero_pad)
+    mut fi := x64.new()
+    mut fi_r: []PendingReloc = []
+    x64.emit_prologue(&mut fi, 112, ctx.is_win64)
+    x64.mov_store(&mut fi, x64.RBP, -8, a0, 8)  // val
+    x64.mov_store(&mut fi, x64.RBP, -16, a1, 8) // base
+    x64.mov_store(&mut fi, x64.RBP, -24, a2, 8) // width
+    x64.mov_store(&mut fi, x64.RBP, -32, a3, 8) // flags
+    x64.mov_imm(&mut fi, true, SCRATCH_A, 0)
+    x64.mov_store(&mut fi, x64.RBP, -40, SCRATCH_A, 8) // neg
+    x64.mov_rr(&mut fi, true, x64.RAX, a0)
+    fi_nn := x64.label(&mut fi)
+    x64.cmp_ri(&mut fi, true, a1, 10)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_NE, fi_nn)
+    x64.test_ri(&mut fi, false, a3, 2)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_NE, fi_nn)
+    x64.test_rr(&mut fi, true, x64.RAX, x64.RAX)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_GE, fi_nn)
+    x64.mov_imm(&mut fi, true, SCRATCH_A, 1)
+    x64.mov_store(&mut fi, x64.RBP, -40, SCRATCH_A, 8)
+    x64.neg_r(&mut fi, true, x64.RAX)
+    x64.mark(&mut fi, fi_nn)
+    x64.lea_disp(&mut fi, SCRATCH_A, x64.RBP, -48) // cursor backwards in [rbp-112..rbp-48]
+    x64.mov_load(&mut fi, SCRATCH_B, x64.RBP, -16, 8, false) // base
+    fi_dl := x64.label(&mut fi)
+    fi_hex := x64.label(&mut fi)
+    fi_st := x64.label(&mut fi)
+    x64.mark(&mut fi, fi_dl)
+    x64.mov_imm(&mut fi, true, x64.RDX, 0)
+    x64.div_r(&mut fi, true, SCRATCH_B)
+    x64.cmp_ri(&mut fi, false, x64.RDX, 10)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_GE, fi_hex)
+    x64.add_ri(&mut fi, false, x64.RDX, 48)
+    _ := x64.jmp_lbl(&mut fi, fi_st)
+    x64.mark(&mut fi, fi_hex)
+    x64.mov_load(&mut fi, x64.R8, x64.RBP, -32, 8, false)
+    x64.test_ri(&mut fi, false, x64.R8, 1)
+    fi_lo := x64.label(&mut fi)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_E, fi_lo)
+    x64.add_ri(&mut fi, false, x64.RDX, 55)
+    _ := x64.jmp_lbl(&mut fi, fi_st)
+    x64.mark(&mut fi, fi_lo)
+    x64.add_ri(&mut fi, false, x64.RDX, 87)
+    x64.mark(&mut fi, fi_st)
+    x64.sub_ri(&mut fi, true, SCRATCH_A, 1)
+    x64.mov_store(&mut fi, SCRATCH_A, 0, x64.RDX, 1)
+    x64.test_rr(&mut fi, true, x64.RAX, x64.RAX)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_NE, fi_dl)
+    // Add '-' if neg
+    x64.mov_load(&mut fi, x64.R8, x64.RBP, -40, 8, false)
+    fi_ns := x64.label(&mut fi)
+    x64.test_rr(&mut fi, false, x64.R8, x64.R8)
+    _ := x64.jcc_lbl(&mut fi, x64.CC_E, fi_ns)
+    x64.sub_ri(&mut fi, true, SCRATCH_A, 1)
+    x64.mov_imm(&mut fi, false, x64.R8, 45)
+    x64.mov_store(&mut fi, SCRATCH_A, 0, x64.R8, 1)
+    x64.mark(&mut fi, fi_ns)
+    x64.lea_disp(&mut fi, SCRATCH_B, x64.RBP, -48)
+    x64.sub_rr(&mut fi, true, SCRATCH_B, SCRATCH_A) // len
+    x64.mov_store(&mut fi, x64.RBP, -8, SCRATCH_A, 8)
+    x64.mov_store(&mut fi, x64.RBP, -16, SCRATCH_B, 8)
+    x64.lea_disp(&mut fi, a0, SCRATCH_B, 25)
+    c_fia := x64.call_lbl(&mut fi, -1)
+    fi_r.push(PendingReloc { local_off: c_fia, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    x64.mov_load(&mut fi, SCRATCH_B, x64.RBP, -16, 8, false)
+    x64.mov_imm(&mut fi, true, SCRATCH_A, 1)
+    x64.mov_store(&mut fi, x64.RAX, 0, SCRATCH_A, 8)
+    x64.mov_store(&mut fi, x64.RAX, 8, SCRATCH_B, 8)
+    x64.mov_store(&mut fi, x64.RAX, 16, SCRATCH_B, 8)
+    x64.add_ri(&mut fi, true, x64.RAX, 24)
+    x64.mov_store(&mut fi, x64.RBP, -24, x64.RAX, 8)
+    x64.mov_rr(&mut fi, true, a0, x64.RAX)
+    x64.mov_load(&mut fi, a1, x64.RBP, -8, 8, false)
+    x64.mov_rr(&mut fi, true, a2, SCRATCH_B)
+    c_fic := x64.call_lbl(&mut fi, -1)
+    fi_r.push(PendingReloc { local_off: c_fic, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mov_load(&mut fi, x64.RAX, x64.RBP, -24, 8, false)
+    x64.mov_load(&mut fi, SCRATCH_B, x64.RBP, -16, 8, false)
+    x64.mov_imm(&mut fi, false, SCRATCH_A, 0)
+    x64.mov_store_sib(&mut fi, x64.RAX, SCRATCH_B, 1, 0, SCRATCH_A, 1)
+    x64.emit_epilogue(&mut fi)
+    _ := commit_code_block(&mut ctx, ctx.rt.fmt_int_sym, &mut fi, &fi_r, &empty_i, 16)
+
+    // 18. __dunder_fmt_str(ptr, len, width, align) -> String ptr
+    mut fs := x64.new()
+    mut fs_r: []PendingReloc = []
+    x64.emit_prologue(&mut fs, 48, ctx.is_win64)
+    x64.mov_store(&mut fs, x64.RBP, -8, a0, 8)
+    x64.mov_store(&mut fs, x64.RBP, -16, a1, 8)
+    x64.mov_rr(&mut fs, true, SCRATCH_A, a1)
+    fs_w := x64.label(&mut fs)
+    x64.cmp_rr(&mut fs, true, a2, SCRATCH_A)
+    _ := x64.jcc_lbl(&mut fs, x64.CC_LE, fs_w)
+    x64.mov_rr(&mut fs, true, SCRATCH_A, a2)
+    x64.mark(&mut fs, fs_w)
+    x64.mov_store(&mut fs, x64.RBP, -24, SCRATCH_A, 8) // total
+    x64.mov_store(&mut fs, x64.RBP, -32, a3, 8) // align
+    x64.lea_disp(&mut fs, a0, SCRATCH_A, 25)
+    c_fsa := x64.call_lbl(&mut fs, -1)
+    fs_r.push(PendingReloc { local_off: c_fsa, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+    x64.mov_load(&mut fs, SCRATCH_B, x64.RBP, -24, 8, false)
+    x64.mov_imm(&mut fs, true, SCRATCH_A, 1)
+    x64.mov_store(&mut fs, x64.RAX, 0, SCRATCH_A, 8)
+    x64.mov_store(&mut fs, x64.RAX, 8, SCRATCH_B, 8)
+    x64.mov_store(&mut fs, x64.RAX, 16, SCRATCH_B, 8)
+    x64.add_ri(&mut fs, true, x64.RAX, 24)
+    x64.mov_store(&mut fs, x64.RBP, -40, x64.RAX, 8)
+    // Fill with spaces then copy string
+    x64.mov_imm(&mut fs, true, SCRATCH_A, 0)
+    x64.mov_imm(&mut fs, false, a0, 32)
+    fs_fl := x64.label(&mut fs)
+    fs_fd := x64.label(&mut fs)
+    x64.mark(&mut fs, fs_fl)
+    x64.cmp_rr(&mut fs, true, SCRATCH_A, SCRATCH_B)
+    _ := x64.jcc_lbl(&mut fs, x64.CC_GE, fs_fd)
+    x64.mov_store_sib(&mut fs, x64.RAX, SCRATCH_A, 1, 0, a0, 1)
+    x64.add_ri(&mut fs, true, SCRATCH_A, 1)
+    _ := x64.jmp_lbl(&mut fs, fs_fl)
+    x64.mark(&mut fs, fs_fd)
+    x64.mov_imm(&mut fs, false, a0, 0)
+    x64.mov_store_sib(&mut fs, x64.RAX, SCRATCH_B, 1, 0, a0, 1)
+    x64.mov_rr(&mut fs, true, a0, x64.RAX)
+    x64.mov_load(&mut fs, a1, x64.RBP, -32, 8, false) // align
+    fs_la := x64.label(&mut fs)
+    x64.test_rr(&mut fs, false, a1, a1)
+    _ := x64.jcc_lbl(&mut fs, x64.CC_E, fs_la)
+    x64.mov_load(&mut fs, SCRATCH_B, x64.RBP, -24, 8, false)
+    x64.mov_load(&mut fs, SCRATCH_A, x64.RBP, -16, 8, false)
+    x64.sub_rr(&mut fs, true, SCRATCH_B, SCRATCH_A)
+    x64.add_rr(&mut fs, true, a0, SCRATCH_B)
+    x64.mark(&mut fs, fs_la)
+    x64.mov_load(&mut fs, a1, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut fs, a2, x64.RBP, -16, 8, false)
+    c_fsc := x64.call_lbl(&mut fs, -1)
+    fs_r.push(PendingReloc { local_off: c_fsc, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+    x64.mov_load(&mut fs, x64.RAX, x64.RBP, -40, 8, false)
+    x64.emit_epilogue(&mut fs)
+    _ := commit_code_block(&mut ctx, ctx.rt.fmt_str_sym, &mut fs, &fs_r, &empty_i, 16)
+
+    // 19. __dunder_str_slice(ptr, len, start, end) -> String ptr
+    mut ss := x64.new()
+    mut ss_r: []PendingReloc = []
+    x64.emit_prologue(&mut ss, 32, ctx.is_win64)
+    ss_bad := x64.label(&mut ss)
+    x64.test_rr(&mut ss, true, a2, a2)
+    _ := x64.jcc_lbl(&mut ss, x64.CC_L, ss_bad)
+    x64.cmp_rr(&mut ss, true, a3, a2)
+    _ := x64.jcc_lbl(&mut ss, x64.CC_L, ss_bad)
+    x64.cmp_rr(&mut ss, true, a3, a1)
+    _ := x64.jcc_lbl(&mut ss, x64.CC_G, ss_bad)
+    x64.add_rr(&mut ss, true, a0, a2)
+    x64.sub_rr(&mut ss, true, a3, a2)
+    x64.mov_rr(&mut ss, true, a1, a3)
+    x64.mov_imm(&mut ss, true, a2, 0)
+    x64.mov_imm(&mut ss, true, a3, 0)
+    c_ssc := x64.call_lbl(&mut ss, -1)
+    ss_r.push(PendingReloc { local_off: c_ssc, kind: .X86Rel32, sym_id: ctx.rt.fmt_str_sym, addend: 0 })
+    x64.emit_epilogue(&mut ss)
+    x64.mark(&mut ss, ss_bad)
+    x64.mov_imm(&mut ss, false, a0, i64(hb.TRAP_BOUNDS))
+    c_sst := x64.call_lbl(&mut ss, -1)
+    ss_r.push(PendingReloc { local_off: c_sst, kind: .X86Rel32, sym_id: ctx.rt.trap_sym, addend: 0 })
+    x64.ud2(&mut ss)
+    _ := commit_code_block(&mut ctx, ctx.rt.str_slice_sym, &mut ss, &ss_r, &empty_i, 16)
+
+    // 20. __dunder_utf8_valid(ptr, len) -> bool
+    mut uv := x64.new()
+    x64.mov_imm(&mut uv, true, SCRATCH_A, 0)
+    uv_lp := x64.label(&mut uv)
+    uv_ok := x64.label(&mut uv)
+    uv_bad := x64.label(&mut uv)
+    x64.mark(&mut uv, uv_lp)
+    x64.cmp_rr(&mut uv, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_GE, uv_ok)
+    x64.mov_load_sib(&mut uv, SCRATCH_B, a0, SCRATCH_A, 1, 0, 1, false)
+    uv_mb := x64.label(&mut uv)
+    x64.cmp_ri(&mut uv, false, SCRATCH_B, 128)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_AE, uv_mb)
+    x64.add_ri(&mut uv, true, SCRATCH_A, 1)
+    _ := x64.jmp_lbl(&mut uv, uv_lp)
+    x64.mark(&mut uv, uv_mb)
+    x64.cmp_ri(&mut uv, false, SCRATCH_B, 194)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_B, uv_bad)
+    x64.cmp_ri(&mut uv, false, SCRATCH_B, 245)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_AE, uv_bad)
+    uv_3 := x64.label(&mut uv)
+    x64.cmp_ri(&mut uv, false, SCRATCH_B, 224)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_AE, uv_3)
+    x64.add_ri(&mut uv, true, SCRATCH_A, 2)
+    x64.cmp_rr(&mut uv, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_G, uv_bad)
+    _ := x64.jmp_lbl(&mut uv, uv_lp)
+    x64.mark(&mut uv, uv_3)
+    uv_4 := x64.label(&mut uv)
+    x64.cmp_ri(&mut uv, false, SCRATCH_B, 240)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_AE, uv_4)
+    x64.add_ri(&mut uv, true, SCRATCH_A, 3)
+    x64.cmp_rr(&mut uv, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_G, uv_bad)
+    _ := x64.jmp_lbl(&mut uv, uv_lp)
+    x64.mark(&mut uv, uv_4)
+    x64.add_ri(&mut uv, true, SCRATCH_A, 4)
+    x64.cmp_rr(&mut uv, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut uv, x64.CC_G, uv_bad)
+    _ := x64.jmp_lbl(&mut uv, uv_lp)
+    x64.mark(&mut uv, uv_ok)
+    x64.mov_imm(&mut uv, true, x64.RAX, 1)
+    x64.ret(&mut uv)
+    x64.mark(&mut uv, uv_bad)
+    x64.mov_imm(&mut uv, true, x64.RAX, 0)
+    x64.ret(&mut uv)
+    _ := commit_code_block(&mut ctx, ctx.rt.utf8_valid_sym, &mut uv, &empty_r, &empty_i, 16)
+
+    // 21. __dunder_str_runes(ptr, len) -> []u32 array ptr
+    mut sr := x64.new()
+    mut sr_r: []PendingReloc = []
+    x64.emit_prologue(&mut sr, 32, ctx.is_win64)
+    x64.mov_store(&mut sr, x64.RBP, -8, a0, 8)
+    x64.mov_store(&mut sr, x64.RBP, -16, a1, 8)
+    x64.mov_rr(&mut sr, true, a0, a1)
+    x64.mov_imm(&mut sr, true, a1, 4)
+    c_sra := x64.call_lbl(&mut sr, -1)
+    sr_r.push(PendingReloc { local_off: c_sra, kind: .X86Rel32, sym_id: ctx.rt.arr_alloc_sym, addend: 0 })
+    x64.mov_load(&mut sr, a0, x64.RBP, -8, 8, false)
+    x64.mov_load(&mut sr, a1, x64.RBP, -16, 8, false)
+    x64.mov_imm(&mut sr, true, SCRATCH_A, 0) // i
+    x64.mov_imm(&mut sr, true, a2, 0) // cnt
+    sr_lp := x64.label(&mut sr)
+    sr_dn := x64.label(&mut sr)
+    x64.mark(&mut sr, sr_lp)
+    x64.cmp_rr(&mut sr, true, SCRATCH_A, a1)
+    _ := x64.jcc_lbl(&mut sr, x64.CC_GE, sr_dn)
+    x64.mov_load_sib(&mut sr, SCRATCH_B, a0, SCRATCH_A, 1, 0, 1, false)
+    x64.add_ri(&mut sr, true, SCRATCH_A, 1)
+    x64.mov_store_sib(&mut sr, x64.RAX, a2, 4, 0, SCRATCH_B, 4)
+    x64.add_ri(&mut sr, true, a2, 1)
+    _ := x64.jmp_lbl(&mut sr, sr_lp)
+    x64.mark(&mut sr, sr_dn)
+    x64.mov_store(&mut sr, x64.RAX, -8, a2, 8)
+    x64.emit_epilogue(&mut sr)
+    _ := commit_code_block(&mut ctx, ctx.rt.str_runes_sym, &mut sr, &sr_r, &empty_i, 16)
+
+    // 22. __dunder_sys_now_ms() -> i64
+    mut nm := x64.new()
+    if !ctx.is_win64 {
+        x64.emit_prologue(&mut nm, 32, false)
+        x64.mov_imm(&mut nm, true, x64.RAX, 228) // clock_gettime
+        x64.mov_imm(&mut nm, true, x64.RDI, 1)   // CLOCK_MONOTONIC
+        x64.lea_disp(&mut nm, x64.RSI, x64.RBP, -16)
+        x64.syscall(&mut nm)
+        x64.mov_load(&mut nm, x64.RAX, x64.RBP, -16, 8, false)
+        x64.imul_rri(&mut nm, true, x64.RAX, x64.RAX, 1000)
+        x64.mov_load(&mut nm, SCRATCH_A, x64.RBP, -8, 8, false)
+        x64.mov_imm(&mut nm, true, x64.RDX, 0)
+        x64.mov_rr(&mut nm, true, SCRATCH_B, x64.RAX)
+        x64.mov_rr(&mut nm, true, x64.RAX, SCRATCH_A)
+        x64.mov_imm(&mut nm, true, x64.RDI, 1000000)
+        x64.div_r(&mut nm, true, x64.RDI)
+        x64.add_rr(&mut nm, true, x64.RAX, SCRATCH_B)
+        x64.emit_epilogue(&mut nm)
+    } else {
+        x64.mov_imm(&mut nm, true, x64.RAX, 0)
+        x64.ret(&mut nm)
+    }
+    _ := commit_code_block(&mut ctx, ctx.rt.sys_now_ms_sym, &mut nm, &empty_r, &empty_i, 16)
+
+    // 23. __dunder_sys_read_all(path_str, out_err_ptr, max_bytes) -> []u8 ptr
+    mut sra := x64.new()
+    mut sra_r: []PendingReloc = []
+    if !ctx.is_win64 {
+        x64.emit_prologue(&mut sra, 4160, false)
+        x64.mov_store(&mut sra, x64.RBP, -8, x64.RSI, 8)  // out_err
+        x64.mov_store(&mut sra, x64.RBP, -16, x64.RDX, 8) // max_bytes
+        // open(path, O_RDONLY=0, 0) -> fd (syscall 2)
+        x64.mov_imm(&mut sra, true, x64.RAX, 2)
+        x64.mov_imm(&mut sra, true, x64.RSI, 0)
+        x64.mov_imm(&mut sra, true, x64.RDX, 0)
+        x64.syscall(&mut sra)
+        sra_err := x64.label(&mut sra)
+        x64.test_rr(&mut sra, true, x64.RAX, x64.RAX)
+        _ := x64.jcc_lbl(&mut sra, x64.CC_L, sra_err)
+        x64.mov_store(&mut sra, x64.RBP, -24, x64.RAX, 8) // fd
+        x64.mov_imm(&mut sra, true, x64.RDI, 64)
+        x64.mov_imm(&mut sra, true, x64.RSI, 1)
+        c_sraa := x64.call_lbl(&mut sra, -1)
+        sra_r.push(PendingReloc { local_off: c_sraa, kind: .X86Rel32, sym_id: ctx.rt.arr_alloc_sym, addend: 0 })
+        x64.mov_store(&mut sra, x64.RBP, -32, x64.RAX, 8) // out_arr
+        sra_rl := x64.label(&mut sra)
+        sra_eof := x64.label(&mut sra)
+        x64.mark(&mut sra, sra_rl)
+        x64.mov_imm(&mut sra, true, x64.RAX, 0) // read
+        x64.mov_load(&mut sra, x64.RDI, x64.RBP, -24, 8, false)
+        x64.lea_disp(&mut sra, x64.RSI, x64.RBP, -4144)
+        x64.mov_imm(&mut sra, true, x64.RDX, 4096)
+        x64.syscall(&mut sra)
+        x64.test_rr(&mut sra, true, x64.RAX, x64.RAX)
+        _ := x64.jcc_lbl(&mut sra, x64.CC_LE, sra_eof)
+        x64.mov_store(&mut sra, x64.RBP, -40, x64.RAX, 8) // n
+        x64.mov_load(&mut sra, x64.RDI, x64.RBP, -32, 8, false)
+        x64.mov_load(&mut sra, x64.RSI, x64.RDI, -8, 8, false)
+        x64.add_rr(&mut sra, true, x64.RSI, x64.RAX)
+        x64.mov_imm(&mut sra, true, x64.RDX, 1)
+        c_srag := x64.call_lbl(&mut sra, -1)
+        sra_r.push(PendingReloc { local_off: c_srag, kind: .X86Rel32, sym_id: ctx.rt.arr_grow_sym, addend: 0 })
+        x64.mov_store(&mut sra, x64.RBP, -32, x64.RAX, 8)
+        x64.mov_load(&mut sra, SCRATCH_A, x64.RAX, -8, 8, false) // old_len
+        x64.mov_load(&mut sra, x64.RDX, x64.RBP, -40, 8, false) // n
+        x64.mov_rr(&mut sra, true, SCRATCH_B, SCRATCH_A)
+        x64.add_rr(&mut sra, true, SCRATCH_B, x64.RDX)
+        x64.mov_store(&mut sra, x64.RAX, -8, SCRATCH_B, 8)
+        x64.mov_rr(&mut sra, true, x64.RDI, x64.RAX)
+        x64.add_rr(&mut sra, true, x64.RDI, SCRATCH_A)
+        x64.lea_disp(&mut sra, x64.RSI, x64.RBP, -4144)
+        c_srac := x64.call_lbl(&mut sra, -1)
+        sra_r.push(PendingReloc { local_off: c_srac, kind: .X86Rel32, sym_id: ctx.rt.mem_copy_sym, addend: 0 })
+        _ := x64.jmp_lbl(&mut sra, sra_rl)
+        x64.mark(&mut sra, sra_eof)
+        x64.mov_imm(&mut sra, true, x64.RAX, 3) // close
+        x64.mov_load(&mut sra, x64.RDI, x64.RBP, -24, 8, false)
+        x64.syscall(&mut sra)
+        x64.mov_load(&mut sra, SCRATCH_A, x64.RBP, -8, 8, false)
+        x64.mov_imm(&mut sra, true, SCRATCH_B, 0)
+        x64.mov_store(&mut sra, SCRATCH_A, 0, SCRATCH_B, 8)
+        x64.mov_load(&mut sra, x64.RAX, x64.RBP, -32, 8, false)
+        x64.emit_epilogue(&mut sra)
+        x64.mark(&mut sra, sra_err)
+        x64.neg_r(&mut sra, true, x64.RAX)
+        x64.mov_load(&mut sra, SCRATCH_A, x64.RBP, -8, 8, false)
+        x64.mov_store(&mut sra, SCRATCH_A, 0, x64.RAX, 8)
+        x64.mov_imm(&mut sra, true, x64.RAX, 0)
+        x64.emit_epilogue(&mut sra)
+    } else {
+        x64.mov_imm(&mut sra, true, SCRATCH_A, 78)
+        x64.mov_store(&mut sra, a1, 0, SCRATCH_A, 8)
+        x64.mov_imm(&mut sra, true, x64.RAX, 0)
+        x64.ret(&mut sra)
+    }
+    _ := commit_code_block(&mut ctx, ctx.rt.sys_read_all_sym, &mut sra, &sra_r, &empty_i, 16)
+
+    // 24. __dunder_sys_write_file(path_str, data_ptr, data_len, append) -> errno
+    mut swf := x64.new()
+    if !ctx.is_win64 {
+        x64.emit_prologue(&mut swf, 48, false)
+        x64.mov_store(&mut swf, x64.RBP, -8, x64.RSI, 8)
+        x64.mov_store(&mut swf, x64.RBP, -16, x64.RDX, 8)
+        x64.mov_imm(&mut swf, true, x64.RSI, 577) // O_WRONLY|O_CREAT|O_TRUNC
+        swf_op := x64.label(&mut swf)
+        x64.test_rr(&mut swf, false, x64.RCX, x64.RCX)
+        _ := x64.jcc_lbl(&mut swf, x64.CC_E, swf_op)
+        x64.mov_imm(&mut swf, true, x64.RSI, 1089) // O_WRONLY|O_CREAT|O_APPEND
+        x64.mark(&mut swf, swf_op)
+        x64.mov_imm(&mut swf, true, x64.RAX, 2) // open
+        x64.mov_imm(&mut swf, true, x64.RDX, 420)
+        x64.syscall(&mut swf)
+        swf_err := x64.label(&mut swf)
+        x64.test_rr(&mut swf, true, x64.RAX, x64.RAX)
+        _ := x64.jcc_lbl(&mut swf, x64.CC_L, swf_err)
+        x64.mov_store(&mut swf, x64.RBP, -24, x64.RAX, 8) // fd
+        x64.mov_rr(&mut swf, true, x64.RDI, x64.RAX)
+        x64.mov_load(&mut swf, x64.RSI, x64.RBP, -8, 8, false)
+        x64.mov_load(&mut swf, x64.RDX, x64.RBP, -16, 8, false)
+        x64.mov_imm(&mut swf, true, x64.RAX, 1) // write
+        x64.syscall(&mut swf)
+        x64.mov_load(&mut swf, x64.RDI, x64.RBP, -24, 8, false)
+        x64.mov_imm(&mut swf, true, x64.RAX, 3) // close
+        x64.syscall(&mut swf)
+        x64.mov_imm(&mut swf, true, x64.RAX, 0)
+        x64.emit_epilogue(&mut swf)
+        x64.mark(&mut swf, swf_err)
+        x64.neg_r(&mut swf, true, x64.RAX)
+        x64.emit_epilogue(&mut swf)
+    } else {
+        x64.mov_imm(&mut swf, true, x64.RAX, 78)
+        x64.ret(&mut swf)
+    }
+    _ := commit_code_block(&mut ctx, ctx.rt.sys_write_file_sym, &mut swf, &empty_r, &empty_i, 16)
+
+    // 25. __dunder_sys_stat(path_str, stat_buf, use_lstat) -> errno
+    mut sst := x64.new()
+    if !ctx.is_win64 {
+        x64.mov_imm(&mut sst, true, x64.RAX, 4) // stat
+        sst_go := x64.label(&mut sst)
+        x64.test_rr(&mut sst, false, x64.RDX, x64.RDX)
+        _ := x64.jcc_lbl(&mut sst, x64.CC_E, sst_go)
+        x64.mov_imm(&mut sst, true, x64.RAX, 6) // lstat
+        x64.mark(&mut sst, sst_go)
+        x64.syscall(&mut sst)
+        sst_ok := x64.label(&mut sst)
+        x64.test_rr(&mut sst, true, x64.RAX, x64.RAX)
+        _ := x64.jcc_lbl(&mut sst, x64.CC_GE, sst_ok)
+        x64.neg_r(&mut sst, true, x64.RAX)
+        x64.ret(&mut sst)
+        x64.mark(&mut sst, sst_ok)
+        x64.mov_imm(&mut sst, true, x64.RAX, 0)
+        x64.ret(&mut sst)
+    } else {
+        x64.mov_imm(&mut sst, true, x64.RAX, 78)
+        x64.ret(&mut sst)
+    }
+    _ := commit_code_block(&mut ctx, ctx.rt.sys_stat_sym, &mut sst, &empty_r, &empty_i, 16)
 }
 
 // =========================================================================
@@ -2833,15 +3772,36 @@ fn emit_intrinsic_call(b: &mut x64.X86Buf, ctx: &mut EmitCtx, prog: &ssa.SsaProg
     }
 
     if id == hb.INTRINSIC_SIZE_OF && tm.dest_val >= 0 {
-        sz := if tm.aux_ty >= 0 && tm.aux_ty < types.entries.len { types.entries[tm.aux_ty].size } else { 0 }
+        sty := if tm.sig_ty >= 0 && tm.sig_ty < types.entries.len { tm.sig_ty } else { tm.aux_ty }
+        sz := if sty >= 0 && sty < types.entries.len { types.entries[sty].size } else { 0 }
         x64.mov_imm(&mut b, true, SCRATCH_A, i64(sz))
         store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
         return
     }
 
     if id == hb.INTRINSIC_ALIGN_OF && tm.dest_val >= 0 {
-        al := if tm.aux_ty >= 0 && tm.aux_ty < types.entries.len { types.entries[tm.aux_ty].align } else { 1 }
+        aty := if tm.sig_ty >= 0 && tm.sig_ty < types.entries.len { tm.sig_ty } else { tm.aux_ty }
+        al := if aty >= 0 && aty < types.entries.len { types.entries[aty].align } else { 1 }
         x64.mov_imm(&mut b, true, SCRATCH_A, i64(al))
+        store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+        return
+    }
+
+    if id == hb.INTRINSIC_TARGET_IS && tm.dest_val >= 0 {
+        mut tname := ""
+        if tm.arg_len >= 1 {
+            av := f.val_args[tm.arg_start]
+            if av >= 0 && av < f.vals.len && f.vals[av].def_inst >= 0 {
+                di := f.insts[f.vals[av].def_inst]
+                if (di.kind == .ConstStr || di.kind == .ConstCStr) && di.str_idx >= 0 && di.str_idx < f.const_strs.len {
+                    tname = f.const_strs[di.str_idx].clone()
+                }
+            }
+        }
+        matched := tname == "x86_64" || tname == "native" ||
+            (!ctx.is_win64 && (tname == "linux" || tname == "x86_64-linux")) ||
+            (ctx.is_win64 && (tname == "windows" || tname == "x86_64-windows"))
+        x64.mov_imm(&mut b, true, SCRATCH_A, if matched { 1 } else { 0 })
         store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
         return
     }
@@ -3146,6 +4106,520 @@ fn emit_intrinsic_call(b: &mut x64.X86Buf, ctx: &mut EmitCtx, prog: &ssa.SsaProg
             } else {
                 emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, x64.RBP, ra.locs[av].rbp_off, types.entries[dty].size, SCRATCH_B)
             }
+        }
+        return
+    }
+
+    // --- Array, Map/Set/Hash, Formatting/UTF-8 & OS __sys_* intrinsics ---
+    a0 := gp_arg_reg(ctx.is_win64, 0)
+    a1 := gp_arg_reg(ctx.is_win64, 1)
+    a2 := gp_arg_reg(ctx.is_win64, 2)
+    a3 := gp_arg_reg(ctx.is_win64, 3)
+
+    if id == hb.INTRINSIC_ARR_CLEAR && tm.arg_len >= 1 {
+        av := f.val_args[tm.arg_start]
+        _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        if types.entries[f.vals[av].ty].kind == .Ref || types.entries[f.vals[av].ty].kind == .MutRef {
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+        }
+        x64.mov_imm(&mut b, true, SCRATCH_B, 0)
+        x64.mov_store(&mut b, SCRATCH_A, -8, SCRATCH_B, 8)
+        return
+    }
+
+    if id == hb.INTRINSIC_ARR_PUSH && tm.arg_len >= 2 {
+        av := f.val_args[tm.arg_start]
+        vv := f.val_args[tm.arg_start + 1]
+        vty := f.vals[vv].ty
+        vsz := types.entries[vty].size
+        val := if types.entries[vty].align > 0 { types.entries[vty].align } else { 1 }
+        stride := align_up_i32(if vsz > 0 { vsz } else { 1 }, val)
+        _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        x64.mov_load(&mut b, a0, SCRATCH_A, 0, 8, false) // old arr ptr
+        x64.mov_load(&mut b, a1, a0, -8, 8, false)       // len
+        x64.add_ri(&mut b, true, a1, 1)
+        x64.mov_imm(&mut b, true, a2, i64(stride))
+        c_ag := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: c_ag, kind: .X86Rel32, sym_id: ctx.rt.arr_grow_sym, addend: 0 })
+        _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        x64.mov_store(&mut b, SCRATCH_A, 0, x64.RAX, 8)
+        x64.mov_load(&mut b, SCRATCH_B, x64.RAX, -8, 8, false) // old len
+        x64.lea_disp(&mut b, SCRATCH_A, SCRATCH_B, 1)
+        x64.mov_store(&mut b, x64.RAX, -8, SCRATCH_A, 8)
+        x64.imul_rri(&mut b, true, SCRATCH_B, SCRATCH_B, i64(stride))
+        x64.add_rr(&mut b, true, x64.RAX, SCRATCH_B) // &data[old_len]
+        vrepr := classify_repr(&types, vty, ctx.is_win64)
+        if vrepr == REPR_GP {
+            vr := load_gp_val_into(&mut b, &ra, vv, SCRATCH_B)
+            x64.mov_store(&mut b, x64.RAX, 0, vr, scalar_width(&types, vty))
+        } else if vrepr == REPR_FP {
+            xr := load_fp_val_into(&mut b, &ra, vv, is_f64_ty(&types, vty), FP_SCRATCH_A)
+            x64.movs_store(&mut b, is_f64_ty(&types, vty), x64.RAX, 0, xr)
+        } else if vrepr == REPR_PAIR {
+            load_pair_halves(&mut b, &ra, vv, SCRATCH_A, SCRATCH_B)
+            x64.mov_store(&mut b, x64.RAX, 0, SCRATCH_A, 8)
+            x64.mov_store(&mut b, x64.RAX, 8, SCRATCH_B, 8)
+        } else if vrepr == REPR_MEM {
+            emit_inline_copy_regs(&mut b, x64.RAX, 0, x64.RBP, ra.locs[vv].rbp_off, vsz, SCRATCH_B)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_ARR_POP && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        dty := f.vals[tm.dest_val].ty
+        dsz := types.entries[dty].size
+        dal := if types.entries[dty].align > 0 { types.entries[dty].align } else { 1 }
+        stride := align_up_i32(if dsz > 0 { dsz } else { 1 }, dal)
+        _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+        x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, -8, 8, false)
+        ok_p := x64.label(&mut b)
+        x64.cmp_ri(&mut b, true, SCRATCH_B, 0)
+        _ := x64.jcc_lbl(&mut b, x64.CC_G, ok_p)
+        emit_trap_call(&mut b, &ctx, &mut relocs, hb.TRAP_BOUNDS)
+        x64.mark(&mut b, ok_p)
+        x64.sub_ri(&mut b, true, SCRATCH_B, 1)
+        x64.mov_store(&mut b, SCRATCH_A, -8, SCRATCH_B, 8)
+        x64.imul_rri(&mut b, true, SCRATCH_B, SCRATCH_B, i64(stride))
+        x64.add_rr(&mut b, true, SCRATCH_A, SCRATCH_B)
+        drepr := classify_repr(&types, dty, ctx.is_win64)
+        if drepr == REPR_GP {
+            x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 0, scalar_width(&types, dty), is_signed_int_ty(&types, dty))
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_B)
+        } else if drepr == REPR_FP {
+            x64.movs_load(&mut b, is_f64_ty(&types, dty), FP_SCRATCH_A, SCRATCH_A, 0)
+            store_fp_val_from(&mut b, &ra, tm.dest_val, is_f64_ty(&types, dty), FP_SCRATCH_A)
+        } else if drepr == REPR_PAIR {
+            x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 8, 8, false)
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+            store_pair_halves(&mut b, &ra, tm.dest_val, SCRATCH_A, SCRATCH_B)
+        } else if drepr == REPR_MEM {
+            emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 0, dsz, SCRATCH_B)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_HASH && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        kk := if ak == .String { 1 } else if ak == .FatStr { 2 } else { 0 }
+        arepr := classify_repr(&types, aty, ctx.is_win64)
+        if arepr == REPR_MEM {
+            x64.lea_disp(&mut b, a0, x64.RBP, ra.locs[av].rbp_off)
+        } else if arepr == REPR_PAIR {
+            load_pair_halves(&mut b, &ra, av, SCRATCH_A, SCRATCH_B)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off, SCRATCH_A, 8)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off + 8, SCRATCH_B, 8)
+            x64.lea_disp(&mut b, a0, x64.RBP, ra.scratch_save_off)
+        } else {
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off, SCRATCH_A, 8)
+            x64.lea_disp(&mut b, a0, x64.RBP, ra.scratch_save_off)
+        }
+        x64.mov_imm(&mut b, true, a1, i64(types.entries[aty].size))
+        x64.mov_imm(&mut b, true, a2, i64(kk))
+        ch := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: ch, kind: .X86Rel32, sym_id: ctx.rt.hash_key_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if id == hb.INTRINSIC_MAP_NEW || id == hb.INTRINSIC_SET_NEW {
+        mty := if tm.sig_ty >= 0 && tm.sig_ty < types.entries.len { tm.sig_ty }
+            else if tm.dest_val >= 0 { f.vals[tm.dest_val].ty } else { -1 }
+        mi := if mty >= 0 { ht.find_map_inst(&types, mty) } else { -1 }
+        k_ty := if mi >= 0 { types.map_insts[mi].key_ty } else { ht.TY_I64 }
+        v_ty := if mi >= 0 { types.map_insts[mi].val_ty } else { ht.TY_UNIT }
+        ks := align_up_i32(if types.entries[k_ty].size > 0 { types.entries[k_ty].size } else { 8 }, types.entries[k_ty].align)
+        vs := if v_ty == ht.TY_UNIT || types.entries[v_ty].size <= 0 { 0 } else { align_up_i32(types.entries[v_ty].size, types.entries[v_ty].align) }
+        kk := if k_ty == ht.TY_STRING { 1 } else if types.entries[k_ty].kind == .FatStr { 2 } else { 0 }
+        x64.mov_imm(&mut b, true, a0, i64(ks))
+        x64.mov_imm(&mut b, true, a1, i64(vs))
+        x64.mov_imm(&mut b, true, a2, i64(kk))
+        cm := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cm, kind: .X86Rel32, sym_id: ctx.rt.map_new_sym, addend: 0 })
+        if tm.dest_val >= 0 { store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX) }
+        return
+    }
+
+    if (id == hb.INTRINSIC_MAP_LEN || id == hb.INTRINSIC_MAP_IS_EMPTY || id == hb.INTRINSIC_MAP_CLEAR ||
+        id == hb.INTRINSIC_MAP_KEYS || id == hb.INTRINSIC_MAP_VALUES || id == hb.INTRINSIC_MAP_PUT ||
+        id == hb.INTRINSIC_MAP_PUT_NEW || id == hb.INTRINSIC_SET_INSERT || id == hb.INTRINSIC_MAP_REMOVE ||
+        id == hb.INTRINSIC_MAP_CONTAINS || id == hb.INTRINSIC_MAP_FIND_INDEX || id == hb.INTRINSIC_MAP_GET ||
+        id == hb.INTRINSIC_MAP_GET_OR || id == hb.INTRINSIC_MAP_GET_OR_DEFAULT ||
+        id == hb.INTRINSIC_MAP_AT || id == hb.INTRINSIC_MAP_AT_MUT) && tm.arg_len >= 1 {
+        mv := f.val_args[tm.arg_start]
+        mv_ty := f.vals[mv].ty
+        mv_is_ref := types.entries[mv_ty].kind == .Ref || types.entries[mv_ty].kind == .MutRef
+        m_ty := if mv_is_ref { types.entries[mv_ty].inner_a } else { mv_ty }
+        mi := ht.find_map_inst(&types, m_ty)
+        k_ty := if mi >= 0 { types.map_insts[mi].key_ty } else { ht.TY_I64 }
+        v_ty := if mi >= 0 { types.map_insts[mi].val_ty } else { ht.TY_UNIT }
+        vs := if v_ty == ht.TY_UNIT || types.entries[v_ty].size <= 0 { 0 } else { align_up_i32(types.entries[v_ty].size, types.entries[v_ty].align) }
+
+        _ := load_gp_val_into(&mut b, &ra, mv, SCRATCH_A)
+        if mv_is_ref { x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false) }
+        if id == hb.INTRINSIC_MAP_LEN && tm.dest_val >= 0 {
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 32, 8, false)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+        if id == hb.INTRINSIC_MAP_IS_EMPTY && tm.dest_val >= 0 {
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 32, 8, false)
+            x64.cmp_ri(&mut b, true, SCRATCH_A, 0)
+            x64.setcc_bool(&mut b, x64.CC_E, SCRATCH_A)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+        if id == hb.INTRINSIC_MAP_CLEAR {
+            x64.mov_imm(&mut b, true, SCRATCH_B, 0)
+            x64.mov_store(&mut b, SCRATCH_A, 32, SCRATCH_B, 8)
+            x64.mov_load(&mut b, a0, SCRATCH_A, 0, 8, false); x64.mov_store(&mut b, a0, -8, SCRATCH_B, 8)
+            x64.mov_load(&mut b, a0, SCRATCH_A, 8, 8, false); x64.mov_store(&mut b, a0, -8, SCRATCH_B, 8)
+            x64.mov_load(&mut b, a0, SCRATCH_A, 16, 8, false)
+            x64.mov_load(&mut b, a1, SCRATCH_A, 24, 8, false)
+            x64.mov_imm(&mut b, true, a2, -1)
+            mc_lp := x64.label(&mut b)
+            x64.mark(&mut b, mc_lp)
+            x64.mov_store_sib(&mut b, a0, SCRATCH_B, 4, 0, a2, 4)
+            x64.add_ri(&mut b, true, SCRATCH_B, 1)
+            x64.cmp_rr(&mut b, true, SCRATCH_B, a1)
+            _ := x64.jcc_lbl(&mut b, x64.CC_L, mc_lp)
+            return
+        }
+        if (id == hb.INTRINSIC_MAP_KEYS || id == hb.INTRINSIC_MAP_VALUES) && tm.dest_val >= 0 {
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, if id == hb.INTRINSIC_MAP_KEYS { 0 } else { 8 }, 8, false)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+
+        // Materialize key ptr in a1 (using scratch_save_off for non-MEM)
+        kv := f.val_args[tm.arg_start + 1]
+        krepr := classify_repr(&types, k_ty, ctx.is_win64)
+        if krepr == REPR_MEM {
+            x64.lea_disp(&mut b, a1, x64.RBP, ra.locs[kv].rbp_off)
+        } else if krepr == REPR_PAIR {
+            load_pair_halves(&mut b, &ra, kv, SCRATCH_A, SCRATCH_B)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off, SCRATCH_A, 8)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off + 8, SCRATCH_B, 8)
+            x64.lea_disp(&mut b, a1, x64.RBP, ra.scratch_save_off)
+        } else {
+            _ := load_gp_val_into(&mut b, &ra, kv, SCRATCH_B)
+            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off, SCRATCH_B, 8)
+            x64.lea_disp(&mut b, a1, x64.RBP, ra.scratch_save_off)
+        }
+        _ := load_gp_val_into(&mut b, &ra, mv, a0)
+        if mv_is_ref { x64.mov_load(&mut b, a0, a0, 0, 8, false) }
+
+        if id == hb.INTRINSIC_MAP_PUT || id == hb.INTRINSIC_MAP_PUT_NEW || id == hb.INTRINSIC_SET_INSERT {
+            if tm.arg_len >= 3 && vs > 0 {
+                vv := f.val_args[tm.arg_start + 2]
+                vrepr := classify_repr(&types, v_ty, ctx.is_win64)
+                if vrepr == REPR_MEM {
+                    x64.lea_disp(&mut b, a2, x64.RBP, ra.locs[vv].rbp_off)
+                } else if vrepr == REPR_PAIR {
+                    load_pair_halves(&mut b, &ra, vv, SCRATCH_A, SCRATCH_B)
+                    x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off + 16, SCRATCH_A, 8)
+                    x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off + 24, SCRATCH_B, 8)
+                    x64.lea_disp(&mut b, a2, x64.RBP, ra.scratch_save_off + 16)
+                } else {
+                    _ := load_gp_val_into(&mut b, &ra, vv, SCRATCH_B)
+                    x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off + 16, SCRATCH_B, 8)
+                    x64.lea_disp(&mut b, a2, x64.RBP, ra.scratch_save_off + 16)
+                }
+            } else {
+                x64.mov_imm(&mut b, true, a2, 0)
+            }
+            x64.mov_imm(&mut b, true, a3, if id == hb.INTRINSIC_MAP_PUT { 1 } else { 0 })
+            cp := x64.call_lbl(&mut b, -1)
+            relocs.push(PendingReloc { local_off: cp, kind: .X86Rel32, sym_id: ctx.rt.map_put_sym, addend: 0 })
+            if tm.dest_val >= 0 { store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX) }
+            return
+        }
+        if id == hb.INTRINSIC_MAP_REMOVE {
+            cr := x64.call_lbl(&mut b, -1)
+            relocs.push(PendingReloc { local_off: cr, kind: .X86Rel32, sym_id: ctx.rt.map_remove_sym, addend: 0 })
+            if tm.dest_val >= 0 { store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX) }
+            return
+        }
+        cf := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cf, kind: .X86Rel32, sym_id: ctx.rt.map_find_sym, addend: 0 })
+        if id == hb.INTRINSIC_MAP_CONTAINS && tm.dest_val >= 0 {
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            x64.setcc_bool(&mut b, x64.CC_GE, SCRATCH_A)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+        if id == hb.INTRINSIC_MAP_FIND_INDEX && tm.dest_val >= 0 {
+            store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+            return
+        }
+        if (id == hb.INTRINSIC_MAP_AT || id == hb.INTRINSIC_MAP_AT_MUT) && tm.dest_val >= 0 {
+            ok_at := x64.label(&mut b)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            _ := x64.jcc_lbl(&mut b, x64.CC_GE, ok_at)
+            emit_trap_call(&mut b, &ctx, &mut relocs, hb.TRAP_BOUNDS)
+            x64.mark(&mut b, ok_at)
+            _ := load_gp_val_into(&mut b, &ra, mv, SCRATCH_A)
+            if mv_is_ref { x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false) }
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 8, 8, false)
+            x64.imul_rri(&mut b, true, x64.RAX, x64.RAX, i64(vs))
+            x64.add_rr(&mut b, true, SCRATCH_A, x64.RAX)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+        if (id == hb.INTRINSIC_MAP_GET_OR || id == hb.INTRINSIC_MAP_GET_OR_DEFAULT) && tm.dest_val >= 0 {
+            dty := f.vals[tm.dest_val].ty
+            drepr := classify_repr(&types, dty, ctx.is_win64)
+            m_miss := x64.label(&mut b)
+            m_done := x64.label(&mut b)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            _ := x64.jcc_lbl(&mut b, x64.CC_L, m_miss)
+            _ := load_gp_val_into(&mut b, &ra, mv, SCRATCH_A)
+            if mv_is_ref { x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false) }
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 8, 8, false)
+            x64.imul_rri(&mut b, true, x64.RAX, x64.RAX, i64(vs))
+            x64.add_rr(&mut b, true, SCRATCH_A, x64.RAX)
+            if drepr == REPR_GP {
+                x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 0, scalar_width(&types, dty), is_signed_int_ty(&types, dty))
+                store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_B)
+            } else if drepr == REPR_PAIR {
+                x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 8, 8, false)
+                x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+                store_pair_halves(&mut b, &ra, tm.dest_val, SCRATCH_A, SCRATCH_B)
+            } else if drepr == REPR_MEM {
+                emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 0, types.entries[dty].size, SCRATCH_B)
+            }
+            _ := x64.jmp_lbl(&mut b, m_done)
+            x64.mark(&mut b, m_miss)
+            if id == hb.INTRINSIC_MAP_GET_OR && tm.arg_len >= 3 {
+                dv := f.val_args[tm.arg_start + 2]
+                if drepr == REPR_GP { _ := load_gp_val_into(&mut b, &ra, dv, SCRATCH_A); store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A) }
+                else if drepr == REPR_PAIR { load_pair_halves(&mut b, &ra, dv, SCRATCH_A, SCRATCH_B); store_pair_halves(&mut b, &ra, tm.dest_val, SCRATCH_A, SCRATCH_B) }
+                else if drepr == REPR_MEM { emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, x64.RBP, ra.locs[dv].rbp_off, types.entries[dty].size, SCRATCH_B) }
+            } else if drepr == REPR_GP {
+                if dty == ht.TY_STRING {
+                    es := intern_string_rodata(&mut ctx, "")
+                    ro := x64.lea_rip(&mut b, SCRATCH_A, -1)
+                    relocs.push(PendingReloc { local_off: ro, kind: .X86RipDisp32, sym_id: es, addend: 0 })
+                } else {
+                    x64.mov_imm(&mut b, true, SCRATCH_A, 0)
+                }
+                store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            }
+            x64.mark(&mut b, m_done)
+            return
+        }
+        // MAP_GET -> Option<V>
+        if id == hb.INTRINSIC_MAP_GET && tm.dest_val >= 0 {
+            dty := f.vals[tm.dest_val].ty
+            te := &types.entries[dty]
+            emit_inline_zero_reg(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, types.entries[dty].size, SCRATCH_B)
+            mg_none := x64.label(&mut b)
+            mg_done := x64.label(&mut b)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            _ := x64.jcc_lbl(&mut b, x64.CC_L, mg_none)
+            _ := load_gp_val_into(&mut b, &ra, mv, SCRATCH_A)
+            if mv_is_ref { x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false) }
+            x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 8, 8, false)
+            x64.imul_rri(&mut b, true, x64.RAX, x64.RAX, i64(vs))
+            x64.add_rr(&mut b, true, SCRATCH_A, x64.RAX)
+            al := if te.align > 0 { te.align } else { 4 }
+            tag_al := align_up_i32(4, al)
+            poff := if te.inner_a < types.variants.len && types.variants[te.inner_a].payload_count > 0 { tag_al + types.fields[types.variants[te.inner_a].payload_start].offset } else { tag_al }
+            emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off + poff, SCRATCH_A, 0, types.entries[v_ty].size, SCRATCH_B)
+            _ := x64.jmp_lbl(&mut b, mg_done)
+            x64.mark(&mut b, mg_none)
+            x64.mov_imm(&mut b, false, SCRATCH_A, 1)
+            x64.mov_store(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 4)
+            x64.mark(&mut b, mg_done)
+            return
+        }
+        return
+    }
+
+    if (id == hb.INTRINSIC_FORMAT_INT || id == hb.INTRINSIC_TO_STR) && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        if id == hb.INTRINSIC_TO_STR && ak == .String {
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+            return
+        }
+        if id == hb.INTRINSIC_TO_STR && ak == .Bool {
+            ts := intern_string_rodata(&mut ctx, "true")
+            fs := intern_string_rodata(&mut ctx, "false")
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+            r1 := x64.lea_rip(&mut b, a0, -1); relocs.push(PendingReloc { local_off: r1, kind: .X86RipDisp32, sym_id: ts, addend: 0 })
+            r2 := x64.lea_rip(&mut b, a1, -1); relocs.push(PendingReloc { local_off: r2, kind: .X86RipDisp32, sym_id: fs, addend: 0 })
+            x64.test_rr(&mut b, false, SCRATCH_A, SCRATCH_A)
+            x64.cmovcc(&mut b, true, x64.CC_E, a0, a1)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, a0)
+            return
+        }
+        _ := load_gp_val_into(&mut b, &ra, av, a0)
+        if !is_wide_int(&types, aty) {
+            if is_signed_int_ty(&types, aty) { x64.movsxd_rr(&mut b, a0, a0) }
+            else { x64.mov_rr(&mut b, false, a0, a0) }
+        }
+        mut radix: i64 = 10
+        mut width: i64 = 0
+        mut flags: i64 = if !is_signed_int_ty(&types, aty) { 2 } else { 0 }
+        if id == hb.INTRINSIC_FORMAT_INT && tm.arg_len >= 2 {
+            mut spec_txt := ""
+            sv := f.val_args[tm.arg_start + 1]
+            if sv >= 0 && sv < f.vals.len && f.vals[sv].def_inst >= 0 {
+                di := f.insts[f.vals[sv].def_inst]
+                if (di.kind == .ConstStr || di.kind == .ConstCStr) && di.str_idx >= 0 && di.str_idx < f.const_strs.len {
+                    spec_txt = f.const_strs[di.str_idx].clone()
+                }
+            }
+            spec := lexer.integer_format(spec_txt)
+            radix = i64(spec.radix)
+            width = i64(spec.width)
+            if spec.letter_offset < 80 { flags = flags.bit_or(1) }
+            if spec.padding == 48 { flags = flags.bit_or(4) }
+        }
+        x64.mov_imm(&mut b, true, a1, radix)
+        x64.mov_imm(&mut b, true, a2, width)
+        x64.mov_imm(&mut b, true, a3, flags)
+        cfi := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cfi, kind: .X86Rel32, sym_id: ctx.rt.fmt_int_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if id == hb.INTRINSIC_FORMAT_STR && tm.arg_len >= 2 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        mut spec_txt := ""
+        sv := f.val_args[tm.arg_start + 1]
+        if sv >= 0 && sv < f.vals.len && f.vals[sv].def_inst >= 0 {
+            di := f.insts[f.vals[sv].def_inst]
+            if (di.kind == .ConstStr || di.kind == .ConstCStr) && di.str_idx >= 0 && di.str_idx < f.const_strs.len {
+                spec_txt = f.const_strs[di.str_idx].clone()
+            }
+        }
+        spec := lexer.string_format(spec_txt)
+        ak := types.entries[f.vals[av].ty].kind
+        if ak == .FatStr { load_pair_halves(&mut b, &ra, av, a0, a1) }
+        else { _ := load_gp_val_into(&mut b, &ra, av, a0); x64.mov_load(&mut b, a1, a0, -8, 8, false) }
+        x64.mov_imm(&mut b, true, a2, i64(spec.width))
+        x64.mov_imm(&mut b, true, a3, i64(spec.align))
+        cfs := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cfs, kind: .X86Rel32, sym_id: ctx.rt.fmt_str_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if id == hb.INTRINSIC_STR_SLICE && tm.arg_len >= 3 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        ak := types.entries[f.vals[av].ty].kind
+        if ak == .FatStr { load_pair_halves(&mut b, &ra, av, a0, a1) }
+        else { _ := load_gp_val_into(&mut b, &ra, av, a0); x64.mov_load(&mut b, a1, a0, -8, 8, false) }
+        _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start + 1], a2)
+        _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start + 2], a3)
+        css := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: css, kind: .X86Rel32, sym_id: ctx.rt.str_slice_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if id == hb.INTRINSIC_RUNES && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        ak := types.entries[f.vals[av].ty].kind
+        if ak == .FatStr { load_pair_halves(&mut b, &ra, av, a0, a1) }
+        else { _ := load_gp_val_into(&mut b, &ra, av, a0); x64.mov_load(&mut b, a1, a0, -8, 8, false) }
+        csr := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: csr, kind: .X86Rel32, sym_id: ctx.rt.str_runes_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if (id == hb.INTRINSIC_SYS_ALLOC || id == hb.INTRINSIC_SYS_POOL_ALLOC_TRY) && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start], a0)
+        ca := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: ca, kind: .X86Rel32, sym_id: ctx.rt.alloc_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+    if id == hb.INTRINSIC_SYS_FREE || id == hb.INTRINSIC_SYS_POOL_FREE { return }
+
+    if id == hb.INTRINSIC_SYS_PID && tm.dest_val >= 0 {
+        if !ctx.is_win64 {
+            x64.mov_imm(&mut b, true, x64.RAX, 39) // getpid
+            x64.syscall(&mut b)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        } else {
+            x64.mov_imm(&mut b, true, SCRATCH_A, 0)
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+        }
+        return
+    }
+
+    if (id == hb.INTRINSIC_SYS_NOW_MS || id == hb.INTRINSIC_SYS_CLOCK) && tm.dest_val >= 0 {
+        cn := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cn, kind: .X86Rel32, sym_id: ctx.rt.sys_now_ms_sym, addend: 0 })
+        store_gp_val_from(&mut b, &ra, tm.dest_val, x64.RAX)
+        return
+    }
+
+    if (id == hb.INTRINSIC_SYS_WRITE_TEXT || id == hb.INTRINSIC_SYS_APPEND_TEXT || id == hb.INTRINSIC_SYS_WRITE_BYTES) && tm.arg_len >= 2 {
+        _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start], a0)
+        dv := f.val_args[tm.arg_start + 1]
+        dk := types.entries[f.vals[dv].ty].kind
+        if dk == .FatStr || dk == .FatSlice { load_pair_halves(&mut b, &ra, dv, a1, a2) }
+        else { _ := load_gp_val_into(&mut b, &ra, dv, a1); x64.mov_load(&mut b, a2, a1, -8, 8, false) }
+        x64.mov_imm(&mut b, true, a3, if id == hb.INTRINSIC_SYS_APPEND_TEXT { 1 } else { 0 })
+        cw := x64.call_lbl(&mut b, -1)
+        relocs.push(PendingReloc { local_off: cw, kind: .X86Rel32, sym_id: ctx.rt.sys_write_file_sym, addend: 0 })
+        if tm.dest_val >= 0 && ra.locs[tm.dest_val].kind == LOC_MEM_HOME {
+            emit_inline_zero_reg(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, ra.locs[tm.dest_val].size, SCRATCH_B)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            x64.setcc_bool(&mut b, x64.CC_E, SCRATCH_A)
+            x64.mov_store(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 1)
+            if ra.locs[tm.dest_val].size >= 8 { x64.mov_store(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off + 4, x64.RAX, 4) }
+        }
+        return
+    }
+
+    if (id == hb.INTRINSIC_SYS_MKDIR || id == hb.INTRINSIC_SYS_REMOVE_FILE ||
+        id == hb.INTRINSIC_SYS_REMOVE_DIR || id == hb.INTRINSIC_SYS_MAKE_EXECUTABLE) && tm.arg_len >= 1 {
+        if !ctx.is_win64 {
+            _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start], x64.RDI)
+            if id == hb.INTRINSIC_SYS_MKDIR { x64.mov_imm(&mut b, true, x64.RSI, 493); x64.mov_imm(&mut b, true, x64.RAX, 83) }
+            else if id == hb.INTRINSIC_SYS_REMOVE_FILE { x64.mov_imm(&mut b, true, x64.RAX, 87) }
+            else if id == hb.INTRINSIC_SYS_REMOVE_DIR { x64.mov_imm(&mut b, true, x64.RAX, 84) }
+            else { x64.mov_imm(&mut b, true, x64.RSI, 493); x64.mov_imm(&mut b, true, x64.RAX, 90) }
+            x64.syscall(&mut b)
+        } else {
+            x64.mov_imm(&mut b, true, x64.RAX, -78)
+        }
+        if tm.dest_val >= 0 && ra.locs[tm.dest_val].kind == LOC_MEM_HOME {
+            emit_inline_zero_reg(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, ra.locs[tm.dest_val].size, SCRATCH_B)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            x64.setcc_bool(&mut b, x64.CC_GE, SCRATCH_A)
+            x64.mov_store(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 1)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_SYS_RENAME && tm.arg_len >= 2 {
+        if !ctx.is_win64 {
+            _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start], x64.RDI)
+            _ := load_gp_val_into(&mut b, &ra, f.val_args[tm.arg_start + 1], x64.RSI)
+            x64.mov_imm(&mut b, true, x64.RAX, 82)
+            x64.syscall(&mut b)
+        } else {
+            x64.mov_imm(&mut b, true, x64.RAX, -78)
+        }
+        if tm.dest_val >= 0 && ra.locs[tm.dest_val].kind == LOC_MEM_HOME {
+            emit_inline_zero_reg(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, ra.locs[tm.dest_val].size, SCRATCH_B)
+            x64.cmp_ri(&mut b, true, x64.RAX, 0)
+            x64.setcc_bool(&mut b, x64.CC_GE, SCRATCH_A)
+            x64.mov_store(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 1)
         }
         return
     }
@@ -3692,6 +5166,24 @@ pub fn emit_program(prog: &ssa.SsaProgram, hir: &hb.HirProgram, target: obj.Targ
         mem_equal_sym: obj.add_symbol(&mut m, "__dunder_mem_equal", .Function, .Text, 0, 0, false),
         write_fd_sym: obj.add_symbol(&mut m, "__dunder_write_fd", .Function, .Text, 0, 0, false),
         print_i64_sym: obj.add_symbol(&mut m, "__dunder_print_i64", .Function, .Text, 0, 0, false),
+        arr_alloc_sym: obj.add_symbol(&mut m, "__dunder_arr_alloc", .Function, .Text, 0, 0, false),
+        arr_grow_sym: obj.add_symbol(&mut m, "__dunder_arr_grow", .Function, .Text, 0, 0, false),
+        hash_key_sym: obj.add_symbol(&mut m, "__dunder_hash_key", .Function, .Text, 0, 0, false),
+        key_eq_sym: obj.add_symbol(&mut m, "__dunder_key_eq", .Function, .Text, 0, 0, false),
+        map_new_sym: obj.add_symbol(&mut m, "__dunder_map_new", .Function, .Text, 0, 0, false),
+        map_find_sym: obj.add_symbol(&mut m, "__dunder_map_find", .Function, .Text, 0, 0, false),
+        map_put_sym: obj.add_symbol(&mut m, "__dunder_map_put", .Function, .Text, 0, 0, false),
+        map_remove_sym: obj.add_symbol(&mut m, "__dunder_map_remove", .Function, .Text, 0, 0, false),
+        fmt_int_sym: obj.add_symbol(&mut m, "__dunder_fmt_int", .Function, .Text, 0, 0, false),
+        fmt_str_sym: obj.add_symbol(&mut m, "__dunder_fmt_str", .Function, .Text, 0, 0, false),
+        str_slice_sym: obj.add_symbol(&mut m, "__dunder_str_slice", .Function, .Text, 0, 0, false),
+        str_runes_sym: obj.add_symbol(&mut m, "__dunder_str_runes", .Function, .Text, 0, 0, false),
+        utf8_valid_sym: obj.add_symbol(&mut m, "__dunder_utf8_valid", .Function, .Text, 0, 0, false),
+        sys_now_ms_sym: obj.add_symbol(&mut m, "__dunder_sys_now_ms", .Function, .Text, 0, 0, false),
+        sys_read_all_sym: obj.add_symbol(&mut m, "__dunder_sys_read_all", .Function, .Text, 0, 0, false),
+        sys_write_file_sym: obj.add_symbol(&mut m, "__dunder_sys_write_file", .Function, .Text, 0, 0, false),
+        sys_stat_sym: obj.add_symbol(&mut m, "__dunder_sys_stat", .Function, .Text, 0, 0, false),
+        bss_args_off: -1,
         win_exit_imp: win_exit,
         win_valloc_imp: win_valloc,
         win_stdhandle_imp: win_stdhandle,
