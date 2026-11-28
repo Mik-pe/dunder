@@ -1,0 +1,1847 @@
+// Unified SSA MIR Optimization Pass Manager (`selfhost/ssa/ssa_opt.ddr`).
+// Runs ssa_verify after EVERY pass when verify_each == true!
+//
+// Pass 1 — SROA / Mem2Reg: Promotes non-addr_taken scalar & FatStr/FatSlice StackSlots
+//          into pure SSA values + block parameters (Cytron IDF SSA construction).
+// Pass 2 — Unified SSA MIR Inliner: Inlines small/leaf/single-caller functions directly on SSA MIR
+//          (uniformly across structs, methods, generics, Option/Result, FatStr/FatSlice, and post-drop calls).
+// Pass 3 — GVN, Constant Folding & Copy Propagation (dominator-tree scoped).
+// Pass 4 — Bounds & Overflow Check Elision (dominating checks, constants, loop ranges 0..len).
+// Pass 5 — CFG Simplification & DCE (constant Branch/Switch folding, trivial block merging,
+//          unreachable block removal, dead pure instruction & slot elimination).
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ssa_ir as ssa
+import ssa_verify
+
+// =========================================================================
+// Shared SSA Rewriting & Compaction Utilities
+// =========================================================================
+
+fn resolve_rep(rep: &[]i32, v_in: i32) -> i32 {
+    if v_in < 0 || v_in >= rep.len { return v_in }
+    mut v := v_in
+    mut steps := 0
+    while v >= 0 && v < rep.len && rep[v] >= 0 && rep[v] != v && steps < 64 {
+        v = rep[v]
+        steps += 1
+    }
+    v
+}
+
+fn rewrite_inst_uses(f: &mut ssa.SsaFunc, iid: i32, rep: &[]i32) {
+    ins := f.insts[iid]
+    if ins.op_a >= 0 { f.insts[iid].op_a = resolve_rep(&rep, ins.op_a) }
+    if ins.op_b >= 0 { f.insts[iid].op_b = resolve_rep(&rep, ins.op_b) }
+    if ins.op_c >= 0 { f.insts[iid].op_c = resolve_rep(&rep, ins.op_c) }
+    if ins.kind == .ClosureMake {
+        for i in 0..ins.arg_len {
+            idx := ins.arg_start + i
+            f.val_args[idx] = resolve_rep(&rep, f.val_args[idx])
+        }
+    }
+}
+
+fn rewrite_term_uses(f: &mut ssa.SsaFunc, tid: i32, rep: &[]i32) {
+    if tid < 0 || tid >= f.terms.len { return }
+    tm := f.terms[tid]
+    if tm.cond_val >= 0 { f.terms[tid].cond_val = resolve_rep(&rep, tm.cond_val) }
+    if tm.env_val >= 0 { f.terms[tid].env_val = resolve_rep(&rep, tm.env_val) }
+    for i in 0..tm.arg_len {
+        idx := tm.arg_start + i
+        if f.val_args[idx] >= 0 {
+            f.val_args[idx] = resolve_rep(&rep, f.val_args[idx])
+        }
+    }
+    for i in 0..tm.arg2_len {
+        idx := tm.arg2_start + i
+        if f.val_args[idx] >= 0 {
+            f.val_args[idx] = resolve_rep(&rep, f.val_args[idx])
+        }
+    }
+    if tm.kind == .Switch {
+        for ci in 0..tm.case_len {
+            as0 := f.switch_arg_starts[tm.case_start + ci]
+            al0 := f.switch_arg_lens[tm.case_start + ci]
+            for i in 0..al0 {
+                f.val_args[as0 + i] = resolve_rep(&rep, f.val_args[as0 + i])
+            }
+        }
+    }
+}
+
+fn rewrite_all_uses(f: &mut ssa.SsaFunc, rep: &[]i32) {
+    for bb in 0..f.blocks.len {
+        s := f.blocks[bb].inst_start
+        n := f.blocks[bb].inst_len
+        for i in 0..n {
+            rewrite_inst_uses(&mut f, f.block_insts[s + i], &rep)
+        }
+        rewrite_term_uses(&mut f, f.blocks[bb].term_id, &rep)
+    }
+}
+
+fn compact_nops(f: &mut ssa.SsaFunc) {
+    for bb in 0..f.blocks.len {
+        s := f.blocks[bb].inst_start
+        n := f.blocks[bb].inst_len
+        mut w := 0
+        for i in 0..n {
+            iid := f.block_insts[s + i]
+            if f.insts[iid].kind != .Nop {
+                f.block_insts[s + w] = iid
+                w += 1
+            }
+        }
+        f.blocks[bb].inst_len = w
+    }
+}
+
+fn emit_undef_zero(f: &mut ssa.SsaFunc, types: &ht.TypeTable, bb: i32, ty: i32) -> i32 {
+    tk := types.entries[ty].kind
+    if tk == .FatStr || tk == .FatSlice || tk == .RegionSlice {
+        // Prepend in reverse order: FatMake, then len ConstInt, then ptr ConstInt -> [ptr, len, FatMake]
+        p_id := ssa.add_val(&mut f, ht.TY_PTR, bb, -1)
+        l_id := ssa.add_val(&mut f, ht.TY_I64, bb, -1)
+        fm := ssa.prepend_inst(&mut f, bb, ssa.make_inst(.FatMake, ty, p_id, l_id, -1, 0, -1, 0, -1, 0, 0, 0, 0))
+        mut li := ssa.make_inst(.ConstInt, ht.TY_I64, -1, -1, -1, 0, -1, 0, -1, 0, 0, 0, 0)
+        li.res = l_id
+        _ := ssa.prepend_inst(&mut f, bb, li)
+        mut pi := ssa.make_inst(.ConstInt, ht.TY_PTR, -1, -1, -1, 0, -1, 0, -1, 0, 0, 0, 0)
+        pi.res = p_id
+        _ := ssa.prepend_inst(&mut f, bb, pi)
+        return fm
+    }
+    if tk == .F32 || tk == .F64 {
+        return ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstFloat, ty, -1, -1, -1, 0, -1, 0, -1, 0, 0, 0, 0))
+    }
+    if tk == .String {
+        sidx := ssa.add_const_str(&mut f, "")
+        return ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstStr, ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, 0, 0))
+    }
+    if tk == .CStr {
+        sidx := ssa.add_const_str(&mut f, "")
+        return ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstCStr, ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, 0, 0))
+    }
+    if tk == .WStr {
+        sidx := ssa.add_const_str(&mut f, "")
+        return ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstWStr, ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, 0, 0))
+    }
+    if tk == .FnPtr || tk == .ExternFn {
+        return ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstFn, ty, -1, -1, -1, 0, -1, 0, -1, 0, 0, 0, 0))
+    }
+    ssa.prepend_inst(&mut f, bb, ssa.make_inst(.ConstInt, ty, -1, -1, -1, 0, -1, 0, -1, 0, 0, 0, 0))
+}
+
+fn is_promotable_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    k := types.entries[ty].kind
+    if k == .Unit || k == .Bool || k == .I8 || k == .I16 || k == .I32 || k == .I64 || k == .Isize ||
+        k == .U8 || k == .U16 || k == .U32 || k == .U64 || k == .Usize ||
+        k == .F32 || k == .F64 || k == .Rune || k == .Ptr ||
+        k == .String || k == .Array || k == .CStr || k == .WStr ||
+        k == .Ref || k == .MutRef || k == .RawConst || k == .RawMut ||
+        k == .FnPtr || k == .ExternFn || k == .ClosureEnv || k == .Task ||
+        k == .FatStr || k == .FatSlice || k == .RegionSlice {
+        return true
+    }
+    if k == .Enum && types.entries[ty].size <= 4 { return true }
+    false
+}
+
+// =========================================================================
+// Pass 1 — SROA / Mem2Reg (Cytron IDF SSA Construction)
+// =========================================================================
+
+fn append_edge_arg(f: &mut ssa.SsaFunc, old_start: i32, old_len: i32, extra_val: i32) -> i32 {
+    new_s := f.val_args.len
+    for k in 0..old_len { f.val_args.push(f.val_args[old_start + k]) }
+    f.val_args.push(extra_val)
+    new_s
+}
+
+fn add_edge_arg_to_term(f: &mut ssa.SsaFunc, pred_bb: i32, succ_bb: i32, val: i32) {
+    tid := f.blocks[pred_bb].term_id
+    if tid < 0 { return }
+    tm := f.terms[tid]
+    if tm.kind == .Goto && tm.target_a == succ_bb {
+        ns := append_edge_arg(&mut f, tm.arg_start, tm.arg_len, val)
+        f.terms[tid].arg_start = ns
+        f.terms[tid].arg_len = tm.arg_len + 1
+    } else if tm.kind == .Branch {
+        if tm.target_a == succ_bb {
+            ns := append_edge_arg(&mut f, tm.arg_start, tm.arg_len, val)
+            f.terms[tid].arg_start = ns
+            f.terms[tid].arg_len = tm.arg_len + 1
+        }
+        if tm.target_b == succ_bb {
+            ns2 := append_edge_arg(&mut f, f.terms[tid].arg2_start, f.terms[tid].arg2_len, val)
+            f.terms[tid].arg2_start = ns2
+            f.terms[tid].arg2_len = f.terms[tid].arg2_len + 1
+        }
+    } else if tm.kind == .Switch {
+        for ci in 0..tm.case_len {
+            if f.switch_bbs[tm.case_start + ci] == succ_bb {
+                as0 := f.switch_arg_starts[tm.case_start + ci]
+                al0 := f.switch_arg_lens[tm.case_start + ci]
+                ns := append_edge_arg(&mut f, as0, al0, val)
+                f.switch_arg_starts[tm.case_start + ci] = ns
+                f.switch_arg_lens[tm.case_start + ci] = al0 + 1
+            }
+        }
+        if tm.target_a == succ_bb {
+            ns := append_edge_arg(&mut f, f.terms[tid].arg_start, f.terms[tid].arg_len, val)
+            f.terms[tid].arg_start = ns
+            f.terms[tid].arg_len = f.terms[tid].arg_len + 1
+        }
+    }
+}
+
+fn edge_can_carry_args(f: &ssa.SsaFunc, pred_bb: i32) -> bool {
+    tid := f.blocks[pred_bb].term_id
+    if tid < 0 { return false }
+    k := f.terms[tid].kind
+    k == .Goto || k == .Branch || k == .Switch
+}
+
+struct RenameCtx {
+    n_slots: i32,
+    promotable: []bool,
+    slot_stacks: []i32,
+    slot_stack_prev: []i32,
+    slot_top: []i32,
+    val_to_slot: []i32,     // for inserted block params: maps val_id -> slot_id (-1 otherwise)
+    val_addr_slot: []i32,   // for SlotAddr vals: maps val_id -> slot_id (-1 otherwise)
+    rep: []i32,             // replacement map for eliminated Loads
+    zero_cache: []i32,      // cached zero SsaVal per slot (-1 if not created)
+}
+
+fn push_slot_def(rc: &mut RenameCtx, slot: i32, val: i32) {
+    node := rc.slot_stacks.len
+    rc.slot_stacks.push(val)
+    rc.slot_stack_prev.push(rc.slot_top[slot])
+    rc.slot_top[slot] = node
+}
+
+fn get_slot_def(rc: &mut RenameCtx, f: &mut ssa.SsaFunc, types: &ht.TypeTable, slot: i32) -> i32 {
+    top := rc.slot_top[slot]
+    if top >= 0 { return rc.slot_stacks[top] }
+    if rc.zero_cache[slot] < 0 {
+        zv := emit_undef_zero(&mut f, &types, 0, f.slots[slot].ty)
+        while rc.rep.len < f.vals.len { rc.rep.push(-1) }
+        while rc.val_to_slot.len < f.vals.len { rc.val_to_slot.push(-1) }
+        while rc.val_addr_slot.len < f.vals.len { rc.val_addr_slot.push(-1) }
+        rc.zero_cache[slot] = zv
+    }
+    rc.zero_cache[slot]
+}
+
+fn rename_walk(f: &mut ssa.SsaFunc, types: &ht.TypeTable, dom: &ssa.DomTree,
+    rc: &mut RenameCtx, bb: i32) {
+    // Save stack tops for all promotable slots so we pop on exit
+    mut saved_tops: []i32 = []
+    for s in 0..rc.n_slots { saved_tops.push(rc.slot_top[s]) }
+
+    // 1. Bind inserted block params of `bb`
+    ps := f.blocks[bb].params_start
+    pn := f.blocks[bb].params_len
+    for pi in 0..pn {
+        pv := f.block_params[ps + pi]
+        if pv >= 0 && pv < rc.val_to_slot.len && rc.val_to_slot[pv] >= 0 {
+            push_slot_def(&mut rc, rc.val_to_slot[pv], pv)
+        }
+    }
+
+    // 2. Walk instructions in `bb`
+    is0 := f.blocks[bb].inst_start
+    in0 := f.blocks[bb].inst_len
+    for idx in 0..in0 {
+        iid := f.block_insts[is0 + idx]
+        rewrite_inst_uses(&mut f, iid, &rc.rep)
+        ins := f.insts[iid]
+        if ins.kind == .Load && ins.imm_i64 == 0 {
+            sl := if ins.op_a >= 0 && ins.op_a < rc.val_addr_slot.len { rc.val_addr_slot[ins.op_a] } else { -1 }
+            if sl >= 0 && rc.promotable[sl] && ins.ty == f.slots[sl].ty {
+                cur_v := get_slot_def(&mut rc, &mut f, &types, sl)
+                rc.rep[ins.res] = cur_v
+                f.insts[iid].kind = .Nop
+                f.insts[iid].res = -1
+            }
+        } else if ins.kind == .Store && ins.imm_i64 == 0 {
+            sl := if ins.op_a >= 0 && ins.op_a < rc.val_addr_slot.len { rc.val_addr_slot[ins.op_a] } else { -1 }
+            if sl >= 0 && rc.promotable[sl] && ins.ty == f.slots[sl].ty {
+                val := resolve_rep(&rc.rep, ins.op_b)
+                push_slot_def(&mut rc, sl, val)
+                f.insts[iid].kind = .Nop
+            }
+        } else if ins.kind == .SlotAddr && ins.imm_i64 == 0 && ins.aux >= 0 && ins.aux < rc.n_slots && rc.promotable[ins.aux] {
+            f.insts[iid].kind = .Nop
+            f.insts[iid].res = -1
+        }
+    }
+
+    // 3. Rewrite terminator uses
+    rewrite_term_uses(&mut f, f.blocks[bb].term_id, &rc.rep)
+
+    // 4. Populate edge arguments for every successor's inserted block params!
+    mut succs: []i32 = []
+    ssa.term_succs(&f, bb, &mut succs)
+    // Deduplicate succs so Branch(c, X, X) does not add args twice per slot!
+    // Actually for Branch(c, X, X), add_edge_arg_to_term updates BOTH then_args and else_args on one call!
+    mut seen_succ: []i32 = []
+    for si in 0..succs.len {
+        sbb := succs[si]
+        mut dup := false
+        for k in 0..seen_succ.len { if seen_succ[k] == sbb { dup = true; break } }
+        if dup { continue }
+        seen_succ.push(sbb)
+        sps := f.blocks[sbb].params_start
+        spn := f.blocks[sbb].params_len
+        for pi in 0..spn {
+            pv := f.block_params[sps + pi]
+            if pv >= 0 && pv < rc.val_to_slot.len && rc.val_to_slot[pv] >= 0 {
+                sl := rc.val_to_slot[pv]
+                cur_v := get_slot_def(&mut rc, &mut f, &types, sl)
+                add_edge_arg_to_term(&mut f, bb, sbb, cur_v)
+            }
+        }
+    }
+
+    // 5. Recurse on dominator-tree children
+    cs := dom.dom_child_start[bb]
+    cl := dom.dom_child_len[bb]
+    for ci in 0..cl {
+        child := dom.dom_children[cs + ci]
+        rename_walk(&mut f, &types, &dom, &mut rc, child)
+    }
+
+    // 6. Restore stacks
+    for s in 0..rc.n_slots { rc.slot_top[s] = saved_tops[s] }
+}
+
+pub fn pass_mem2reg(types: &ht.TypeTable, f: &mut ssa.SsaFunc) -> bool {
+    n_slots := f.slots.len
+    if n_slots == 0 || f.blocks.len == 0 { return false }
+
+    // Prune unreachable blocks first so dead blocks cannot hold stale SlotAddrs of promoted slots!
+    _ := remove_unreachable_blocks(&mut f)
+
+    // Step 1: Identify strictly promotable slots (verify EVERY use of SlotAddr(slot)!)
+    mut promotable: []bool = []
+    for s in 0..n_slots {
+        sl := &f.slots[s]
+        ok := !sl.dead && !sl.addr_taken && !sl.is_sret && is_promotable_ty(&types, sl.ty)
+        promotable.push(ok)
+    }
+
+    // Map each SlotAddr result val -> slot_id
+    mut val_addr_slot: []i32 = []
+    for _ in 0..f.vals.len { val_addr_slot.push(-1) }
+    for bb in 0..f.blocks.len {
+        is0 := f.blocks[bb].inst_start
+        in0 := f.blocks[bb].inst_len
+        for i in 0..in0 {
+            ins := f.insts[f.block_insts[is0 + i]]
+            if ins.kind == .SlotAddr && ins.aux >= 0 && ins.aux < n_slots {
+                if ins.imm_i64 != 0 {
+                    promotable[ins.aux] = false
+                } else if ins.res >= 0 {
+                    val_addr_slot[ins.res] = ins.aux
+                }
+            }
+        }
+    }
+
+    // Check every use of a SlotAddr val: ONLY direct whole-slot Load(op_a) and Store(op_a) allowed!
+    for bb in 0..f.blocks.len {
+        is0 := f.blocks[bb].inst_start
+        in0 := f.blocks[bb].inst_len
+        for i in 0..in0 {
+            ins := f.insts[f.block_insts[is0 + i]]
+            if ins.kind == .Load {
+                if ins.op_a >= 0 && val_addr_slot[ins.op_a] >= 0 {
+                    sl := val_addr_slot[ins.op_a]
+                    if ins.imm_i64 != 0 || ins.ty != f.slots[sl].ty {
+                        promotable[sl] = false
+                    }
+                }
+            } else if ins.kind == .Store {
+                if ins.op_a >= 0 && val_addr_slot[ins.op_a] >= 0 {
+                    sl := val_addr_slot[ins.op_a]
+                    if ins.imm_i64 != 0 || ins.ty != f.slots[sl].ty {
+                        promotable[sl] = false
+                    }
+                }
+                if ins.op_b >= 0 && val_addr_slot[ins.op_b] >= 0 {
+                    promotable[val_addr_slot[ins.op_b]] = false
+                }
+            } else {
+                if ins.op_a >= 0 && val_addr_slot[ins.op_a] >= 0 { promotable[val_addr_slot[ins.op_a]] = false }
+                if ins.op_b >= 0 && val_addr_slot[ins.op_b] >= 0 { promotable[val_addr_slot[ins.op_b]] = false }
+                if ins.op_c >= 0 && val_addr_slot[ins.op_c] >= 0 { promotable[val_addr_slot[ins.op_c]] = false }
+                if ins.kind == .ClosureMake {
+                    for ci in 0..ins.arg_len {
+                        v := f.val_args[ins.arg_start + ci]
+                        if v >= 0 && val_addr_slot[v] >= 0 { promotable[val_addr_slot[v]] = false }
+                    }
+                }
+            }
+        }
+        tid := f.blocks[bb].term_id
+        if tid >= 0 {
+            tm := f.terms[tid]
+            if tm.cond_val >= 0 && val_addr_slot[tm.cond_val] >= 0 { promotable[val_addr_slot[tm.cond_val]] = false }
+            if tm.env_val >= 0 && val_addr_slot[tm.env_val] >= 0 { promotable[val_addr_slot[tm.env_val]] = false }
+            for ai in 0..tm.arg_len {
+                v := f.val_args[tm.arg_start + ai]
+                if v >= 0 && val_addr_slot[v] >= 0 { promotable[val_addr_slot[v]] = false }
+            }
+            for ai in 0..tm.arg2_len {
+                v := f.val_args[tm.arg2_start + ai]
+                if v >= 0 && val_addr_slot[v] >= 0 { promotable[val_addr_slot[v]] = false }
+            }
+        }
+    }
+
+    mut any_promo := false
+    for s in 0..n_slots { if promotable[s] { any_promo = true; break } }
+    if !any_promo { return false }
+
+    // Step 2: Compute Dominators & Dominance Frontiers
+    dom := ssa.compute_doms(&f)
+    df := ssa.compute_dom_frontiers(&f, &dom)
+    n_bbs := f.blocks.len
+
+    // Check which blocks can safely receive block params (every reachable pred must be Goto/Branch/Switch!)
+    mut can_phi_bb: []bool = []
+    for bb in 0..n_bbs {
+        mut ok := dom.idom[bb] >= 0
+        ps := f.blocks[bb].pred_start
+        pl := f.blocks[bb].pred_len
+        for k in 0..pl {
+            p := f.preds[ps + k]
+            if dom.idom[p] >= 0 && !edge_can_carry_args(&f, p) { ok = false; break }
+        }
+        can_phi_bb.push(ok)
+    }
+
+    // Step 3: Find defining blocks per promotable slot & insert block parameters at IDF
+    mut val_to_slot: []i32 = []
+    for _ in 0..f.vals.len { val_to_slot.push(-1) }
+
+    for s in 0..n_slots {
+        if !promotable[s] { continue }
+        mut worklist: []i32 = []
+        mut in_work: []bool = []
+        mut has_phi: []bool = []
+        for _ in 0..n_bbs { in_work.push(false); has_phi.push(false) }
+
+        for ri in 0..dom.rpo_order.len {
+            bb := dom.rpo_order[ri]
+            is0 := f.blocks[bb].inst_start
+            in0 := f.blocks[bb].inst_len
+            for i in 0..in0 {
+                ins := f.insts[f.block_insts[is0 + i]]
+                if ins.kind == .Store && ins.op_a >= 0 && val_addr_slot[ins.op_a] == s {
+                    if !in_work[bb] {
+                        in_work[bb] = true
+                        worklist.push(bb)
+                    }
+                }
+            }
+        }
+
+        // Check that every IDF block can receive block params; if not, skip promoting this slot!
+        mut phi_bbs: []i32 = []
+        mut head := 0
+        mut ok_slot := true
+        while head < worklist.len {
+            x := worklist[head]; head += 1
+            ds := df.df_start[x]
+            dl := df.df_len[x]
+            for di in 0..dl {
+                y := df.df_nodes[ds + di]
+                if !has_phi[y] {
+                    if !can_phi_bb[y] { ok_slot = false; break }
+                    has_phi[y] = true
+                    phi_bbs.push(y)
+                    if !in_work[y] {
+                        in_work[y] = true
+                        worklist.push(y)
+                    }
+                }
+            }
+            if !ok_slot { break }
+        }
+        if !ok_slot {
+            promotable[s] = false
+            continue
+        }
+        for pi in 0..phi_bbs.len {
+            y := phi_bbs[pi]
+            pv := ssa.add_block_param(&mut f, y, f.slots[s].ty)
+            while val_to_slot.len <= pv { val_to_slot.push(-1) }
+            while val_addr_slot.len <= pv { val_addr_slot.push(-1) }
+            val_to_slot[pv] = s
+        }
+    }
+
+    // Re-check if any slot remains promotable
+    any_promo = false
+    for s in 0..n_slots { if promotable[s] { any_promo = true; break } }
+    if !any_promo { return false }
+
+    // Step 4: Dominator-tree preorder rename walk
+    mut slot_top: []i32 = []
+    mut zero_cache: []i32 = []
+    for _ in 0..n_slots { slot_top.push(-1); zero_cache.push(-1) }
+    mut rep: []i32 = []
+    for _ in 0..f.vals.len { rep.push(-1) }
+
+    mut rc := RenameCtx {
+        n_slots: n_slots,
+        promotable: move promotable,
+        slot_stacks: [],
+        slot_stack_prev: [],
+        slot_top: move slot_top,
+        val_to_slot: move val_to_slot,
+        val_addr_slot: move val_addr_slot,
+        rep: move rep,
+        zero_cache: move zero_cache,
+    }
+    rename_walk(&mut f, &types, &dom, &mut rc, 0)
+
+    // Mark promoted slots dead & compact Nops
+    for s in 0..n_slots {
+        if rc.promotable[s] { f.slots[s].dead = true }
+    }
+    compact_nops(&mut f)
+    true
+}
+
+// =========================================================================
+// Pass 2 — Unified SSA MIR Inliner
+// =========================================================================
+
+struct FnMetrics {
+    inst_count: i32,
+    block_count: i32,
+    call_count: i32,
+    caller_count: i32,
+    has_scope: bool,
+    self_recursive: bool,
+}
+
+fn measure_func(f: &ssa.SsaFunc) -> FnMetrics {
+    mut ic := 0
+    mut cc := 0
+    mut has_sc := false
+    mut self_rec := false
+    for bb in 0..f.blocks.len {
+        ic += f.blocks[bb].inst_len
+        tid := f.blocks[bb].term_id
+        if tid >= 0 {
+            tm := f.terms[tid]
+            if tm.kind == .Call || tm.kind == .IndirectCall || tm.kind == .ExternCall || tm.kind == .IntrinsicCall {
+                cc += 1
+                if tm.kind == .Call && tm.callee == f.fn_id { self_rec = true }
+            } else if tm.kind == .TaskScopeEnter || tm.kind == .TaskScopeJoin ||
+                tm.kind == .RegionEnter || tm.kind == .RegionExit {
+                has_sc = true
+            }
+        }
+    }
+    FnMetrics {
+        inst_count: ic,
+        block_count: f.blocks.len,
+        call_count: cc,
+        caller_count: 0,
+        has_scope: has_sc,
+        self_recursive: self_rec,
+    }
+}
+
+fn remap_val(vmap: &[]i32, v: i32) -> i32 {
+    if v < 0 || v >= vmap.len { return v }
+    vmap[v]
+}
+
+fn inline_call_site(caller: &mut ssa.SsaFunc, callee: &ssa.SsaFunc, call_bb: i32) -> bool {
+    tid := caller.blocks[call_bb].term_id
+    if tid < 0 || caller.terms[tid].kind != .Call { return false }
+    ctm := caller.terms[tid]
+    if ctm.arg_len != callee.param_vals.len { return false }
+
+    // 1. Clone non-dead StackSlots from callee into caller
+    mut slot_map: []i32 = []
+    for s in 0..callee.slots.len {
+        sl := &callee.slots[s]
+        if sl.dead {
+            slot_map.push(-1)
+        } else {
+            ns := ssa.add_slot(&mut caller, sl.ty, sl.size, sl.align, sl.addr_taken, false, false, sl.name)
+            slot_map.push(ns)
+        }
+    }
+
+    // 2. Clone const_strs from callee into caller
+    mut str_map: []i32 = []
+    for si in 0..callee.const_strs.len {
+        str_map.push(ssa.add_const_str(&mut caller, callee.const_strs[si]))
+    }
+
+    // 3. Create cloned blocks for callee + merge_bb for Return values
+    mut bb_map: []i32 = []
+    for _ in 0..callee.blocks.len {
+        bb_map.push(ssa.add_block(&mut caller))
+    }
+    merge_bb := ssa.add_block(&mut caller)
+    mut merge_val := -1
+    has_ret_val := ctm.dest_val >= 0 && callee.ret_ty != ht.TY_UNIT
+    if has_ret_val {
+        merge_val = ssa.add_block_param(&mut caller, merge_bb, caller.vals[ctm.dest_val].ty)
+    }
+    empty_args: []i32 = []
+    _ := ssa.set_goto(&mut caller, merge_bb, ctm.target_a, &empty_args, ctm.span_start, ctm.span_end)
+
+    // 4. Pre-allocate SsaVal mapping for callee
+    mut val_map: []i32 = []
+    for _ in 0..callee.vals.len { val_map.push(-1) }
+    // Map callee fn params directly to call arguments!
+    for pi in 0..callee.param_vals.len {
+        val_map[callee.param_vals[pi]] = caller.val_args[ctm.arg_start + pi]
+    }
+    // Map callee block params
+    for cbb in 0..callee.blocks.len {
+        ps := callee.blocks[cbb].params_start
+        pn := callee.blocks[cbb].params_len
+        for pi in 0..pn {
+            old_pv := callee.block_params[ps + pi]
+            new_pv := ssa.add_block_param(&mut caller, bb_map[cbb], callee.vals[old_pv].ty)
+            val_map[old_pv] = new_pv
+        }
+    }
+    // Pre-allocate vals for all callee instructions and call terminator results
+    for cbb in 0..callee.blocks.len {
+        nbb := bb_map[cbb]
+        is0 := callee.blocks[cbb].inst_start
+        in0 := callee.blocks[cbb].inst_len
+        for i in 0..in0 {
+            ins := callee.insts[callee.block_insts[is0 + i]]
+            if ssa.inst_produces_val(ins.kind) && ins.res >= 0 {
+                val_map[ins.res] = ssa.add_val(&mut caller, ins.ty, nbb, -1)
+            }
+        }
+        ctid := callee.blocks[cbb].term_id
+        if ctid >= 0 {
+            ktm := callee.terms[ctid]
+            if ktm.dest_val >= 0 {
+                val_map[ktm.dest_val] = ssa.add_val(&mut caller, callee.vals[ktm.dest_val].ty, nbb, ssa.DEF_TERM_RESULT)
+            }
+        }
+    }
+
+    // 5. Clone instructions & terminators into caller
+    for cbb in 0..callee.blocks.len {
+        nbb := bb_map[cbb]
+        is0 := callee.blocks[cbb].inst_start
+        in0 := callee.blocks[cbb].inst_len
+        for i in 0..in0 {
+            old_ins := callee.insts[callee.block_insts[is0 + i]]
+            mut ni := old_ins
+            if ni.res >= 0 { ni.res = val_map[ni.res] }
+            if ni.op_a >= 0 { ni.op_a = remap_val(&val_map, ni.op_a) }
+            if ni.op_b >= 0 { ni.op_b = remap_val(&val_map, ni.op_b) }
+            if ni.op_c >= 0 { ni.op_c = remap_val(&val_map, ni.op_c) }
+            if ni.str_idx >= 0 && ni.str_idx < str_map.len { ni.str_idx = str_map[ni.str_idx] }
+            if ni.kind == .SlotAddr && ni.aux >= 0 && ni.aux < slot_map.len {
+                ni.aux = slot_map[ni.aux]
+            } else if (ni.kind == .Load || ni.kind == .Store) && ni.aux >= 0 && ni.aux < slot_map.len {
+                ni.aux = slot_map[ni.aux]
+            } else if ni.kind == .ClosureMake {
+                mut margs: []i32 = []
+                for ai in 0..old_ins.arg_len {
+                    margs.push(remap_val(&val_map, callee.val_args[old_ins.arg_start + ai]))
+                }
+                ni.arg_start = ssa.push_val_args(&mut caller, &margs)
+                ni.arg_len = margs.len
+            }
+            _ := ssa.emit_inst(&mut caller, nbb, ni)
+        }
+
+        ctid := callee.blocks[cbb].term_id
+        if ctid < 0 {
+            _ := ssa.set_trap(&mut caller, nbb, hb.TRAP_UNREACHABLE, 0, 0)
+            continue
+        }
+        ktm := callee.terms[ctid]
+        if ktm.kind == .Return {
+            if has_ret_val {
+                rv := remap_val(&val_map, ktm.cond_val)
+                rargs: []i32 = [rv]
+                _ := ssa.set_goto(&mut caller, nbb, merge_bb, &rargs, ktm.span_start, ktm.span_end)
+            } else {
+                _ := ssa.set_goto(&mut caller, nbb, merge_bb, &empty_args, ktm.span_start, ktm.span_end)
+            }
+        } else {
+            mut ntm := ktm
+            if ntm.target_a >= 0 { ntm.target_a = bb_map[ntm.target_a] }
+            if ntm.target_b >= 0 { ntm.target_b = bb_map[ntm.target_b] }
+            if ntm.cond_val >= 0 { ntm.cond_val = remap_val(&val_map, ntm.cond_val) }
+            if ntm.env_val >= 0 { ntm.env_val = remap_val(&val_map, ntm.env_val) }
+            if ntm.dest_val >= 0 { ntm.dest_val = val_map[ntm.dest_val] }
+            if ktm.arg_len > 0 {
+                mut a1: []i32 = []
+                for ai in 0..ktm.arg_len {
+                    v := callee.val_args[ktm.arg_start + ai]
+                    a1.push(if v >= 0 { remap_val(&val_map, v) } else { -1 })
+                }
+                ntm.arg_start = ssa.push_val_args(&mut caller, &a1)
+                ntm.arg_len = a1.len
+            } else {
+                ntm.arg_start = 0
+                ntm.arg_len = 0
+            }
+            if ktm.arg2_len > 0 {
+                mut a2: []i32 = []
+                for ai in 0..ktm.arg2_len {
+                    v := callee.val_args[ktm.arg2_start + ai]
+                    a2.push(if v >= 0 { remap_val(&val_map, v) } else { -1 })
+                }
+                ntm.arg2_start = ssa.push_val_args(&mut caller, &a2)
+                ntm.arg2_len = a2.len
+            } else {
+                ntm.arg2_start = 0
+                ntm.arg2_len = 0
+            }
+            if ktm.kind == .Switch && ktm.case_len > 0 {
+                c_start := caller.switch_vals.len
+                for ci in 0..ktm.case_len {
+                    caller.switch_vals.push(callee.switch_vals[ktm.case_start + ci])
+                    caller.switch_bbs.push(bb_map[callee.switch_bbs[ktm.case_start + ci]])
+                    cas := callee.switch_arg_starts[ktm.case_start + ci]
+                    cal := callee.switch_arg_lens[ktm.case_start + ci]
+                    mut ca: []i32 = []
+                    for ai in 0..cal {
+                        ca.push(remap_val(&val_map, callee.val_args[cas + ai]))
+                    }
+                    cas_new := if ca.len > 0 { ssa.push_val_args(&mut caller, &ca) } else { 0 }
+                    caller.switch_arg_starts.push(cas_new)
+                    caller.switch_arg_lens.push(ca.len)
+                }
+                ntm.case_start = c_start
+                ntm.case_len = ktm.case_len
+            } else {
+                ntm.case_start = 0
+                ntm.case_len = 0
+            }
+            _ := ssa.set_term(&mut caller, nbb, ntm)
+        }
+    }
+
+    // 6. Rewrite call_bb terminator to Goto(entry of cloned callee) & replace dest_val uses with merge_val
+    _ := ssa.set_goto(&mut caller, call_bb, bb_map[0], &empty_args, ctm.span_start, ctm.span_end)
+    if has_ret_val && merge_val >= 0 {
+        mut rep: []i32 = []
+        for _ in 0..caller.vals.len { rep.push(-1) }
+        rep[ctm.dest_val] = merge_val
+        rewrite_all_uses(&mut caller, &rep)
+    }
+
+    ssa.compute_preds(&mut caller)
+    true
+}
+
+pub fn pass_inline(types: &ht.TypeTable, prog: &mut ssa.SsaProgram) -> bool {
+    _ := types.sealed
+    nf := prog.funcs.len
+    if nf == 0 { return false }
+
+    mut metrics: []FnMetrics = []
+    for i in 0..nf {
+        metrics.push(measure_func(&prog.funcs[i]))
+    }
+    // Count callers across program
+    for i in 0..nf {
+        f := &prog.funcs[i]
+        for bb in 0..f.blocks.len {
+            tid := f.blocks[bb].term_id
+            if tid >= 0 && f.terms[tid].kind == .Call {
+                cfid := f.terms[tid].callee
+                if cfid >= 0 && cfid < prog.fn_id_to_idx.len {
+                    cidx := prog.fn_id_to_idx[cfid]
+                    if cidx >= 0 && cidx < nf {
+                        metrics[cidx].caller_count += 1
+                    }
+                }
+            }
+        }
+    }
+
+    mut changed := false
+    for i in 0..nf {
+        mut inlines_here := 0
+        mut scan_bb := 0
+        while scan_bb < prog.funcs[i].blocks.len && inlines_here < 8 && prog.funcs[i].insts.len < 600 {
+            tid := prog.funcs[i].blocks[scan_bb].term_id
+            if tid >= 0 && prog.funcs[i].terms[tid].kind == .Call {
+                cfid := prog.funcs[i].terms[tid].callee
+                if cfid >= 0 && cfid < prog.fn_id_to_idx.len {
+                    cidx := prog.fn_id_to_idx[cfid]
+                    if cidx >= 0 && cidx < nf && cidx != i {
+                        m := metrics[cidx]
+                        eligible := !prog.funcs[cidx].is_extern && !m.self_recursive && !m.has_scope &&
+                            ((m.inst_count <= 48 && m.block_count <= 12) ||
+                             (m.call_count == 0 && m.inst_count <= 80 && m.block_count <= 16) ||
+                             (m.caller_count == 1 && m.inst_count <= 120 && m.block_count <= 20))
+                        if eligible {
+                            // Clone callee snapshot by value (safe borrow separation)
+                            callee_copy := clone_func(&prog.funcs[cidx])
+                            if inline_call_site(&mut prog.funcs[i], &callee_copy, scan_bb) {
+                                changed = true
+                                inlines_here += 1
+                                continue
+                            }
+                        }
+                    }
+                }
+            }
+            // Fold no-op INTRINSIC_DROP on Copy types directly into Goto(next_bb)!
+            if tid >= 0 && prog.funcs[i].terms[tid].kind == .IntrinsicCall &&
+                prog.funcs[i].terms[tid].callee == hb.INTRINSIC_DROP {
+                dty := prog.funcs[i].terms[tid].aux_ty
+                if dty >= 0 && dty < types.entries.len && ht.is_copy(&types, dty) {
+                    next_bb := prog.funcs[i].terms[tid].target_a
+                    empty_args: []i32 = []
+                    _ := ssa.set_goto(&mut prog.funcs[i], scan_bb, next_bb, &empty_args,
+                        prog.funcs[i].terms[tid].span_start, prog.funcs[i].terms[tid].span_end)
+                    ssa.compute_preds(&mut prog.funcs[i])
+                    changed = true
+                }
+            }
+            scan_bb += 1
+        }
+    }
+    changed
+}
+
+fn clone_func(src: &ssa.SsaFunc) -> ssa.SsaFunc {
+    mut dst := ssa.new_func(src.fn_id, src.owner_mod, src.name, src.path,
+        src.sig_ty, src.ret_ty, src.param_count, src.is_unsafe)
+    dst.is_extern = src.is_extern
+    dst.is_closure_body = src.is_closure_body
+    for i in 0..src.slots.len {
+        s := &src.slots[i]
+        dst.slots.push(ssa.StackSlot {
+            id: s.id, ty: s.ty, size: s.size, align: s.align,
+            addr_taken: s.addr_taken, is_param: s.is_param, is_sret: s.is_sret,
+            dead: s.dead, name: s.name.clone(),
+        })
+    }
+    for i in 0..src.vals.len { dst.vals.push(src.vals[i]) }
+    for i in 0..src.param_vals.len { dst.param_vals.push(src.param_vals[i]) }
+    for i in 0..src.blocks.len { dst.blocks.push(src.blocks[i]) }
+    for i in 0..src.block_params.len { dst.block_params.push(src.block_params[i]) }
+    for i in 0..src.block_insts.len { dst.block_insts.push(src.block_insts[i]) }
+    for i in 0..src.insts.len { dst.insts.push(src.insts[i]) }
+    for i in 0..src.terms.len { dst.terms.push(src.terms[i]) }
+    for i in 0..src.preds.len { dst.preds.push(src.preds[i]) }
+    for i in 0..src.val_args.len { dst.val_args.push(src.val_args[i]) }
+    for i in 0..src.const_strs.len { dst.const_strs.push(src.const_strs[i].clone()) }
+    for i in 0..src.switch_vals.len { dst.switch_vals.push(src.switch_vals[i]) }
+    for i in 0..src.switch_bbs.len { dst.switch_bbs.push(src.switch_bbs[i]) }
+    for i in 0..src.switch_arg_starts.len { dst.switch_arg_starts.push(src.switch_arg_starts[i]) }
+    for i in 0..src.switch_arg_lens.len { dst.switch_arg_lens.push(src.switch_arg_lens[i]) }
+    dst
+}
+
+// =========================================================================
+// Pass 3 — GVN, Constant Folding & Copy Propagation
+// =========================================================================
+
+struct GvnEntry {
+    kind: ssa.SsaInstKind,
+    ty: i32,
+    aux: i32,
+    aux_ty: i32,
+    imm_i64: i64,
+    op_a: i32,
+    op_b: i32,
+    op_c: i32,
+    epoch: i32,
+    val_id: i32,
+}
+
+struct GvnCtx {
+    rep: []i32,
+    has_const: []bool,
+    const_val: []i64,
+    fat_ptr_of: []i32,
+    fat_len_of: []i32,
+    entries: []GvnEntry,
+    mem_epoch: i32,
+    changed: bool,
+}
+
+fn is_gvn_eligible(k: ssa.SsaInstKind) -> bool {
+    k == .ConstInt || k == .ConstFn || k == .Binary || k == .Unary || k == .Cast ||
+    k == .SlotAddr || k == .FieldAddr || k == .IndexAddr ||
+    k == .FatMake || k == .FatPtr || k == .FatLen || k == .Len || k == .Select
+}
+
+fn find_gvn(ctx: &GvnCtx, k: ssa.SsaInstKind, ty: i32, aux: i32, aux_ty: i32,
+    imm_i64: i64, op_a: i32, op_b: i32, op_c: i32, epoch: i32) -> i32 {
+    mut i := ctx.entries.len - 1
+    while i >= 0 {
+        e := ctx.entries[i]
+        if e.kind == k && e.ty == ty && e.aux == aux && e.aux_ty == aux_ty &&
+            e.imm_i64 == imm_i64 && e.op_a == op_a && e.op_b == op_b && e.op_c == op_c &&
+            e.epoch == epoch {
+            return e.val_id
+        }
+        i -= 1
+    }
+    -1
+}
+
+struct ConstEval {
+    ok: bool,
+    val: i64,
+}
+
+fn eval_const_binary(types: &ht.TypeTable, op: i32, op_ty: i32, a: i64, b: i64) -> ConstEval {
+    if op == hb.BINOP_ADD { return ConstEval { ok: true, val: a.wrapping_add(b) } }
+    if op == hb.BINOP_SUB { return ConstEval { ok: true, val: a.wrapping_sub(b) } }
+    if op == hb.BINOP_MUL { return ConstEval { ok: true, val: a.wrapping_mul(b) } }
+    if op == hb.BINOP_DIV {
+        if b == 0 || (a == -9223372036854775807 - 1 && b == -1) { return ConstEval { ok: false, val: 0 } }
+        if ssa.is_unsigned_int_ty(&types, op_ty) { return ConstEval { ok: true, val: i64(u64(a) / u64(b)) } }
+        return ConstEval { ok: true, val: a / b }
+    }
+    if op == hb.BINOP_MOD {
+        if b == 0 || (a == -9223372036854775807 - 1 && b == -1) { return ConstEval { ok: false, val: 0 } }
+        if ssa.is_unsigned_int_ty(&types, op_ty) { return ConstEval { ok: true, val: i64(u64(a) % u64(b)) } }
+        return ConstEval { ok: true, val: a % b }
+    }
+    if op == hb.BINOP_EQ { return ConstEval { ok: true, val: if a == b { 1 } else { 0 } } }
+    if op == hb.BINOP_NE { return ConstEval { ok: true, val: if a != b { 1 } else { 0 } } }
+    if ssa.is_unsigned_int_ty(&types, op_ty) {
+        ua := u64(a); ub := u64(b)
+        if op == hb.BINOP_LT { return ConstEval { ok: true, val: if ua < ub { 1 } else { 0 } } }
+        if op == hb.BINOP_LE { return ConstEval { ok: true, val: if ua <= ub { 1 } else { 0 } } }
+        if op == hb.BINOP_GT { return ConstEval { ok: true, val: if ua > ub { 1 } else { 0 } } }
+        if op == hb.BINOP_GE { return ConstEval { ok: true, val: if ua >= ub { 1 } else { 0 } } }
+    } else {
+        if op == hb.BINOP_LT { return ConstEval { ok: true, val: if a < b { 1 } else { 0 } } }
+        if op == hb.BINOP_LE { return ConstEval { ok: true, val: if a <= b { 1 } else { 0 } } }
+        if op == hb.BINOP_GT { return ConstEval { ok: true, val: if a > b { 1 } else { 0 } } }
+        if op == hb.BINOP_GE { return ConstEval { ok: true, val: if a >= b { 1 } else { 0 } } }
+    }
+    ConstEval { ok: false, val: 0 }
+}
+
+fn gvn_walk(f: &mut ssa.SsaFunc, types: &ht.TypeTable, dom: &ssa.DomTree, ctx: &mut GvnCtx, bb: i32) {
+    saved_entries := ctx.entries.len
+    saved_epoch := ctx.mem_epoch
+
+    // Conservative epoch bump on join blocks (pred_len > 1) in case a loop/branch mutated an Array
+    if f.blocks[bb].pred_len > 1 {
+        ctx.mem_epoch += 1
+    }
+
+    is0 := f.blocks[bb].inst_start
+    in0 := f.blocks[bb].inst_len
+    for idx in 0..in0 {
+        iid := f.block_insts[is0 + idx]
+        rewrite_inst_uses(&mut f, iid, &ctx.rep)
+        ins := f.insts[iid]
+        k := ins.kind
+
+        if k == .Store || k == .MemCopy || k == .MemZero {
+            // Only bump array-len epoch if storing to an Array / indirect pointer (not a local scalar)
+            if ins.aux < 0 || (ins.aux < f.slots.len && types.entries[f.slots[ins.aux].ty].kind == .Array) {
+                ctx.mem_epoch += 1
+            }
+            continue
+        }
+
+        if k == .Copy {
+            ctx.rep[ins.res] = ins.op_a
+            f.insts[iid].kind = .Nop
+            f.insts[iid].res = -1
+            ctx.changed = true
+            continue
+        }
+
+        if k == .ConstInt {
+            ctx.has_const[ins.res] = true
+            ctx.const_val[ins.res] = ins.imm_i64
+        } else if k == .FatMake {
+            ctx.fat_ptr_of[ins.res] = ins.op_a
+            ctx.fat_len_of[ins.res] = ins.op_b
+        } else if k == .FatPtr {
+            if ins.op_a >= 0 && ctx.fat_ptr_of[ins.op_a] >= 0 && f.vals[ctx.fat_ptr_of[ins.op_a]].ty == ins.ty {
+                ctx.rep[ins.res] = ctx.fat_ptr_of[ins.op_a]
+                f.insts[iid].kind = .Nop
+                f.insts[iid].res = -1
+                ctx.changed = true
+                continue
+            }
+        } else if k == .FatLen {
+            if ins.op_a >= 0 && ctx.fat_len_of[ins.op_a] >= 0 && f.vals[ctx.fat_len_of[ins.op_a]].ty == ins.ty {
+                ctx.rep[ins.res] = ctx.fat_len_of[ins.op_a]
+                f.insts[iid].kind = .Nop
+                f.insts[iid].res = -1
+                ctx.changed = true
+                continue
+            }
+        } else if k == .Cast {
+            if ins.op_a >= 0 && f.vals[ins.op_a].ty == ins.ty {
+                ctx.rep[ins.res] = ins.op_a
+                f.insts[iid].kind = .Nop
+                f.insts[iid].res = -1
+                ctx.changed = true
+                continue
+            }
+            if ins.op_a >= 0 && ctx.has_const[ins.op_a] &&
+                (ssa.is_int_ty(&types, ins.ty) || ins.ty == ht.TY_BOOL) &&
+                (ssa.is_int_ty(&types, f.vals[ins.op_a].ty) || f.vals[ins.op_a].ty == ht.TY_BOOL) {
+                cv: i64 = if ins.ty == ht.TY_BOOL { if ctx.const_val[ins.op_a] != 0 { i64(1) } else { i64(0) } } else { ctx.const_val[ins.op_a] }
+                f.insts[iid].kind = .ConstInt
+                f.insts[iid].op_a = -1
+                f.insts[iid].aux_ty = -1
+                f.insts[iid].imm_i64 = cv
+                ctx.has_const[ins.res] = true
+                ctx.const_val[ins.res] = cv
+                ctx.changed = true
+            }
+        } else if k == .Unary {
+            if ins.op_a >= 0 && ctx.has_const[ins.op_a] {
+                av := ctx.const_val[ins.op_a]
+                mut folded := av
+                mut did := false
+                if ins.aux == hb.UNOP_NEG && ssa.is_int_ty(&types, ins.ty) {
+                    folded = 0 - av; did = true
+                } else if ins.aux == hb.UNOP_NOT && ins.ty == ht.TY_BOOL {
+                    folded = if av == 0 { 1 } else { 0 }; did = true
+                } else if ins.aux == hb.UNOP_BIT_NOT && ssa.is_int_ty(&types, ins.ty) {
+                    folded = av.bit_not(); did = true
+                }
+                if did {
+                    f.insts[iid].kind = .ConstInt
+                    f.insts[iid].op_a = -1
+                    f.insts[iid].aux = 0
+                    f.insts[iid].imm_i64 = folded
+                    ctx.has_const[ins.res] = true
+                    ctx.const_val[ins.res] = folded
+                    ctx.changed = true
+                }
+            }
+        } else if k == .Binary {
+            aty := f.vals[ins.op_a].ty
+            if (ssa.is_int_ty(&types, aty) || aty == ht.TY_BOOL) &&
+                ctx.has_const[ins.op_a] && ctx.has_const[ins.op_b] {
+                ev := eval_const_binary(&types, ins.aux, aty, ctx.const_val[ins.op_a], ctx.const_val[ins.op_b])
+                if ev.ok {
+                    f.insts[iid].kind = .ConstInt
+                    f.insts[iid].op_a = -1
+                    f.insts[iid].op_b = -1
+                    f.insts[iid].aux = 0
+                    f.insts[iid].imm_i64 = ev.val
+                    ctx.has_const[ins.res] = true
+                    ctx.const_val[ins.res] = ev.val
+                    ctx.changed = true
+                }
+            } else if ssa.is_int_ty(&types, aty) {
+                // Algebraic identities
+                if ins.aux == hb.BINOP_ADD && ctx.has_const[ins.op_b] && ctx.const_val[ins.op_b] == 0 {
+                    ctx.rep[ins.res] = ins.op_a; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+                }
+                if ins.aux == hb.BINOP_ADD && ctx.has_const[ins.op_a] && ctx.const_val[ins.op_a] == 0 {
+                    ctx.rep[ins.res] = ins.op_b; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+                }
+                if ins.aux == hb.BINOP_SUB && ctx.has_const[ins.op_b] && ctx.const_val[ins.op_b] == 0 {
+                    ctx.rep[ins.res] = ins.op_a; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+                }
+                if ins.aux == hb.BINOP_MUL && ctx.has_const[ins.op_b] && ctx.const_val[ins.op_b] == 1 {
+                    ctx.rep[ins.res] = ins.op_a; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+                }
+                if ins.aux == hb.BINOP_MUL && ctx.has_const[ins.op_a] && ctx.const_val[ins.op_a] == 1 {
+                    ctx.rep[ins.res] = ins.op_b; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+                }
+                if ins.op_a == ins.op_b {
+                    if ins.aux == hb.BINOP_EQ || ins.aux == hb.BINOP_LE || ins.aux == hb.BINOP_GE {
+                        f.insts[iid].kind = .ConstInt; f.insts[iid].op_a = -1; f.insts[iid].op_b = -1
+                        f.insts[iid].aux = 0; f.insts[iid].imm_i64 = 1
+                        ctx.has_const[ins.res] = true; ctx.const_val[ins.res] = 1; ctx.changed = true
+                    } else if ins.aux == hb.BINOP_NE || ins.aux == hb.BINOP_LT || ins.aux == hb.BINOP_GT {
+                        f.insts[iid].kind = .ConstInt; f.insts[iid].op_a = -1; f.insts[iid].op_b = -1
+                        f.insts[iid].aux = 0; f.insts[iid].imm_i64 = 0
+                        ctx.has_const[ins.res] = true; ctx.const_val[ins.res] = 0; ctx.changed = true
+                    }
+                }
+            }
+        } else if k == .Select {
+            if ins.op_b == ins.op_c {
+                ctx.rep[ins.res] = ins.op_b; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+            }
+            if ctx.has_const[ins.op_a] {
+                chosen := if ctx.const_val[ins.op_a] != 0 { ins.op_b } else { ins.op_c }
+                ctx.rep[ins.res] = chosen; f.insts[iid].kind = .Nop; f.insts[iid].res = -1; ctx.changed = true; continue
+            }
+        }
+
+        // GVN deduplication of pure ops in dominating scope
+        cur := f.insts[iid]
+        if is_gvn_eligible(cur.kind) && cur.res >= 0 {
+            mut epoch := 0
+            if cur.kind == .Len && cur.aux_ty >= 0 && cur.aux_ty < types.entries.len &&
+                types.entries[cur.aux_ty].kind == .Array {
+                epoch = ctx.mem_epoch
+            }
+            // Canonicalize commutative Binary ops (ADD, MUL, EQ, NE)
+            mut ka := cur.op_a
+            mut kb := cur.op_b
+            if cur.kind == .Binary && (cur.aux == hb.BINOP_ADD || cur.aux == hb.BINOP_MUL ||
+                cur.aux == hb.BINOP_EQ || cur.aux == hb.BINOP_NE) && ka > kb {
+                tmp := ka; ka = kb; kb = tmp
+            }
+            existing := find_gvn(&ctx, cur.kind, cur.ty, cur.aux, cur.aux_ty, cur.imm_i64, ka, kb, cur.op_c, epoch)
+            if existing >= 0 {
+                ctx.rep[cur.res] = existing
+                f.insts[iid].kind = .Nop
+                f.insts[iid].res = -1
+                ctx.changed = true
+            } else {
+                ctx.entries.push(GvnEntry {
+                    kind: cur.kind, ty: cur.ty, aux: cur.aux, aux_ty: cur.aux_ty,
+                    imm_i64: cur.imm_i64, op_a: ka, op_b: kb, op_c: cur.op_c,
+                    epoch: epoch, val_id: cur.res,
+                })
+            }
+        }
+    }
+
+    rewrite_term_uses(&mut f, f.blocks[bb].term_id, &ctx.rep)
+
+    // If terminator is a call, bump epoch for dominated children
+    tid := f.blocks[bb].term_id
+    if tid >= 0 {
+        tk := f.terms[tid].kind
+        if tk == .Call || tk == .IndirectCall || tk == .ExternCall || tk == .IntrinsicCall {
+            ctx.mem_epoch += 1
+        }
+    }
+
+    cs := dom.dom_child_start[bb]
+    cl := dom.dom_child_len[bb]
+    for ci in 0..cl {
+        gvn_walk(&mut f, &types, &dom, &mut ctx, dom.dom_children[cs + ci])
+    }
+
+    while ctx.entries.len > saved_entries { _ := ctx.entries.pop() }
+    ctx.mem_epoch = saved_epoch
+}
+
+pub fn pass_gvn_const_fold(types: &ht.TypeTable, f: &mut ssa.SsaFunc) -> bool {
+    if f.blocks.len == 0 { return false }
+    dom := ssa.compute_doms(&f)
+    nv := f.vals.len
+    mut rep: []i32 = []
+    mut has_c: []bool = []
+    mut c_val: []i64 = []
+    mut fp: []i32 = []
+    mut fl: []i32 = []
+    for _ in 0..nv {
+        rep.push(-1); has_c.push(false); c_val.push(0); fp.push(-1); fl.push(-1)
+    }
+    mut ctx := GvnCtx {
+        rep: move rep,
+        has_const: move has_c,
+        const_val: move c_val,
+        fat_ptr_of: move fp,
+        fat_len_of: move fl,
+        entries: [],
+        mem_epoch: 0,
+        changed: false,
+    }
+    gvn_walk(&mut f, &types, &dom, &mut ctx, 0)
+    if ctx.changed {
+        compact_nops(&mut f)
+    }
+    ctx.changed
+}
+
+// =========================================================================
+// Pass 4 — Bounds & Overflow Check Elision
+// =========================================================================
+
+// Facts tracked along dominator tree:
+// kind 0: BoundsCheck(a, b, mode=0 -> 0 <= a < b)
+// kind 1: BoundsCheck(a, b, mode=1 -> 0 <= a <= b)
+// kind 2: a < b (signed/unsigned matching type)
+// kind 3: a >= 0 (non-negative)
+struct CheckFact {
+    kind: i32,
+    a: i32,
+    b: i32,
+}
+
+struct ElideCtx {
+    has_const: []bool,
+    const_val: []i64,
+    non_neg: []bool,    // provably >= 0 globally (unsigned, ConstInt >= 0, or monotonic 0..N loop IV)
+    facts: []CheckFact,
+    changed: bool,
+}
+
+fn has_fact(ctx: &ElideCtx, kind: i32, a: i32, b: i32) -> bool {
+    mut i := ctx.facts.len - 1
+    while i >= 0 {
+        ft := ctx.facts[i]
+        if ft.kind == kind && ft.a == a && ft.b == b { return true }
+        i -= 1
+    }
+    false
+}
+
+fn is_non_neg(ctx: &ElideCtx, v: i32) -> bool {
+    if v < 0 || v >= ctx.non_neg.len { return false }
+    if ctx.non_neg[v] { return true }
+    has_fact(&ctx, 3, v, -1)
+}
+
+fn check_int_const_no_overflow(types: &ht.TypeTable, ty: i32, op: i32, a: i64, b: i64) -> bool {
+    // Safe range check for common small constants in i32/i64/u32/u64
+    if op == hb.BINOP_DIV || op == hb.BINOP_MOD {
+        if b == 0 { return false }
+        if !ssa.is_unsigned_int_ty(&types, ty) && a == -9223372036854775807 - 1 && b == -1 { return false }
+        return true
+    }
+    if ty == ht.TY_I32 {
+        min32: i64 = -2147483648
+        max32: i64 = 2147483647
+        if op == hb.BINOP_ADD { r := a + b; return r >= min32 && r <= max32 }
+        if op == hb.BINOP_SUB { r := a - b; return r >= min32 && r <= max32 }
+        if op == hb.BINOP_MUL {
+            if a >= -46340 && a <= 46340 && b >= -46340 && b <= 46340 {
+                r := a * b
+                return r >= min32 && r <= max32
+            }
+        }
+    } else if ty == ht.TY_I64 {
+        half: i64 = 4611686018427387903
+        if op == hb.BINOP_ADD { return a >= -half && a <= half && b >= -half && b <= half }
+        if op == hb.BINOP_SUB { return a >= -half && a <= half && b >= -half && b <= half }
+        if op == hb.BINOP_MUL { return a >= -2147483647 && a <= 2147483647 && b >= -2147483647 && b <= 2147483647 }
+    }
+    false
+}
+
+fn elide_walk(f: &mut ssa.SsaFunc, types: &ht.TypeTable, dom: &ssa.DomTree, ctx: &mut ElideCtx, bb: i32) {
+    saved := ctx.facts.len
+
+    // Extract branch-condition facts from immediate dominator if `bb` has sole pred `idom[bb]`!
+    if bb != 0 && f.blocks[bb].pred_len == 1 {
+        p := f.preds[f.blocks[bb].pred_start]
+        ptid := f.blocks[p].term_id
+        if ptid >= 0 && f.terms[ptid].kind == .Branch {
+            ptm := f.terms[ptid]
+            cv := ptm.cond_val
+            if cv >= 0 && f.vals[cv].def_inst >= 0 {
+                cins := f.insts[f.vals[cv].def_inst]
+                if cins.kind == .Binary {
+                    if ptm.target_a == bb && ptm.target_b != bb {
+                        // True branch!
+                        if cins.aux == hb.BINOP_LT {
+                            ctx.facts.push(CheckFact { kind: 2, a: cins.op_a, b: cins.op_b })
+                        } else if cins.aux == hb.BINOP_GT {
+                            ctx.facts.push(CheckFact { kind: 2, a: cins.op_b, b: cins.op_a })
+                        } else if cins.aux == hb.BINOP_GE && ctx.has_const[cins.op_b] && ctx.const_val[cins.op_b] >= 0 {
+                            ctx.facts.push(CheckFact { kind: 3, a: cins.op_a, b: -1 })
+                        } else if cins.aux == hb.BINOP_LE && ctx.has_const[cins.op_a] && ctx.const_val[cins.op_a] >= 0 {
+                            ctx.facts.push(CheckFact { kind: 3, a: cins.op_b, b: -1 })
+                        }
+                    } else if ptm.target_b == bb && ptm.target_a != bb {
+                        // False branch!
+                        if cins.aux == hb.BINOP_GE {
+                            ctx.facts.push(CheckFact { kind: 2, a: cins.op_a, b: cins.op_b })
+                        } else if cins.aux == hb.BINOP_LE {
+                            ctx.facts.push(CheckFact { kind: 2, a: cins.op_b, b: cins.op_a })
+                        } else if cins.aux == hb.BINOP_LT && ctx.has_const[cins.op_b] && ctx.const_val[cins.op_b] >= 0 {
+                            ctx.facts.push(CheckFact { kind: 3, a: cins.op_a, b: -1 })
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    is0 := f.blocks[bb].inst_start
+    in0 := f.blocks[bb].inst_len
+    for idx in 0..in0 {
+        iid := f.block_insts[is0 + idx]
+        ins := f.insts[iid]
+
+        if ins.kind == .BoundsCheck {
+            a := ins.op_a
+            b := ins.op_b
+            mode := ins.aux
+            mut elide := false
+
+            // 1. Constant bounds check
+            if ctx.has_const[a] && ctx.has_const[b] {
+                av := ctx.const_val[a]
+                bv := ctx.const_val[b]
+                if mode == ssa.BOUNDS_LT && av >= 0 && av < bv { elide = true }
+                if mode == ssa.BOUNDS_LE && av >= 0 && av <= bv { elide = true }
+            }
+            // 2. Dominating BoundsCheck
+            if !elide && has_fact(&ctx, 0, a, b) { elide = true }
+            if !elide && mode == ssa.BOUNDS_LE && has_fact(&ctx, 1, a, b) { elide = true }
+
+            // 3. Dominating `a < b` (or Cast(a) < b) AND `a >= 0` (e.g. `for i in 0..arr.len`)!
+            if !elide {
+                // Check exact match or widening Cast(a0)
+                mut a_cand := a
+                if a >= 0 && f.vals[a].def_inst >= 0 && f.insts[f.vals[a].def_inst].kind == .Cast {
+                    a_cand = f.insts[f.vals[a].def_inst].op_a
+                }
+                mut b_cand := b
+                if b >= 0 && f.vals[b].def_inst >= 0 && f.insts[f.vals[b].def_inst].kind == .Cast {
+                    b_cand = f.insts[f.vals[b].def_inst].op_a
+                }
+                lt_ok := has_fact(&ctx, 2, a, b) || has_fact(&ctx, 2, a_cand, b) ||
+                    has_fact(&ctx, 2, a, b_cand) || has_fact(&ctx, 2, a_cand, b_cand)
+                if !lt_ok && b >= 0 && f.vals[b].def_inst >= 0 && f.insts[f.vals[b].def_inst].kind == .Len {
+                    // Also check if loop limit was another Len/FatLen of the same container or Cast of it
+                    len_op := f.insts[f.vals[b].def_inst].op_a
+                    for fi in 0..ctx.facts.len {
+                        ft := ctx.facts[fi]
+                        if ft.kind == 2 && (ft.a == a || ft.a == a_cand) && ft.b >= 0 && f.vals[ft.b].def_inst >= 0 {
+                            bins := f.insts[f.vals[ft.b].def_inst]
+                            if (bins.kind == .Len || bins.kind == .FatLen) && bins.op_a == len_op {
+                                if is_non_neg(&ctx, a) || is_non_neg(&ctx, a_cand) { elide = true; break }
+                            }
+                        }
+                    }
+                }
+                if !elide && lt_ok && (is_non_neg(&ctx, a) || is_non_neg(&ctx, a_cand)) {
+                    elide = true
+                }
+            }
+
+            if elide {
+                f.insts[iid].kind = .Nop
+                ctx.changed = true
+            } else {
+                ctx.facts.push(CheckFact { kind: mode, a: a, b: b })
+            }
+        } else if ins.kind == .OverflowCheck {
+            a := ins.op_a
+            b := ins.op_b
+            op := ins.aux
+            ty := f.vals[a].ty
+            mut elide := false
+
+            // 1. Both operands constant and provably in range
+            if ctx.has_const[a] && ctx.has_const[b] && check_int_const_no_overflow(&types, ty, op, ctx.const_val[a], ctx.const_val[b]) {
+                elide = true
+            }
+            // 2. Monotonic induction increment `a + 1` where dominating `a < limit` holds!
+            //    Since a < limit <= MAX_T, a + 1 <= limit <= MAX_T, so zero overflow!
+            if !elide && op == hb.BINOP_ADD && ctx.has_const[b] && ctx.const_val[b] == 1 {
+                for fi in 0..ctx.facts.len {
+                    ft := ctx.facts[fi]
+                    if ft.kind == 2 && ft.a == a && ft.b >= 0 && f.vals[ft.b].ty == ty {
+                        elide = true
+                        break
+                    }
+                }
+            }
+            if elide {
+                f.insts[iid].kind = .Nop
+                ctx.changed = true
+            }
+        }
+    }
+
+    cs := dom.dom_child_start[bb]
+    cl := dom.dom_child_len[bb]
+    for ci in 0..cl {
+        elide_walk(&mut f, &types, &dom, &mut ctx, dom.dom_children[cs + ci])
+    }
+
+    while ctx.facts.len > saved { _ := ctx.facts.pop() }
+}
+
+pub fn pass_check_elision(types: &ht.TypeTable, f: &mut ssa.SsaFunc) -> bool {
+    if f.blocks.len == 0 { return false }
+    dom := ssa.compute_doms(&f)
+    nv := f.vals.len
+    mut has_c: []bool = []
+    mut c_val: []i64 = []
+    mut non_neg: []bool = []
+    for v in 0..nv {
+        has_c.push(false)
+        c_val.push(0)
+        non_neg.push(ssa.is_unsigned_int_ty(&types, f.vals[v].ty))
+    }
+
+    // Collect constant ints, Len/FatLen (>= 0), and monotonic induction block params (init >= 0, step = iv + k with k >= 0)!
+    for bb in 0..f.blocks.len {
+        is0 := f.blocks[bb].inst_start
+        in0 := f.blocks[bb].inst_len
+        for i in 0..in0 {
+            ins := f.insts[f.block_insts[is0 + i]]
+            if ins.kind == .ConstInt && ins.res >= 0 {
+                has_c[ins.res] = true
+                c_val[ins.res] = ins.imm_i64
+                if ins.imm_i64 >= 0 { non_neg[ins.res] = true }
+            } else if (ins.kind == .Len || ins.kind == .FatLen) && ins.res >= 0 {
+                non_neg[ins.res] = true
+            }
+        }
+    }
+
+    // Detect non-negative loop induction block params:
+    // For each block param `p` of `bb`, if every incoming edge arg is EITHER:
+    //   - provably non-negative (`non_neg[arg]`), OR
+    //   - `Binary(p, ConstInt(step >= 0), BINOP_ADD)`
+    // then `p` is provably >= 0!
+    mut iv_changed := true
+    while iv_changed {
+        iv_changed = false
+        for ri in 0..dom.rpo_order.len {
+            bb := dom.rpo_order[ri]
+            ps := f.blocks[bb].params_start
+            pn := f.blocks[bb].params_len
+            if pn == 0 { continue }
+            preds_s := f.blocks[bb].pred_start
+            preds_n := f.blocks[bb].pred_len
+            if preds_n == 0 { continue }
+            for pi in 0..pn {
+                pv := f.block_params[ps + pi]
+                if non_neg[pv] { continue }
+                mut all_ok := true
+                for k in 0..preds_n {
+                    pr := f.preds[preds_s + k]
+                    if dom.idom[pr] < 0 { continue }
+                    ptm := f.terms[f.blocks[pr].term_id]
+                    mut edge_v := -1
+                    if ptm.kind == .Goto && ptm.target_a == bb {
+                        edge_v = f.val_args[ptm.arg_start + pi]
+                    } else if ptm.kind == .Branch {
+                        if ptm.target_a == bb { edge_v = f.val_args[ptm.arg_start + pi] }
+                        else if ptm.target_b == bb { edge_v = f.val_args[ptm.arg2_start + pi] }
+                    }
+                    if edge_v < 0 { all_ok = false; break }
+                    if non_neg[edge_v] { continue }
+                    // Check if edge_v == Binary(pv, ConstInt(>= 0), ADD)
+                    di := f.vals[edge_v].def_inst
+                    if di >= 0 && f.insts[di].kind == .Binary && f.insts[di].aux == hb.BINOP_ADD &&
+                        f.insts[di].op_a == pv && f.insts[di].op_b >= 0 &&
+                        has_c[f.insts[di].op_b] && c_val[f.insts[di].op_b] >= 0 {
+                        continue
+                    }
+                    all_ok = false
+                    break
+                }
+                if all_ok {
+                    non_neg[pv] = true
+                    iv_changed = true
+                }
+            }
+        }
+    }
+
+    mut ctx := ElideCtx {
+        has_const: move has_c,
+        const_val: move c_val,
+        non_neg: move non_neg,
+        facts: [],
+        changed: false,
+    }
+    elide_walk(&mut f, &types, &dom, &mut ctx, 0)
+    if ctx.changed {
+        compact_nops(&mut f)
+    }
+    ctx.changed
+}
+
+// =========================================================================
+// Pass 5 — CFG Simplification & Dead Code Elimination (DCE)
+// =========================================================================
+
+fn remove_unreachable_blocks(f: &mut ssa.SsaFunc) -> bool {
+    n := f.blocks.len
+    if n <= 1 { return false }
+    mut reach: []bool = []
+    for _ in 0..n { reach.push(false) }
+    mut q: []i32 = [0]
+    reach[0] = true
+    mut head := 0
+    mut succs: []i32 = []
+    while head < q.len {
+        bb := q[head]; head += 1
+        ssa.term_succs(&f, bb, &mut succs)
+        for i in 0..succs.len {
+            s := succs[i]
+            if s >= 0 && s < n && !reach[s] {
+                reach[s] = true
+                q.push(s)
+            }
+        }
+    }
+    if q.len == n { return false }
+
+    mut bb_map: []i32 = []
+    mut new_blocks: []ssa.SsaBlock = []
+    for bb in 0..n {
+        if reach[bb] {
+            bb_map.push(new_blocks.len)
+            new_blocks.push(f.blocks[bb])
+        } else {
+            bb_map.push(-1)
+        }
+    }
+    f.blocks = move new_blocks
+
+    // Remap all SsaVal.def_bb and terminator block targets
+    for v in 0..f.vals.len {
+        db := f.vals[v].def_bb
+        if db >= 0 && db < bb_map.len {
+            f.vals[v].def_bb = bb_map[db]
+        }
+    }
+    for bb in 0..f.blocks.len {
+        tid := f.blocks[bb].term_id
+        if tid < 0 { continue }
+        tm := f.terms[tid]
+        if tm.target_a >= 0 && tm.target_a < bb_map.len { f.terms[tid].target_a = bb_map[tm.target_a] }
+        if tm.target_b >= 0 && tm.target_b < bb_map.len { f.terms[tid].target_b = bb_map[tm.target_b] }
+        if tm.kind == .Switch {
+            for ci in 0..tm.case_len {
+                old_t := f.switch_bbs[tm.case_start + ci]
+                if old_t >= 0 && old_t < bb_map.len {
+                    f.switch_bbs[tm.case_start + ci] = bb_map[old_t]
+                }
+            }
+        }
+    }
+    ssa.compute_preds(&mut f)
+    true
+}
+
+fn fold_const_terminators(f: &mut ssa.SsaFunc) -> bool {
+    mut has_c: []bool = []
+    mut c_val: []i64 = []
+    for _ in 0..f.vals.len { has_c.push(false); c_val.push(0) }
+    for bb in 0..f.blocks.len {
+        is0 := f.blocks[bb].inst_start
+        in0 := f.blocks[bb].inst_len
+        for i in 0..in0 {
+            ins := f.insts[f.block_insts[is0 + i]]
+            if ins.kind == .ConstInt && ins.res >= 0 {
+                has_c[ins.res] = true
+                c_val[ins.res] = ins.imm_i64
+            }
+        }
+    }
+
+    mut changed := false
+    for bb in 0..f.blocks.len {
+        tid := f.blocks[bb].term_id
+        if tid < 0 { continue }
+        tm := f.terms[tid]
+        if tm.kind == .Branch {
+            if tm.cond_val >= 0 && has_c[tm.cond_val] {
+                take_then := c_val[tm.cond_val] != 0
+                f.terms[tid].kind = .Goto
+                f.terms[tid].cond_val = -1
+                if !take_then {
+                    f.terms[tid].target_a = tm.target_b
+                    f.terms[tid].arg_start = tm.arg2_start
+                    f.terms[tid].arg_len = tm.arg2_len
+                }
+                f.terms[tid].target_b = -1
+                f.terms[tid].arg2_start = 0
+                f.terms[tid].arg2_len = 0
+                changed = true
+            } else if tm.target_a == tm.target_b && tm.arg_len == tm.arg2_len {
+                mut same_args := true
+                for k in 0..tm.arg_len {
+                    if f.val_args[tm.arg_start + k] != f.val_args[tm.arg2_start + k] {
+                        same_args = false; break
+                    }
+                }
+                if same_args {
+                    f.terms[tid].kind = .Goto
+                    f.terms[tid].cond_val = -1
+                    f.terms[tid].target_b = -1
+                    f.terms[tid].arg2_start = 0
+                    f.terms[tid].arg2_len = 0
+                    changed = true
+                }
+            }
+        } else if tm.kind == .Switch && tm.cond_val >= 0 && has_c[tm.cond_val] {
+            cv := c_val[tm.cond_val]
+            mut target := tm.target_a
+            mut as0 := tm.arg_start
+            mut al0 := tm.arg_len
+            for ci in 0..tm.case_len {
+                if f.switch_vals[tm.case_start + ci] == cv {
+                    target = f.switch_bbs[tm.case_start + ci]
+                    as0 = f.switch_arg_starts[tm.case_start + ci]
+                    al0 = f.switch_arg_lens[tm.case_start + ci]
+                    break
+                }
+            }
+            f.terms[tid].kind = .Goto
+            f.terms[tid].cond_val = -1
+            f.terms[tid].target_a = target
+            f.terms[tid].arg_start = as0
+            f.terms[tid].arg_len = al0
+            f.terms[tid].case_start = 0
+            f.terms[tid].case_len = 0
+            changed = true
+        }
+    }
+    if changed { ssa.compute_preds(&mut f) }
+    changed
+}
+
+fn merge_single_pred_blocks(f: &mut ssa.SsaFunc) -> bool {
+    mut changed := false
+    mut merged_any := true
+    while merged_any {
+        merged_any = false
+        for a in 0..f.blocks.len {
+            tid_a := f.blocks[a].term_id
+            if tid_a < 0 { continue }
+            tma := f.terms[tid_a]
+            if tma.kind != .Goto { continue }
+            b := tma.target_a
+            if b <= 0 || b == a || b >= f.blocks.len { continue }
+            if f.blocks[b].pred_len != 1 { continue }
+
+            // Bind B's block params to A's Goto args
+            if f.blocks[b].params_len > 0 {
+                mut rep: []i32 = []
+                for _ in 0..f.vals.len { rep.push(-1) }
+                for pi in 0..f.blocks[b].params_len {
+                    pv := f.block_params[f.blocks[b].params_start + pi]
+                    av := f.val_args[tma.arg_start + pi]
+                    rep[pv] = av
+                }
+                rewrite_all_uses(&mut f, &rep)
+                f.blocks[b].params_len = 0
+            }
+
+            // Move B's instructions to end of A (updating def_bb to A!)
+            bs := f.blocks[b].inst_start
+            bn := f.blocks[b].inst_len
+            for i in 0..bn {
+                iid := f.block_insts[bs + i]
+                ssa.append_block_inst_id(&mut f, a, iid)
+                if f.insts[iid].res >= 0 {
+                    f.vals[f.insts[iid].res].def_bb = a
+                }
+            }
+            // Move B's terminator to A (updating dest_val.def_bb if Call!)
+            tid_b := f.blocks[b].term_id
+            f.blocks[a].term_id = tid_b
+            if tid_b >= 0 && f.terms[tid_b].dest_val >= 0 {
+                f.vals[f.terms[tid_b].dest_val].def_bb = a
+            }
+            // Disconnect B so remove_unreachable_blocks reclaims it
+            f.blocks[b].inst_len = 0
+            f.blocks[b].term_id = -1
+            ssa.compute_preds(&mut f)
+            _ := remove_unreachable_blocks(&mut f)
+            changed = true
+            merged_any = true
+            break
+        }
+    }
+    changed
+}
+
+fn eliminate_dead_insts_and_slots(f: &mut ssa.SsaFunc) -> bool {
+    mut changed := false
+    mut iter_changed := true
+    while iter_changed {
+        iter_changed = false
+        mut use_cnt: []i32 = []
+        for _ in 0..f.vals.len { use_cnt.push(0) }
+
+        for bb in 0..f.blocks.len {
+            is0 := f.blocks[bb].inst_start
+            in0 := f.blocks[bb].inst_len
+            for i in 0..in0 {
+                ins := f.insts[f.block_insts[is0 + i]]
+                if ins.kind == .Nop { continue }
+                if ins.op_a >= 0 { use_cnt[ins.op_a] += 1 }
+                if ins.op_b >= 0 { use_cnt[ins.op_b] += 1 }
+                if ins.op_c >= 0 { use_cnt[ins.op_c] += 1 }
+                if ins.kind == .ClosureMake {
+                    for ai in 0..ins.arg_len {
+                        v := f.val_args[ins.arg_start + ai]
+                        if v >= 0 { use_cnt[v] += 1 }
+                    }
+                }
+            }
+            tid := f.blocks[bb].term_id
+            if tid >= 0 {
+                tm := f.terms[tid]
+                if tm.cond_val >= 0 { use_cnt[tm.cond_val] += 1 }
+                if tm.env_val >= 0 { use_cnt[tm.env_val] += 1 }
+                for ai in 0..tm.arg_len {
+                    v := f.val_args[tm.arg_start + ai]
+                    if v >= 0 { use_cnt[v] += 1 }
+                }
+                for ai in 0..tm.arg2_len {
+                    v := f.val_args[tm.arg2_start + ai]
+                    if v >= 0 { use_cnt[v] += 1 }
+                }
+                if tm.kind == .Switch {
+                    for ci in 0..tm.case_len {
+                        as0 := f.switch_arg_starts[tm.case_start + ci]
+                        al0 := f.switch_arg_lens[tm.case_start + ci]
+                        for ai in 0..al0 {
+                            v := f.val_args[as0 + ai]
+                            if v >= 0 { use_cnt[v] += 1 }
+                        }
+                    }
+                }
+            }
+        }
+
+        for bb in 0..f.blocks.len {
+            is0 := f.blocks[bb].inst_start
+            in0 := f.blocks[bb].inst_len
+            for i in 0..in0 {
+                iid := f.block_insts[is0 + i]
+                ins := f.insts[iid]
+                if ssa.inst_is_pure(ins.kind) && ins.res >= 0 && use_cnt[ins.res] == 0 {
+                    f.insts[iid].kind = .Nop
+                    f.insts[iid].res = -1
+                    iter_changed = true
+                    changed = true
+                }
+            }
+        }
+    }
+    if changed { compact_nops(&mut f) }
+
+    // Mark completely unreferenced StackSlots as dead
+    mut slot_used: []bool = []
+    for _ in 0..f.slots.len { slot_used.push(false) }
+    for bb in 0..f.blocks.len {
+        is0 := f.blocks[bb].inst_start
+        in0 := f.blocks[bb].inst_len
+        for i in 0..in0 {
+            ins := f.insts[f.block_insts[is0 + i]]
+            if (ins.kind == .SlotAddr || ins.kind == .Load || ins.kind == .Store) &&
+                ins.aux >= 0 && ins.aux < slot_used.len {
+                slot_used[ins.aux] = true
+            }
+        }
+    }
+    for s in 0..f.slots.len {
+        if !f.slots[s].dead && !slot_used[s] {
+            f.slots[s].dead = true
+            changed = true
+        }
+    }
+    changed
+}
+
+pub fn pass_cfg_dce(f: &mut ssa.SsaFunc) -> bool {
+    mut changed := false
+    if fold_const_terminators(&mut f) { changed = true }
+    if remove_unreachable_blocks(&mut f) { changed = true }
+    if merge_single_pred_blocks(&mut f) { changed = true }
+    if eliminate_dead_insts_and_slots(&mut f) { changed = true }
+    changed
+}
+
+// =========================================================================
+// Unified Pass Manager Entry Points (`optimize_func`, `optimize_program`)
+// =========================================================================
+
+pub fn optimize_func(types: &ht.TypeTable, f: &mut ssa.SsaFunc, verify_each: bool, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { return false }
+
+    // Pass 1: Mem2Reg / SROA
+    _ := pass_mem2reg(&types, &mut f)
+    if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+
+    // Pass 3: GVN, Constant Folding & Copy Propagation
+    _ := pass_gvn_const_fold(&types, &mut f)
+    if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+
+    // Pass 4: Bounds & Overflow Check Elision
+    _ := pass_check_elision(&types, &mut f)
+    if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+
+    // Pass 5: CFG Simplification & DCE
+    _ := pass_cfg_dce(&mut f)
+    if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+
+    // Second quick GVN + Check Elision + CFG/DCE cleanup after CFG merge
+    if pass_gvn_const_fold(&types, &mut f) {
+        if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+        _ := pass_check_elision(&types, &mut f)
+        if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+        _ := pass_cfg_dce(&mut f)
+        if verify_each && !ssa_verify.verify_func(&types, &f, &mut diags) { ok = false }
+    }
+
+    ok
+}
+
+pub fn optimize_program(types: &ht.TypeTable, prog: &mut ssa.SsaProgram, verify_each: bool, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if verify_each && !ssa_verify.verify_program(&types, &prog, &mut diags) { return false }
+
+    // Stage A: Per-function Mem2Reg before inlining (shrinks callees & simplifies signatures!)
+    for i in 0..prog.funcs.len {
+        _ := pass_mem2reg(&types, &mut prog.funcs[i])
+        if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+    }
+
+    // Stage B: Pass 2 — Unified SSA MIR Inliner
+    inlined := pass_inline(&types, &mut prog)
+    if verify_each && !ssa_verify.verify_program(&types, &prog, &mut diags) { ok = false }
+
+    // Stage C: Per-function full SSA optimization pipeline (re-run Mem2Reg if inlining introduced new slots!)
+    for i in 0..prog.funcs.len {
+        if inlined {
+            _ := pass_mem2reg(&types, &mut prog.funcs[i])
+            if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+        }
+        _ := pass_gvn_const_fold(&types, &mut prog.funcs[i])
+        if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+
+        _ := pass_check_elision(&types, &mut prog.funcs[i])
+        if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+
+        _ := pass_cfg_dce(&mut prog.funcs[i])
+        if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+
+        // Post-CFG-merge polish
+        if pass_gvn_const_fold(&types, &mut prog.funcs[i]) {
+            if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+            _ := pass_check_elision(&types, &mut prog.funcs[i])
+            if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+            _ := pass_cfg_dce(&mut prog.funcs[i])
+            if verify_each && !ssa_verify.verify_func(&types, &prog.funcs[i], &mut diags) { ok = false }
+        }
+    }
+
+    ok
+}

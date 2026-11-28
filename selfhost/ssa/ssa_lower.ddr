@@ -1,0 +1,813 @@
+// Clean lowering from Post-Drop HL-MIR (`mir2.MirBody` with `post_drop == true` + `hir_body.HirProgram`)
+// to Target-Independent Typed SSA MIR (`ssa_ir.SsaFunc` / `ssa_ir.SsaProgram`).
+// Verified automatically by `ssa_verify`.
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..mir2.mir_body as mb
+import ssa_ir as ssa
+import ssa_verify
+
+struct LowerCtx {
+    f: ssa.SsaFunc,
+    mir_pred_counts: []i32,
+}
+
+fn is_sret_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    if te.kind == .Struct || te.kind == .Tuple || te.kind == .Union || te.kind == .FixedArr || te.kind == .Enum {
+        limit := if ht.word_size(types.platform) == 4 { 8 } else { 16 }
+        return te.size > limit
+    }
+    false
+}
+
+fn elem_stride(types: &ht.TypeTable, elem_ty: i32) -> i64 {
+    if elem_ty < 0 || elem_ty >= types.entries.len { return 8 }
+    sz := types.entries[elem_ty].size
+    al := if types.entries[elem_ty].align > 0 { types.entries[elem_ty].align } else { 1 }
+    rem := sz % al
+    i64(if rem == 0 { sz } else { sz + (al - rem) })
+}
+
+fn enum_payload_offset(types: &ht.TypeTable, enum_ty: i32, var_idx: i32, field_idx: i32) -> i64 {
+    te := &types.entries[enum_ty]
+    al := if te.align > 0 { te.align } else { 4 }
+    rem := 4 % al
+    tag_aligned := if rem == 0 { 4 } else { 4 + (al - rem) }
+    v := &types.variants[te.inner_a + var_idx]
+    f := &types.fields[v.payload_start + field_idx]
+    i64(tag_aligned + f.offset)
+}
+
+fn struct_field_offset(types: &ht.TypeTable, agg_ty: i32, field_idx: i32) -> i64 {
+    te := &types.entries[agg_ty]
+    if field_idx < 0 || field_idx >= te.count { return 0 }
+    i64(types.fields[te.inner_a + field_idx].offset)
+}
+
+fn operand_ty(body: &mb.MirBody, op_id: i32) -> i32 {
+    op := body.ops[op_id]
+    if op.kind == .Const { return body.consts[op.id].ty }
+    body.places[op.id].ty
+}
+
+// Compute the memory address of a MirPlace inside `bb`.
+// If `escape_slot` is true (e.g. Ref / AddrOf / non-whole-slot access), marks the base StackSlot `addr_taken`.
+fn is_value_indexable_kind(k: ht.TypeKind) -> bool {
+    k == .FatSlice || k == .RegionSlice || k == .FatStr || k == .Array || k == .String
+}
+
+fn lower_place_addr(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, place_id: i32, escape_slot: bool, span_s: i32, span_e: i32) -> i32 {
+    p := body.places[place_id]
+    base_ty := body.locals[p.local].ty
+    base_k := types.entries[base_ty].kind
+    first_is_deref := p.proj_len > 0 && body.projs[p.proj_start].kind == .Deref
+    first_is_val_index := p.proj_len > 0 && body.projs[p.proj_start].kind == .Index && is_value_indexable_kind(base_k)
+
+    if escape_slot || (p.proj_len > 0 && !first_is_deref && !first_is_val_index) {
+        ctx.f.slots[p.local].addr_taken = true
+    }
+
+    mut cur_ty := base_ty
+    mut addr := -1
+    mut start_i := 0
+    if first_is_deref {
+        // Load pointer value directly from the local slot (doesn't take local's address!)
+        saddr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+        addr = ssa.emit_load(&mut ctx.f, bb, cur_ty, saddr, 0, p.local, span_s, span_e)
+        cur_ty = types.entries[cur_ty].inner_a
+        start_i = 1
+    } else if !first_is_val_index {
+        addr = ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+    }
+
+    mut downcast_var := -1
+    for i in start_i..p.proj_len {
+        pr := body.projs[p.proj_start + i]
+        if pr.kind == .Deref {
+            // Load the reference/pointer stored at `addr`
+            addr = ssa.emit_load(&mut ctx.f, bb, cur_ty, addr, 0, -1, span_s, span_e)
+            cur_ty = types.entries[cur_ty].inner_a
+            downcast_var = -1
+        } else if pr.kind == .Downcast {
+            downcast_var = pr.index
+        } else if pr.kind == .Field {
+            mut f_off: i64 = 0
+            mut next_ty := cur_ty
+            mut enc_idx := pr.index
+            if downcast_var >= 0 {
+                f_off = enum_payload_offset(&types, cur_ty, downcast_var, pr.index)
+                next_ty = ht.variant_payload_type(&types, cur_ty, downcast_var, pr.index)
+                enc_idx = downcast_var * 65536 + pr.index
+                downcast_var = -1
+            } else {
+                f_off = struct_field_offset(&types, cur_ty, pr.index)
+                next_ty = ht.field_type(&types, cur_ty, pr.index)
+            }
+            addr = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .FieldAddr, ht.TY_PTR, addr, -1, -1, enc_idx, cur_ty, f_off, -1, 0, 0, span_s, span_e))
+            cur_ty = next_ty
+        } else if pr.kind == .Index {
+            // Load index value from `pr.index` local
+            idx_local := pr.index
+            idx_ty := body.locals[idx_local].ty
+            idx_slot_addr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, idx_local, 0, span_s, span_e)
+            mut idx_val := ssa.emit_load(&mut ctx.f, bb, idx_ty, idx_slot_addr, 0, idx_local, span_s, span_e)
+            // Unwrap &i32 / &mut i32 index if needed
+            if idx_ty >= 0 && idx_ty < types.entries.len &&
+                (types.entries[idx_ty].kind == .Ref || types.entries[idx_ty].kind == .MutRef) {
+                inner_i := types.entries[idx_ty].inner_a
+                idx_val = ssa.emit_load(&mut ctx.f, bb, inner_i, idx_val, 0, -1, span_s, span_e)
+            }
+
+            // Load container value/length and emit explicit BoundsCheck + IndexAddr
+            ck := types.entries[cur_ty].kind
+            len_ty := ctx.f.vals[idx_val].ty
+            mut len_val := -1
+            mut data_ptr := addr
+            mut elem_ty := ht.TY_U8
+            if ck == .FatSlice || ck == .RegionSlice || ck == .FatStr {
+                fat_v := if i == 0 && first_is_val_index {
+                    sa0 := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+                    ssa.emit_load(&mut ctx.f, bb, cur_ty, sa0, 0, p.local, span_s, span_e)
+                } else {
+                    ssa.emit_load(&mut ctx.f, bb, cur_ty, addr, 0, -1, span_s, span_e)
+                }
+                len_val = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .FatLen, len_ty, fat_v, -1, -1, 0, cur_ty, 0, -1, 0, 0, span_s, span_e))
+                data_ptr = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .FatPtr, ht.TY_PTR, fat_v, -1, -1, 0, cur_ty, 0, -1, 0, 0, span_s, span_e))
+                elem_ty = if ck == .FatStr { ht.TY_U8 } else { types.entries[cur_ty].inner_a }
+            } else if ck == .Array || ck == .String {
+                arr_v := if i == 0 && first_is_val_index {
+                    sa0 := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+                    ssa.emit_load(&mut ctx.f, bb, cur_ty, sa0, 0, p.local, span_s, span_e)
+                } else {
+                    ssa.emit_load(&mut ctx.f, bb, cur_ty, addr, 0, -1, span_s, span_e)
+                }
+                len_val = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .Len, len_ty, arr_v, -1, -1, 0, cur_ty, 0, -1, 0, 0, span_s, span_e))
+                data_ptr = ssa.emit_cast(&mut ctx.f, bb, ht.TY_PTR, arr_v, span_s, span_e)
+                elem_ty = if ck == .String { ht.TY_U8 } else { types.entries[cur_ty].inner_a }
+            } else if ck == .FixedArr {
+                len_val = ssa.emit_const_int(&mut ctx.f, bb, len_ty, i64(types.entries[cur_ty].count), span_s, span_e)
+                data_ptr = addr
+                elem_ty = types.entries[cur_ty].inner_a
+            } else {
+                len_val = ssa.emit_const_int(&mut ctx.f, bb, len_ty, 0, span_s, span_e)
+                data_ptr = addr
+            }
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .BoundsCheck, ht.TY_UNIT, idx_val, len_val, -1, ssa.BOUNDS_LT, cur_ty, 0, -1, 0, 0, span_s, span_e))
+            stride := elem_stride(&types, elem_ty)
+            addr = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .IndexAddr, ht.TY_PTR, data_ptr, idx_val, -1, 0, elem_ty, stride, -1, 0, 0, span_s, span_e))
+            cur_ty = elem_ty
+            downcast_var = -1
+        }
+    }
+    addr
+}
+
+// Lower a MirPlace read to a typed SsaVal.
+fn lower_place_load(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, place_id: i32, span_s: i32, span_e: i32) -> i32 {
+    p := body.places[place_id]
+    if p.proj_len == 0 {
+        // Direct whole-slot load (eligible for Mem2Reg promotion!)
+        addr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+        return ssa.emit_load(&mut ctx.f, bb, p.ty, addr, 0, p.local, span_s, span_e)
+    }
+    addr := lower_place_addr(&mut ctx, &types, &body, bb, place_id, false, span_s, span_e)
+    ssa.emit_load(&mut ctx.f, bb, p.ty, addr, 0, -1, span_s, span_e)
+}
+
+// Store a typed SsaVal into a MirPlace.
+fn lower_place_store(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, place_id: i32, val: i32, span_s: i32, span_e: i32) {
+    p := body.places[place_id]
+    if p.proj_len == 0 {
+        addr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, p.local, 0, span_s, span_e)
+        ssa.emit_store(&mut ctx.f, bb, p.ty, addr, val, 0, p.local, span_s, span_e)
+        return
+    }
+    addr := lower_place_addr(&mut ctx, &types, &body, bb, place_id, false, span_s, span_e)
+    ssa.emit_store(&mut ctx.f, bb, p.ty, addr, val, 0, -1, span_s, span_e)
+}
+
+fn lower_const(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, const_id: i32, span_s: i32, span_e: i32) -> i32 {
+    c := &body.consts[const_id]
+    if c.ext_static_mode != 0 {
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstBlob, c.ty, -1, -1, -1, c.ext_static_mode, -1, c.int_val, -1, 0, 0, span_s, span_e))
+    }
+    te := &types.entries[c.ty]
+    if te.kind == .F32 || te.kind == .F64 {
+        sidx := if c.text.len > 0 { ssa.add_const_str(&mut ctx.f, c.text) } else { -1 }
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstFloat, c.ty, -1, -1, -1, 0, -1, c.int_val, sidx, 0, 0, span_s, span_e))
+    }
+    if te.kind == .String {
+        sidx := ssa.add_const_str(&mut ctx.f, c.text)
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstStr, c.ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, span_s, span_e))
+    }
+    if te.kind == .CStr {
+        sidx := ssa.add_const_str(&mut ctx.f, c.text)
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstCStr, c.ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, span_s, span_e))
+    }
+    if te.kind == .WStr {
+        sidx := ssa.add_const_str(&mut ctx.f, c.text)
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstWStr, c.ty, -1, -1, -1, 0, -1, 0, sidx, 0, 0, span_s, span_e))
+    }
+    if te.kind == .FnPtr || te.kind == .ExternFn {
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstFn, c.ty, -1, -1, -1, i32(c.int_val), -1, c.int_val, -1, 0, 0, span_s, span_e))
+    }
+    if te.kind == .FatStr {
+        sidx := ssa.add_const_str(&mut ctx.f, c.text)
+        str_v := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ConstStr, ht.TY_STRING, -1, -1, -1, 0, -1, 0, sidx, 0, 0, span_s, span_e))
+        p_v := ssa.emit_cast(&mut ctx.f, bb, ht.TY_PTR, str_v, span_s, span_e)
+        l_v := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, i64(c.text.len), span_s, span_e)
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .FatMake, c.ty, p_v, l_v, -1, 0, ht.TY_U8, 0, -1, 0, 0, span_s, span_e))
+    }
+    ssa.emit_const_int(&mut ctx.f, bb, c.ty, c.int_val, span_s, span_e)
+}
+
+fn lower_operand(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, op_id: i32, span_s: i32, span_e: i32) -> i32 {
+    op := body.ops[op_id]
+    if op.kind == .Const {
+        return lower_const(&mut ctx, &types, &body, bb, op.id, span_s, span_e)
+    }
+    lower_place_load(&mut ctx, &types, &body, bb, op.id, span_s, span_e)
+}
+
+fn emit_fat_view_of_place(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, base_pl: i32, res_ty: i32, span_s: i32, span_e: i32) -> i32 {
+    base_ty := body.places[base_pl].ty
+    bk := types.entries[base_ty].kind
+    if bk == .FatStr || bk == .FatSlice || bk == .RegionSlice {
+        v := lower_place_load(&mut ctx, &types, &body, bb, base_pl, span_s, span_e)
+        if base_ty == res_ty { return v }
+        p := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatPtr, ht.TY_PTR, v, -1, -1, 0, base_ty, 0, -1, 0, 0, span_s, span_e))
+        l := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatLen, ht.TY_I64, v, -1, -1, 0, base_ty, 0, -1, 0, 0, span_s, span_e))
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatMake, res_ty, p, l, -1, 0, -1, 0, -1, 0, 0, span_s, span_e))
+    }
+    if bk == .String || bk == .Array {
+        v := lower_place_load(&mut ctx, &types, &body, bb, base_pl, span_s, span_e)
+        p := ssa.emit_cast(&mut ctx.f, bb, ht.TY_PTR, v, span_s, span_e)
+        l := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.Len, ht.TY_I64, v, -1, -1, 0, base_ty, 0, -1, 0, 0, span_s, span_e))
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatMake, res_ty, p, l, -1, 0, -1, 0, -1, 0, 0, span_s, span_e))
+    }
+    if bk == .FixedArr {
+        p := lower_place_addr(&mut ctx, &types, &body, bb, base_pl, true, span_s, span_e)
+        l := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, i64(types.entries[base_ty].count), span_s, span_e)
+        return ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatMake, res_ty, p, l, -1, 0, -1, 0, -1, 0, 0, span_s, span_e))
+    }
+    p := lower_place_addr(&mut ctx, &types, &body, bb, base_pl, true, span_s, span_e)
+    l := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, 0, span_s, span_e)
+    ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatMake, res_ty, p, l, -1, 0, -1, 0, -1, 0, 0, span_s, span_e))
+}
+
+fn lower_assign(ctx: &mut LowerCtx, types: &ht.TypeTable, body: &mb.MirBody,
+    bb: i32, st: mb.MirStmt) {
+    rv := body.rvalues[st.rvalue]
+    s := st.span_start
+    e := st.span_end
+
+    if rv.kind == .Use {
+        v := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, v, s, e)
+        return
+    }
+
+    if rv.kind == .Ref {
+        ln := body.loans[rv.a]
+        rk := types.entries[rv.ty].kind
+        if rk == .FatStr || rk == .FatSlice || rk == .RegionSlice {
+            fv := emit_fat_view_of_place(&mut ctx, &types, &body, bb, ln.place, rv.ty, s, e)
+            lower_place_store(&mut ctx, &types, &body, bb, st.place, fv, s, e)
+            return
+        }
+        p_addr := lower_place_addr(&mut ctx, &types, &body, bb, ln.place, true, s, e)
+        typed_ref := if ctx.f.vals[p_addr].ty == rv.ty {
+            p_addr
+        } else {
+            ssa.emit_cast(&mut ctx.f, bb, rv.ty, p_addr, s, e)
+        }
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, typed_ref, s, e)
+        return
+    }
+
+    if rv.kind == .AddrOf {
+        p_addr := lower_place_addr(&mut ctx, &types, &body, bb, rv.a, true, s, e)
+        typed_ptr := if ctx.f.vals[p_addr].ty == rv.ty {
+            p_addr
+        } else {
+            ssa.emit_cast(&mut ctx.f, bb, rv.ty, p_addr, s, e)
+        }
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, typed_ptr, s, e)
+        return
+    }
+
+    if rv.kind == .Len {
+        oty := operand_ty(&body, rv.a)
+        ok := types.entries[oty].kind
+        mut lv := -1
+        if ok == .FixedArr {
+            lv = ssa.emit_const_int(&mut ctx.f, bb, rv.ty, i64(types.entries[oty].count), s, e)
+        } else if ok == .FatStr || ok == .FatSlice || ok == .RegionSlice {
+            v := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+            lv = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatLen, rv.ty, v, -1, -1, 0, oty, 0, -1, 0, 0, s, e))
+        } else {
+            v := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+            lv = ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.Len, rv.ty, v, -1, -1, 0, oty, 0, -1, 0, 0, s, e))
+        }
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, lv, s, e)
+        return
+    }
+
+    if rv.kind == .Discriminant {
+        oty := operand_ty(&body, rv.a)
+        v := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+        dv := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.Discriminant, rv.ty, v, -1, -1, 0, oty, 0, -1, 0, 0, s, e))
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, dv, s, e)
+        return
+    }
+
+    if rv.kind == .Slice || rv.kind == .BytesView {
+        ln := body.loans[rv.a]
+        base_pl := ln.place
+        base_ty := body.places[base_pl].ty
+
+        // Region bump allocation `R.alloc(n)`
+        if types.entries[rv.ty].kind == .RegionSlice && types.entries[base_ty].name == "__RegionHandle" {
+            n_val := if rv.op_len > 0 {
+                lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start], s, e)
+            } else {
+                ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, 0, s, e)
+            }
+            elem_ty := types.entries[rv.ty].inner_a
+            stride := elem_stride(&types, elem_ty)
+            ptr_v := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .AllocHeap, ht.TY_PTR, n_val, -1, -1, ln.region_scope, elem_ty, stride, -1, 0, 0, s, e))
+            fat_v := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .FatMake, rv.ty, ptr_v, n_val, -1, 0, elem_ty, 0, -1, 0, 0, s, e))
+            lower_place_store(&mut ctx, &types, &body, bb, st.place, fat_v, s, e)
+            return
+        }
+
+        // Extract base fat view (ptr, len)
+        base_fat := emit_fat_view_of_place(&mut ctx, &types, &body, bb, base_pl, rv.ty, s, e)
+        mut int_bounds: []i32 = []
+        for bi in 0..rv.op_len {
+            bop := body.call_args[rv.op_start + bi]
+            if ssa.is_int_ty(&types, operand_ty(&body, bop)) {
+                int_bounds.push(bop)
+            }
+        }
+        if int_bounds.len == 0 {
+            lower_place_store(&mut ctx, &types, &body, bb, st.place, base_fat, s, e)
+            return
+        }
+
+        base_ptr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatPtr, ht.TY_PTR, base_fat, -1, -1, 0, rv.ty, 0, -1, 0, 0, s, e))
+        base_len := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatLen, ht.TY_I64, base_fat, -1, -1, 0, rv.ty, 0, -1, 0, 0, s, e))
+        elem_ty := if types.entries[rv.ty].kind == .FatStr { ht.TY_U8 } else { types.entries[rv.ty].inner_a }
+        stride := elem_stride(&types, elem_ty)
+
+        lo_raw := lower_operand(&mut ctx, &types, &body, bb, int_bounds[0], s, e)
+        lo_v := if ctx.f.vals[lo_raw].ty == ht.TY_I64 { lo_raw } else { ssa.emit_cast(&mut ctx.f, bb, ht.TY_I64, lo_raw, s, e) }
+        mut hi_v := base_len
+        if int_bounds.len >= 2 {
+            hi_raw := lower_operand(&mut ctx, &types, &body, bb, int_bounds[1], s, e)
+            hi_v = if ctx.f.vals[hi_raw].ty == ht.TY_I64 { hi_raw } else { ssa.emit_cast(&mut ctx.f, bb, ht.TY_I64, hi_raw, s, e) }
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.BoundsCheck, ht.TY_UNIT, lo_v, hi_v, -1, ssa.BOUNDS_LE, rv.ty, 0, -1, 0, 0, s, e))
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.BoundsCheck, ht.TY_UNIT, hi_v, base_len, -1, ssa.BOUNDS_LE, rv.ty, 0, -1, 0, 0, s, e))
+        } else {
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.BoundsCheck, ht.TY_UNIT, lo_v, base_len, -1, ssa.BOUNDS_LE, rv.ty, 0, -1, 0, 0, s, e))
+        }
+        new_ptr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.IndexAddr, ht.TY_PTR, base_ptr, lo_v, -1, 0, elem_ty, stride, -1, 0, 0, s, e))
+        new_len := ssa.emit_binary(&mut ctx.f, bb, ht.TY_I64, hb.BINOP_SUB, hi_v, lo_v, s, e)
+        res_fat := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(.FatMake, rv.ty, new_ptr, new_len, -1, 0, elem_ty, 0, -1, 0, 0, s, e))
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, res_fat, s, e)
+        return
+    }
+
+    if rv.kind == .Binary {
+        lhs := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+        rhs := lower_operand(&mut ctx, &types, &body, bb, rv.b, s, e)
+        lty := ctx.f.vals[lhs].ty
+        // Emit explicit OverflowCheck for checked integer arithmetic (+, -, *, /, %)
+        if ssa.is_int_ty(&types, lty) &&
+            (st.aux == hb.BINOP_ADD || st.aux == hb.BINOP_SUB || st.aux == hb.BINOP_MUL ||
+             st.aux == hb.BINOP_DIV || st.aux == hb.BINOP_MOD) {
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .OverflowCheck, ht.TY_UNIT, lhs, rhs, -1, st.aux, lty, 0, -1, 0, 0, s, e))
+        }
+        res := ssa.emit_binary(&mut ctx.f, bb, rv.ty, st.aux, lhs, rhs, s, e)
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, res, s, e)
+        return
+    }
+
+    if rv.kind == .Unary {
+        op := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+        oty := ctx.f.vals[op].ty
+        if rv.b == hb.UNOP_NEG && ssa.is_int_ty(&types, oty) && !ssa.is_unsigned_int_ty(&types, oty) {
+            zero := ssa.emit_const_int(&mut ctx.f, bb, oty, 0, s, e)
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .OverflowCheck, ht.TY_UNIT, zero, op, -1, hb.BINOP_SUB, oty, 0, -1, 0, 0, s, e))
+        }
+        res := ssa.emit_unary(&mut ctx.f, bb, rv.ty, rv.b, op, s, e)
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, res, s, e)
+        return
+    }
+
+    if rv.kind == .Cast {
+        op := lower_operand(&mut ctx, &types, &body, bb, rv.a, s, e)
+        res := if ctx.f.vals[op].ty == rv.ty {
+            op
+        } else {
+            ssa.emit_cast(&mut ctx.f, bb, rv.ty, op, s, e)
+        }
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, res, s, e)
+        return
+    }
+
+    if rv.kind == .Aggregate {
+        te := &types.entries[rv.ty]
+        dst_addr := lower_place_addr(&mut ctx, &types, &body, bb, st.place, true, s, e)
+        if te.kind == .Struct || te.kind == .Tuple {
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .MemZero, ht.TY_UNIT, dst_addr, -1, -1, 0, rv.ty, i64(te.size), -1, 0, 0, s, e))
+            for fi in 0..rv.op_len {
+                fv := lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start + fi], s, e)
+                foff := struct_field_offset(&types, rv.ty, fi)
+                faddr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .FieldAddr, ht.TY_PTR, dst_addr, -1, -1, fi, rv.ty, foff, -1, 0, 0, s, e))
+                ssa.emit_store(&mut ctx.f, bb, ctx.f.vals[fv].ty, faddr, fv, 0, -1, s, e)
+            }
+        } else if te.kind == .Enum {
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .MemZero, ht.TY_UNIT, dst_addr, -1, -1, 0, rv.ty, i64(te.size), -1, 0, 0, s, e))
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .SetDiscriminant, ht.TY_UNIT, dst_addr, -1, -1, rv.a, rv.ty, 0, -1, 0, 0, s, e))
+            for pi in 0..rv.op_len {
+                pv := lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start + pi], s, e)
+                poff := enum_payload_offset(&types, rv.ty, rv.a, pi)
+                paddr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .FieldAddr, ht.TY_PTR, dst_addr, -1, -1, rv.a * 65536 + pi, rv.ty, poff, -1, 0, 0, s, e))
+                ssa.emit_store(&mut ctx.f, bb, ctx.f.vals[pv].ty, paddr, pv, 0, -1, s, e)
+            }
+        } else if te.kind == .FixedArr {
+            _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .MemZero, ht.TY_UNIT, dst_addr, -1, -1, 0, rv.ty, i64(te.size), -1, 0, 0, s, e))
+            elem_ty := te.inner_a
+            stride := elem_stride(&types, elem_ty)
+            for ei in 0..rv.op_len {
+                ev := lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start + ei], s, e)
+                iv := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, i64(ei), s, e)
+                eaddr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .IndexAddr, ht.TY_PTR, dst_addr, iv, -1, 0, elem_ty, stride, -1, 0, 0, s, e))
+                ssa.emit_store(&mut ctx.f, bb, elem_ty, eaddr, ev, 0, -1, s, e)
+            }
+        } else if te.kind == .Array {
+            // Dynamic array literal: AllocHeap + store elements
+            elem_ty := te.inner_a
+            stride := elem_stride(&types, elem_ty)
+            cnt_v := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, i64(rv.op_len), s, e)
+            arr_v := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                .AllocHeap, rv.ty, cnt_v, -1, -1, 0, elem_ty, stride, -1, 0, 0, s, e))
+            base_p := ssa.emit_cast(&mut ctx.f, bb, ht.TY_PTR, arr_v, s, e)
+            for ei in 0..rv.op_len {
+                ev := lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start + ei], s, e)
+                iv := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I64, i64(ei), s, e)
+                eaddr := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .IndexAddr, ht.TY_PTR, base_p, iv, -1, 0, elem_ty, stride, -1, 0, 0, s, e))
+                ssa.emit_store(&mut ctx.f, bb, elem_ty, eaddr, ev, 0, -1, s, e)
+            }
+            ssa.emit_store(&mut ctx.f, bb, rv.ty, dst_addr, arr_v, 0, -1, s, e)
+        }
+        return
+    }
+
+    if rv.kind == .Closure {
+        mut caps: []i32 = []
+        for ci in 0..rv.op_len {
+            caps.push(lower_operand(&mut ctx, &types, &body, bb, body.call_args[rv.op_start + ci], s, e))
+        }
+        a_start := ssa.push_val_args(&mut ctx.f, &caps)
+        cl_v := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+            .ClosureMake, rv.ty, -1, -1, -1, rv.a, rv.ty, 0, -1, a_start, caps.len, s, e))
+        lower_place_store(&mut ctx, &types, &body, bb, st.place, cl_v, s, e)
+        return
+    }
+}
+
+pub fn lower_body(prog: &hb.HirProgram, body: &mb.MirBody, diags: &mut []diag.Diagnostic) -> ssa.SsaFunc {
+    types := &prog.types
+    mut f := ssa.new_func(body.fn_id, body.owner_mod, body.fn_name, body.path,
+        body.sig_ty, body.ret_ty, body.param_count, body.is_unsafe)
+    if body.fn_id >= 0 && body.fn_id < prog.fns.len {
+        f.is_extern = prog.fns[body.fn_id].is_extern
+        f.is_closure_body = prog.fns[body.fn_id].is_closure_body
+    }
+
+    if !body.post_drop {
+        hb.push_error(&mut diags, "E9100", body.path, 0, 0,
+            "ssa_lower(" + body.fn_name + "): requires post-drop HL-MIR (post_drop == true)")
+        return f
+    }
+
+    // 1. Translate every MirLocal into an explicit StackSlot (exact size, align!)
+    for l in 0..body.locals.len {
+        loc := &body.locals[l]
+        at := loc.flags.bit_and(mb.LF_ADDR_TAKEN) != 0
+        is_p := l >= 1 && l <= body.param_count
+        is_sr := l == 0 && is_sret_ty(&types, loc.ty)
+        _ := ssa.add_slot(&mut f, loc.ty, loc.size, loc.align, at, is_p, is_sr, loc.name)
+    }
+
+    // 2. Pre-create SSA blocks 0..body.blocks.len-1 and record MIR pred counts
+    mut pred_counts: []i32 = []
+    for bb in 0..body.blocks.len {
+        _ := ssa.add_block(&mut f)
+        pred_counts.push(body.blocks[bb].pred_end - body.blocks[bb].pred_start)
+    }
+
+    mut ctx := LowerCtx {
+        f: move f,
+        mir_pred_counts: move pred_counts,
+    }
+
+    // 3. Emit entry parameter SsaVals and store into param slots at start of bb 0
+    if body.blocks.len > 0 {
+        for p in 1..(body.param_count + 1) {
+            if p >= body.locals.len { break }
+            pty := body.locals[p].ty
+            pv := ssa.add_fn_param_val(&mut ctx.f, pty)
+            p_addr := ssa.emit_slot_addr(&mut ctx.f, 0, ht.TY_PTR, p, 0, 0, 0)
+            ssa.emit_store(&mut ctx.f, 0, pty, p_addr, pv, 0, p, 0, 0)
+        }
+    }
+
+    // 4. Lower every basic block's statements and terminator
+    // Track deferred Call destination stores so they are placed at the start of the continuation block.
+    mut call_store_bb: []i32 = []
+    mut call_store_place: []i32 = []
+    mut call_store_val: []i32 = []
+    mut call_store_s: []i32 = []
+    mut call_store_e: []i32 = []
+
+    for bb in 0..body.blocks.len {
+        blk := body.blocks[bb]
+        for si in blk.stmt_start..blk.stmt_end {
+            st := body.stmts[si]
+            if st.kind == .Assign {
+                lower_assign(&mut ctx, &types, &body, bb, st)
+            } else if st.kind == .SetDiscriminant {
+                enum_ty := body.places[st.place].ty
+                addr := lower_place_addr(&mut ctx, &types, &body, bb, st.place, true, st.span_start, st.span_end)
+                _ := ssa.emit_inst(&mut ctx.f, bb, ssa.make_inst(
+                    .SetDiscriminant, ht.TY_UNIT, addr, -1, -1, st.aux, enum_ty, 0, -1, 0, 0, st.span_start, st.span_end))
+            } else if st.kind == .SetDeferActive {
+                cv := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_BOOL, i64(st.aux), st.span_start, st.span_end)
+                addr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, st.place, 0, st.span_start, st.span_end)
+                ssa.emit_store(&mut ctx.f, bb, ht.TY_BOOL, addr, cv, 0, st.place, st.span_start, st.span_end)
+            } else if st.kind == .SetUnwindTarget {
+                cv := ssa.emit_const_int(&mut ctx.f, bb, ht.TY_I32, i64(st.aux), st.span_start, st.span_end)
+                addr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, st.place, 0, st.span_start, st.span_end)
+                ssa.emit_store(&mut ctx.f, bb, ht.TY_I32, addr, cv, 0, st.place, st.span_start, st.span_end)
+            }
+            // StorageLive / StorageDead / Nop: omitted in SSA
+        }
+
+        tid := blk.term_id
+        if tid < 0 || tid >= body.terms.len {
+            _ := ssa.set_trap(&mut ctx.f, bb, hb.TRAP_UNREACHABLE, 0, 0)
+            continue
+        }
+        tm := body.terms[tid]
+        s := tm.span_start
+        e := tm.span_end
+        empty_args: []i32 = []
+
+        if tm.kind == .Goto {
+            _ := ssa.set_goto(&mut ctx.f, bb, tm.target_bb, &empty_args, s, e)
+        } else if tm.kind == .SwitchInt {
+            discr := lower_operand(&mut ctx, &types, &body, bb, tm.place_or_op, s, e)
+            dty := ctx.f.vals[discr].ty
+            if dty == ht.TY_BOOL && tm.arg_len == 1 {
+                v0 := body.switch_vals[tm.arg_start]
+                b0 := body.switch_bbs[tm.arg_start]
+                if v0 == 1 {
+                    _ := ssa.set_branch(&mut ctx.f, bb, discr, b0, &empty_args, tm.target_bb, &empty_args, s, e)
+                } else {
+                    _ := ssa.set_branch(&mut ctx.f, bb, discr, tm.target_bb, &empty_args, b0, &empty_args, s, e)
+                }
+            } else {
+                mut cvals: []i64 = []
+                mut cbbs: []i32 = []
+                for ci in 0..tm.arg_len {
+                    cvals.push(body.switch_vals[tm.arg_start + ci])
+                    cbbs.push(body.switch_bbs[tm.arg_start + ci])
+                }
+                c_start := ssa.push_switch_cases(&mut ctx.f, &cvals, &cbbs)
+                mut stm := ssa.make_term(.Switch)
+                stm.cond_val = discr
+                stm.case_start = c_start
+                stm.case_len = cvals.len
+                stm.target_a = tm.target_bb
+                stm.span_start = s
+                stm.span_end = e
+                _ := ssa.set_term(&mut ctx.f, bb, stm)
+            }
+        } else if tm.kind == .Call {
+            mut callee_val := -1
+            mut env_val := -1
+            if tm.call_kind == .Indirect {
+                callee_val = lower_operand(&mut ctx, &types, &body, bb, tm.callee, s, e)
+                if tm.sig_ty >= 0 && tm.sig_ty < types.entries.len &&
+                    types.entries[tm.sig_ty].kind == .ClosureEnv {
+                    env_val = callee_val
+                }
+            }
+            mut arg_vals: []i32 = []
+            for ai in 0..tm.arg_len {
+                arg_vals.push(lower_operand(&mut ctx, &types, &body, bb, body.call_args[tm.arg_start + ai], s, e))
+            }
+            a_start := ssa.push_val_args(&mut ctx.f, &arg_vals)
+
+            dest_ty := body.places[tm.place_or_op].ty
+            dest_val := ssa.add_val(&mut ctx.f, dest_ty, bb, ssa.DEF_TERM_RESULT)
+
+            // If target_bb has > 1 predecessor, split a dedicated continuation block to store dest_val cleanly!
+            mut next_bb := tm.target_bb
+            if next_bb >= 0 && next_bb < ctx.mir_pred_counts.len && ctx.mir_pred_counts[next_bb] > 1 {
+                tramp := ssa.add_block(&mut ctx.f)
+                _ := ssa.set_goto(&mut ctx.f, tramp, next_bb, &empty_args, s, e)
+                next_bb = tramp
+            }
+
+            mut ctm := ssa.make_term(.Call)
+            if tm.call_kind == .Direct {
+                ctm.kind = .Call
+                ctm.callee = tm.callee
+                ctm.sig_ty = tm.sig_ty
+            } else if tm.call_kind == .Indirect {
+                ctm.kind = .IndirectCall
+                ctm.cond_val = callee_val
+                ctm.env_val = env_val
+                ctm.sig_ty = tm.sig_ty
+            } else if tm.call_kind == .Extern {
+                ctm.kind = .ExternCall
+                ctm.callee = tm.callee
+                ctm.sig_ty = tm.sig_ty
+            } else {
+                ctm.kind = .IntrinsicCall
+                ctm.callee = tm.callee
+                // Preserve dropped/operated TypeId in aux_ty for IntrinsicCall
+                ctm.aux_ty = if arg_vals.len > 0 { ctx.f.vals[arg_vals[0]].ty } else { dest_ty }
+            }
+            ctm.arg_start = a_start
+            ctm.arg_len = arg_vals.len
+            ctm.dest_val = dest_val
+            ctm.target_a = next_bb
+            ctm.span_start = s
+            ctm.span_end = e
+            _ := ssa.set_term(&mut ctx.f, bb, ctm)
+
+            if dest_ty != ht.TY_UNIT && next_bb >= 0 {
+                call_store_bb.push(next_bb)
+                call_store_place.push(tm.place_or_op)
+                call_store_val.push(dest_val)
+                call_store_s.push(s)
+                call_store_e.push(e)
+            }
+        } else if tm.kind == .TaskScopeEnter {
+            mut h_val := -1
+            if tm.place_or_op >= 0 && tm.place_or_op < body.locals.len {
+                ctx.f.slots[tm.place_or_op].addr_taken = true
+                h_val = ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, tm.place_or_op, 0, s, e)
+            }
+            mut targs: []i32 = []
+            for ai in 0..tm.arg_len {
+                aop := body.call_args[tm.arg_start + ai]
+                if aop >= 0 {
+                    targs.push(lower_operand(&mut ctx, &types, &body, bb, aop, s, e))
+                } else {
+                    targs.push(-1)
+                }
+            }
+            a_start := ssa.push_val_args(&mut ctx.f, &targs)
+            mut stm := ssa.make_term(.TaskScopeEnter)
+            stm.callee = tm.callee
+            stm.cond_val = h_val
+            stm.arg_start = a_start
+            stm.arg_len = targs.len
+            stm.target_a = tm.target_bb
+            stm.span_start = s
+            stm.span_end = e
+            _ := ssa.set_term(&mut ctx.f, bb, stm)
+        } else if tm.kind == .TaskScopeJoin {
+            mut h_val := -1
+            if tm.place_or_op >= 0 && tm.place_or_op < body.locals.len {
+                ctx.f.slots[tm.place_or_op].addr_taken = true
+                h_val = ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, tm.place_or_op, 0, s, e)
+            }
+            mut stm := ssa.make_term(.TaskScopeJoin)
+            stm.callee = tm.callee
+            stm.cond_val = h_val
+            stm.target_a = tm.target_bb
+            stm.span_start = s
+            stm.span_end = e
+            _ := ssa.set_term(&mut ctx.f, bb, stm)
+        } else if tm.kind == .RegionEnter {
+            mut cap_v := -1
+            if tm.place_or_op >= 0 {
+                cap_v = lower_operand(&mut ctx, &types, &body, bb, tm.place_or_op, s, e)
+            }
+            mut stm := ssa.make_term(.RegionEnter)
+            stm.callee = tm.callee
+            stm.cond_val = cap_v
+            stm.target_a = tm.target_bb
+            stm.span_start = s
+            stm.span_end = e
+            _ := ssa.set_term(&mut ctx.f, bb, stm)
+        } else if tm.kind == .RegionExit {
+            mut stm := ssa.make_term(.RegionExit)
+            stm.callee = tm.callee
+            stm.target_a = tm.target_bb
+            stm.span_start = s
+            stm.span_end = e
+            _ := ssa.set_term(&mut ctx.f, bb, stm)
+        } else if tm.kind == .Return {
+            if body.ret_ty == ht.TY_UNIT {
+                _ := ssa.set_return(&mut ctx.f, bb, -1, s, e)
+            } else {
+                raddr := ssa.emit_slot_addr(&mut ctx.f, bb, ht.TY_PTR, 0, 0, s, e)
+                rval := ssa.emit_load(&mut ctx.f, bb, body.ret_ty, raddr, 0, 0, s, e)
+                _ := ssa.set_return(&mut ctx.f, bb, rval, s, e)
+            }
+        } else if tm.kind == .Trap {
+            code := if tm.callee > 0 { tm.callee } else { hb.TRAP_UNREACHABLE }
+            _ := ssa.set_trap(&mut ctx.f, bb, code, s, e)
+        } else {
+            // Drop should never exist post-drop; trap defensively if unreachable
+            _ := ssa.set_trap(&mut ctx.f, bb, hb.TRAP_UNREACHABLE, s, e)
+        }
+    }
+
+    // 5. Materialize deferred Call destination stores at the START of each continuation block
+    for ci in 0..call_store_bb.len {
+        cbb := call_store_bb[ci]
+        cpl := call_store_place[ci]
+        cval := call_store_val[ci]
+        cs := call_store_s[ci]
+        ce := call_store_e[ci]
+        p := body.places[cpl]
+        if p.proj_len == 0 {
+            // Prepend Store first, then prepend SlotAddr before it so order is [SlotAddr, Store, ...]!
+            addr_v := ssa.add_val(&mut ctx.f, ht.TY_PTR, cbb, -1)
+            mut st_ins := ssa.make_inst(.Store, p.ty, addr_v, cval, -1, p.local, -1, 0, -1, 0, 0, cs, ce)
+            _ := ssa.prepend_inst(&mut ctx.f, cbb, st_ins)
+            mut sa_ins := ssa.make_inst(.SlotAddr, ht.TY_PTR, -1, -1, -1, p.local, -1, 0, -1, 0, 0, cs, ce)
+            sa_ins.res = addr_v
+            _ := ssa.prepend_inst(&mut ctx.f, cbb, sa_ins)
+        } else {
+            // Projected call destination: emit address & store in a tiny trampoline?
+            // Simpler: create a trampoline block? Already done if preds > 1; if preds == 1 and cbb has insts,
+            // build a tiny prepend sequence via a temp block or save/restore cbb's insts!
+            old_s := ctx.f.blocks[cbb].inst_start
+            old_n := ctx.f.blocks[cbb].inst_len
+            mut saved: []i32 = []
+            for k in 0..old_n { saved.push(ctx.f.block_insts[old_s + k]) }
+            ctx.f.blocks[cbb].inst_len = 0
+            lower_place_store(&mut ctx, &types, &body, cbb, cpl, cval, cs, ce)
+            for k in 0..saved.len { ssa.append_block_inst_id(&mut ctx.f, cbb, saved[k]) }
+        }
+    }
+
+    ssa.compute_preds(&mut ctx.f)
+    _ := ssa_verify.verify_func(&types, &ctx.f, &mut diags)
+    ctx.f
+}
+
+pub fn lower_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags: &mut []diag.Diagnostic) -> ssa.SsaProgram {
+    mut sp := ssa.new_program(prog.fns.len, prog.entry_fn)
+    for bi in 0..bodies.len {
+        sf := lower_body(&prog, &bodies[bi], &mut diags)
+        _ := ssa.add_program_func(&mut sp, move sf)
+    }
+    sp
+}

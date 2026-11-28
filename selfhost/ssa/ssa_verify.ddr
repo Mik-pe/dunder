@@ -1,0 +1,998 @@
+// Strict semantic SSA MIR Verifier (`selfhost/ssa/ssa_verify.ddr`).
+// Enforces:
+// 1. CFG integrity (preds consistent, valid block targets, single terminator per block)
+// 2. Block-parameter arity & TypeId agreement on every outgoing edge (Goto / Branch / Switch)
+// 3. Strict TypeId equality across all SsaInst operands/results, Load/Store, FieldAddr, Call signatures
+// 4. Exact StackSlot(size, align) bounds on every slot access
+// 5. Strict SSA dominance (every SsaVal use dominated by its def)
+// 6. Balanced TaskScopeEnter/TaskScopeJoin and RegionEnter/RegionExit depth on all paths
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ssa_ir as ssa
+
+fn err(f: &ssa.SsaFunc, diags: &mut []diag.Diagnostic, start: i32, end: i32, msg: string) {
+    hb.push_error(&mut diags, "E9101", f.path, start, end, "ssa_verify(" + f.name + "): " + msg)
+}
+
+fn valid_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    ty >= 0 && ty < types.entries.len
+}
+
+fn valid_val(f: &ssa.SsaFunc, v: i32) -> bool {
+    v >= 0 && v < f.vals.len
+}
+
+fn check_val_use_inst(f: &ssa.SsaFunc, dom: &ssa.DomTree, v: i32, bb: i32, pos: i32,
+    span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic, ctx: string) -> bool {
+    if !valid_val(&f, v) {
+        err(&f, &mut diags, span_s, span_e, ctx + ": invalid SsaVal id " + v.str())
+        return false
+    }
+    if !ssa.val_dominates_inst(&f, &dom, v, bb, pos) {
+        err(&f, &mut diags, span_s, span_e, ctx + ": SsaVal v" + v.str() +
+            " (def bb" + f.vals[v].def_bb.str() + ") does not dominate use in bb" + bb.str())
+        return false
+    }
+    true
+}
+
+fn check_val_use_term(f: &ssa.SsaFunc, dom: &ssa.DomTree, v: i32, bb: i32,
+    span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic, ctx: string) -> bool {
+    if !valid_val(&f, v) {
+        err(&f, &mut diags, span_s, span_e, ctx + ": invalid SsaVal id " + v.str())
+        return false
+    }
+    if !ssa.val_dominates_term(&f, &dom, v, bb) {
+        err(&f, &mut diags, span_s, span_e, ctx + ": SsaVal v" + v.str() +
+            " (def bb" + f.vals[v].def_bb.str() + ") does not dominate terminator in bb" + bb.str())
+        return false
+    }
+    true
+}
+
+fn check_edge_args(types: &ht.TypeTable, f: &ssa.SsaFunc, dom: &ssa.DomTree,
+    from_bb: i32, to_bb: i32, arg_start: i32, arg_len: i32,
+    span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic) -> bool {
+    if to_bb < 0 || to_bb >= f.blocks.len {
+        err(&f, &mut diags, span_s, span_e, "bb" + from_bb.str() + " edge to invalid target bb" + to_bb.str())
+        return false
+    }
+    if arg_start < 0 || arg_len < 0 || arg_start + arg_len > f.val_args.len {
+        err(&f, &mut diags, span_s, span_e, "bb" + from_bb.str() + " edge arg slice out of bounds")
+        return false
+    }
+    dst := f.blocks[to_bb]
+    if arg_len != dst.params_len {
+        err(&f, &mut diags, span_s, span_e,
+            "edge bb" + from_bb.str() + " -> bb" + to_bb.str() +
+            " arg arity mismatch: got " + arg_len.str() + ", expected " + dst.params_len.str())
+        return false
+    }
+    mut ok := true
+    for i in 0..arg_len {
+        av := f.val_args[arg_start + i]
+        pv := f.block_params[dst.params_start + i]
+        if !check_val_use_term(&f, &dom, av, from_bb, span_s, span_e, &mut diags, "edge arg") {
+            ok = false
+            continue
+        }
+        if !valid_val(&f, pv) {
+            err(&f, &mut diags, span_s, span_e, "bb" + to_bb.str() + " invalid block param")
+            ok = false
+            continue
+        }
+        if f.vals[av].ty != f.vals[pv].ty {
+            err(&f, &mut diags, span_s, span_e,
+                "edge bb" + from_bb.str() + " -> bb" + to_bb.str() +
+                " arg " + i.str() + " TypeId mismatch: " + f.vals[av].ty.str() +
+                " != param " + f.vals[pv].ty.str())
+            ok = false
+        }
+        _ := types.sealed
+    }
+    ok
+}
+
+fn check_slot_bounds(types: &ht.TypeTable, f: &ssa.SsaFunc, slot_id: i32,
+    offset: i64, access_ty: i32, span_s: i32, span_e: i32,
+    diags: &mut []diag.Diagnostic, ctx: string) -> bool {
+    if slot_id < 0 || slot_id >= f.slots.len {
+        err(&f, &mut diags, span_s, span_e, ctx + ": invalid StackSlot id " + slot_id.str())
+        return false
+    }
+    sl := &f.slots[slot_id]
+    if sl.dead {
+        err(&f, &mut diags, span_s, span_e, ctx + ": access to dead StackSlot " + slot_id.str())
+        return false
+    }
+    if !valid_ty(&types, access_ty) {
+        err(&f, &mut diags, span_s, span_e, ctx + ": invalid access TypeId " + access_ty.str())
+        return false
+    }
+    acc_sz := i64(types.entries[access_ty].size)
+    if offset < 0 || offset + acc_sz > i64(sl.size) {
+        err(&f, &mut diags, span_s, span_e,
+            ctx + ": StackSlot " + slot_id.str() + " bounds violation: [" +
+            offset.str() + ".." + (offset + acc_sz).str() + ") exceeds slot size " + sl.size.str())
+        return false
+    }
+    true
+}
+
+fn is_cmp_binop(op: i32) -> bool {
+    op == hb.BINOP_EQ || op == hb.BINOP_NE ||
+    op == hb.BINOP_LT || op == hb.BINOP_LE ||
+    op == hb.BINOP_GT || op == hb.BINOP_GE
+}
+
+fn verify_inst(types: &ht.TypeTable, f: &ssa.SsaFunc, dom: &ssa.DomTree,
+    bb: i32, pos: i32, iid: i32, diags: &mut []diag.Diagnostic) -> bool {
+    ins := f.insts[iid]
+    mut ok := true
+
+    if ssa.inst_produces_val(ins.kind) {
+        if !valid_val(&f, ins.res) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "inst " + iid.str() + " missing result SsaVal")
+            return false
+        }
+        rv := f.vals[ins.res]
+        if rv.def_bb != bb || rv.def_inst != iid {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "inst " + iid.str() + " result v" + ins.res.str() + " def site mismatch")
+            ok = false
+        }
+        if rv.ty != ins.ty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "inst " + iid.str() + " result TypeId mismatch: val " + rv.ty.str() + " != inst " + ins.ty.str())
+            ok = false
+        }
+        if !valid_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "inst " + iid.str() + " invalid TypeId " + ins.ty.str())
+            return false
+        }
+    }
+
+    k := ins.kind
+    if k == .Nop || k == .ConstInt || k == .ConstFloat || k == .ConstBlob || k == .ConstFn {
+        if k == .ConstFn {
+            tk := types.entries[ins.ty].kind
+            if tk != .FnPtr && tk != .ExternFn && tk != .Ptr {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "ConstFn must have FnPtr/ExternFn/Ptr type")
+                ok = false
+            }
+        }
+        return ok
+    }
+    if k == .ConstStr || k == .ConstCStr || k == .ConstWStr {
+        if ins.str_idx < 0 || ins.str_idx >= f.const_strs.len {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "ConstStr/CStr/WStr invalid str_idx")
+            ok = false
+        }
+        return ok
+    }
+    if k == .Copy {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Copy") {
+            return false
+        }
+        if f.vals[ins.op_a].ty != ins.ty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "Copy TypeId mismatch: src " + f.vals[ins.op_a].ty.str() + " != dst " + ins.ty.str())
+            ok = false
+        }
+        return ok
+    }
+    if k == .Binary {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Binary lhs")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "Binary rhs")
+        if !a_ok || !b_ok { return false }
+        aty := f.vals[ins.op_a].ty
+        bty := f.vals[ins.op_b].ty
+        if aty != bty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "Binary operand TypeId mismatch: " + aty.str() + " vs " + bty.str())
+            ok = false
+        }
+        if is_cmp_binop(ins.aux) {
+            if ins.ty != ht.TY_BOOL {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "Binary comparison must produce TY_BOOL")
+                ok = false
+            }
+        } else if ins.ty != aty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "Binary result TypeId " + ins.ty.str() + " != operand TypeId " + aty.str())
+            ok = false
+        }
+        return ok
+    }
+    if k == .Unary {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Unary") {
+            return false
+        }
+        aty := f.vals[ins.op_a].ty
+        if ins.aux == hb.UNOP_NOT {
+            if aty != ht.TY_BOOL || ins.ty != ht.TY_BOOL {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "Unary NOT requires TY_BOOL operand and result")
+                ok = false
+            }
+        } else if ins.ty != aty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "Unary result TypeId " + ins.ty.str() + " != operand TypeId " + aty.str())
+            ok = false
+        }
+        return ok
+    }
+    if k == .Cast {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Cast") {
+            return false
+        }
+        if ins.aux_ty >= 0 && ins.aux_ty != ins.ty {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Cast aux_ty != res ty")
+            ok = false
+        }
+        return ok
+    }
+    if k == .SlotAddr {
+        if !ssa.is_addr_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "SlotAddr must produce pointer/ref TypeId")
+            ok = false
+        }
+        if ins.aux < 0 || ins.aux >= f.slots.len {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "SlotAddr invalid slot id " + ins.aux.str())
+            return false
+        }
+        sl := &f.slots[ins.aux]
+        if sl.dead {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "SlotAddr references dead slot " + ins.aux.str())
+            ok = false
+        }
+        if ins.imm_i64 < 0 || ins.imm_i64 > i64(sl.size) {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "SlotAddr offset " + ins.imm_i64.str() + " out of StackSlot bounds " + sl.size.str())
+            ok = false
+        }
+        return ok
+    }
+    if k == .Load {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Load addr") {
+            return false
+        }
+        aty := f.vals[ins.op_a].ty
+        if !ssa.is_addr_ty(&types, aty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Load address operand is not pointer/ref type")
+            ok = false
+        }
+        if ins.aux >= 0 {
+            if !check_slot_bounds(&types, &f, ins.aux, ins.imm_i64, ins.ty, ins.span_start, ins.span_end, &mut diags, "Load") {
+                ok = false
+            }
+        }
+        // If typed Ref/MutRef/RawConst/RawMut at offset 0, verify pointee matches loaded TypeId
+        ak := types.entries[aty].kind
+        if ins.imm_i64 == 0 && (ak == .Ref || ak == .MutRef || ak == .RawConst || ak == .RawMut) {
+            if types.entries[aty].inner_a != ins.ty {
+                err(&f, &mut diags, ins.span_start, ins.span_end,
+                    "Load pointee TypeId " + types.entries[aty].inner_a.str() + " != result TypeId " + ins.ty.str())
+                ok = false
+            }
+        }
+        return ok
+    }
+    if k == .Store {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Store addr")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "Store val")
+        if !a_ok || !b_ok { return false }
+        aty := f.vals[ins.op_a].ty
+        vty := f.vals[ins.op_b].ty
+        if !ssa.is_addr_ty(&types, aty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Store address operand is not pointer/ref type")
+            ok = false
+        }
+        if ins.ty != vty {
+            err(&f, &mut diags, ins.span_start, ins.span_end,
+                "Store TypeId " + ins.ty.str() + " != value TypeId " + vty.str())
+            ok = false
+        }
+        if ins.aux >= 0 {
+            if !check_slot_bounds(&types, &f, ins.aux, ins.imm_i64, vty, ins.span_start, ins.span_end, &mut diags, "Store") {
+                ok = false
+            }
+        }
+        ak := types.entries[aty].kind
+        if ins.imm_i64 == 0 && (ak == .Ref || ak == .MutRef || ak == .RawConst || ak == .RawMut) {
+            if types.entries[aty].inner_a != vty {
+                err(&f, &mut diags, ins.span_start, ins.span_end,
+                    "Store pointee TypeId " + types.entries[aty].inner_a.str() + " != value TypeId " + vty.str())
+                ok = false
+            }
+        }
+        return ok
+    }
+    if k == .FieldAddr {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "FieldAddr") {
+            return false
+        }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FieldAddr base is not pointer/ref")
+            ok = false
+        }
+        if !ssa.is_addr_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FieldAddr result must be pointer/ref")
+            ok = false
+        }
+        if !valid_ty(&types, ins.aux_ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FieldAddr invalid base aggregate TypeId")
+            ok = false
+        } else {
+            bk := types.entries[ins.aux_ty].kind
+            if bk != .Struct && bk != .Tuple && bk != .Union && bk != .Enum && bk != .ClosureEnv {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "FieldAddr base aux_ty is not an aggregate")
+                ok = false
+            }
+            if ins.imm_i64 < 0 {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "FieldAddr negative offset")
+                ok = false
+            }
+            // If op_a came directly from SlotAddr of an inline aggregate, verify field fits in StackSlot!
+            base_def := f.vals[ins.op_a].def_inst
+            if base_def >= 0 && f.insts[base_def].kind == .SlotAddr && bk != .ClosureEnv {
+                sl_id := f.insts[base_def].aux
+                if sl_id >= 0 && sl_id < f.slots.len && f.slots[sl_id].ty == ins.aux_ty {
+                    rk := types.entries[ins.ty].kind
+                    if rk == .Ref || rk == .MutRef || rk == .RawConst || rk == .RawMut {
+                        f_ty := types.entries[ins.ty].inner_a
+                        if !check_slot_bounds(&types, &f, sl_id, f.insts[base_def].imm_i64 + ins.imm_i64, f_ty,
+                            ins.span_start, ins.span_end, &mut diags, "FieldAddr") {
+                            ok = false
+                        }
+                    }
+                }
+            }
+        }
+        return ok
+    }
+    if k == .IndexAddr {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "IndexAddr base")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "IndexAddr idx")
+        if !a_ok || !b_ok { return false }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "IndexAddr base must be pointer/ref")
+            ok = false
+        }
+        if !ssa.is_int_ty(&types, f.vals[ins.op_b].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "IndexAddr index must be integer")
+            ok = false
+        }
+        if !ssa.is_addr_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "IndexAddr result must be pointer/ref")
+            ok = false
+        }
+        if ins.imm_i64 < 0 {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "IndexAddr negative stride")
+            ok = false
+        }
+        return ok
+    }
+    if k == .FatMake {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "FatMake ptr")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "FatMake len")
+        if !a_ok || !b_ok { return false }
+        if !ssa.is_fat_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatMake result must be FatStr/FatSlice/RegionSlice")
+            ok = false
+        }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatMake ptr must be pointer/ref")
+            ok = false
+        }
+        if !ssa.is_int_ty(&types, f.vals[ins.op_b].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatMake len must be integer")
+            ok = false
+        }
+        return ok
+    }
+    if k == .FatPtr {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "FatPtr") {
+            return false
+        }
+        if !ssa.is_fat_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatPtr operand must be FatStr/FatSlice/RegionSlice")
+            ok = false
+        }
+        if !ssa.is_addr_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatPtr result must be pointer/ref")
+            ok = false
+        }
+        return ok
+    }
+    if k == .FatLen {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "FatLen") {
+            return false
+        }
+        if !ssa.is_fat_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatLen operand must be FatStr/FatSlice/RegionSlice")
+            ok = false
+        }
+        if !ssa.is_int_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "FatLen result must be integer")
+            ok = false
+        }
+        return ok
+    }
+    if k == .AllocHeap {
+        if ins.op_a >= 0 {
+            if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "AllocHeap size") {
+                return false
+            }
+            if !ssa.is_int_ty(&types, f.vals[ins.op_a].ty) {
+                err(&f, &mut diags, ins.span_start, ins.span_end, "AllocHeap dynamic size must be integer")
+                ok = false
+            }
+        }
+        return ok
+    }
+    if k == .MemCopy {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "MemCopy dst")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "MemCopy src")
+        if !a_ok || !b_ok { return false }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) || !ssa.is_addr_ty(&types, f.vals[ins.op_b].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "MemCopy operands must be pointer/ref")
+            ok = false
+        }
+        if ins.imm_i64 < 0 {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "MemCopy negative size")
+            ok = false
+        }
+        return ok
+    }
+    if k == .MemZero {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "MemZero dst") {
+            return false
+        }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "MemZero operand must be pointer/ref")
+            ok = false
+        }
+        if ins.imm_i64 < 0 {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "MemZero negative size")
+            ok = false
+        }
+        return ok
+    }
+    if k == .Discriminant {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Discriminant") {
+            return false
+        }
+        if ins.ty != ht.TY_I32 {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Discriminant result must be TY_I32")
+            ok = false
+        }
+        return ok
+    }
+    if k == .SetDiscriminant {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "SetDiscriminant") {
+            return false
+        }
+        if !ssa.is_addr_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "SetDiscriminant target must be pointer/ref")
+            ok = false
+        }
+        if !valid_ty(&types, ins.aux_ty) || types.entries[ins.aux_ty].kind != .Enum ||
+            ins.aux < 0 || ins.aux >= types.entries[ins.aux_ty].count {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "SetDiscriminant invalid enum type or variant")
+            ok = false
+        }
+        return ok
+    }
+    if k == .Len {
+        if !check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Len") {
+            return false
+        }
+        if !ssa.is_int_ty(&types, ins.ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Len result must be integer")
+            ok = false
+        }
+        return ok
+    }
+    if k == .ClosureMake {
+        if !valid_ty(&types, ins.ty) || types.entries[ins.ty].kind != .ClosureEnv {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "ClosureMake result must be ClosureEnv")
+            return false
+        }
+        if ins.arg_start < 0 || ins.arg_len < 0 || ins.arg_start + ins.arg_len > f.val_args.len {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "ClosureMake capture arg slice out of bounds")
+            return false
+        }
+        if ins.arg_len != types.entries[ins.ty].count {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "ClosureMake capture count mismatch")
+            ok = false
+        } else {
+            for ci in 0..ins.arg_len {
+                cv := f.val_args[ins.arg_start + ci]
+                if !check_val_use_inst(&f, &dom, cv, bb, pos, ins.span_start, ins.span_end, &mut diags, "ClosureMake cap") {
+                    ok = false
+                    continue
+                }
+                fty := ht.field_type(&types, ins.ty, ci)
+                if f.vals[cv].ty != fty {
+                    err(&f, &mut diags, ins.span_start, ins.span_end, "ClosureMake capture " + ci.str() + " TypeId mismatch")
+                    ok = false
+                }
+            }
+        }
+        return ok
+    }
+    if k == .Select {
+        c_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "Select cond")
+        t_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "Select true")
+        f_ok := check_val_use_inst(&f, &dom, ins.op_c, bb, pos, ins.span_start, ins.span_end, &mut diags, "Select false")
+        if !c_ok || !t_ok || !f_ok { return false }
+        if f.vals[ins.op_a].ty != ht.TY_BOOL {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Select cond must be TY_BOOL")
+            ok = false
+        }
+        if f.vals[ins.op_b].ty != ins.ty || f.vals[ins.op_c].ty != ins.ty {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "Select branch value TypeId mismatch")
+            ok = false
+        }
+        return ok
+    }
+    if k == .BoundsCheck {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "BoundsCheck idx")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "BoundsCheck len")
+        if !a_ok || !b_ok { return false }
+        if !ssa.is_int_ty(&types, f.vals[ins.op_a].ty) || !ssa.is_int_ty(&types, f.vals[ins.op_b].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "BoundsCheck operands must be integers")
+            ok = false
+        }
+        return ok
+    }
+    if k == .OverflowCheck {
+        a_ok := check_val_use_inst(&f, &dom, ins.op_a, bb, pos, ins.span_start, ins.span_end, &mut diags, "OverflowCheck lhs")
+        b_ok := check_val_use_inst(&f, &dom, ins.op_b, bb, pos, ins.span_start, ins.span_end, &mut diags, "OverflowCheck rhs")
+        if !a_ok || !b_ok { return false }
+        if f.vals[ins.op_a].ty != f.vals[ins.op_b].ty || !ssa.is_int_ty(&types, f.vals[ins.op_a].ty) {
+            err(&f, &mut diags, ins.span_start, ins.span_end, "OverflowCheck operands must have identical integer TypeId")
+            ok = false
+        }
+        return ok
+    }
+    ok
+}
+
+fn verify_call_sig(types: &ht.TypeTable, f: &ssa.SsaFunc, dom: &ssa.DomTree,
+    bb: i32, tm: &ssa.SsaTerm, check_sig: bool, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if tm.arg_start < 0 || tm.arg_len < 0 || tm.arg_start + tm.arg_len > f.val_args.len {
+        err(&f, &mut diags, tm.span_start, tm.span_end, "Call arg slice out of bounds")
+        return false
+    }
+    for ai in 0..tm.arg_len {
+        av := f.val_args[tm.arg_start + ai]
+        if !check_val_use_term(&f, &dom, av, bb, tm.span_start, tm.span_end, &mut diags, "Call arg") {
+            ok = false
+        }
+    }
+    if tm.dest_val >= 0 {
+        if !valid_val(&f, tm.dest_val) {
+            err(&f, &mut diags, tm.span_start, tm.span_end, "Call invalid dest_val")
+            ok = false
+        } else {
+            dv := f.vals[tm.dest_val]
+            if dv.def_bb != bb || dv.def_inst != ssa.DEF_TERM_RESULT {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Call dest_val def_bb/def_inst mismatch")
+                ok = false
+            }
+        }
+    }
+    if check_sig && tm.sig_ty >= 0 && valid_ty(&types, tm.sig_ty) {
+        ret := ht.callable_ret(&types, tm.sig_ty)
+        if ret >= 0 && tm.dest_val >= 0 && valid_val(&f, tm.dest_val) && f.vals[tm.dest_val].ty != ret {
+            err(&f, &mut diags, tm.span_start, tm.span_end,
+                "Call dest_val TypeId " + f.vals[tm.dest_val].ty.str() + " != callee ret " + ret.str())
+            ok = false
+        }
+        p_cnt := ht.callable_param_count(&types, tm.sig_ty)
+        p_start := ht.callable_param_start(&types, tm.sig_ty)
+        is_var := ht.has_flag(&types, tm.sig_ty, ht.TF_VARIADIC)
+        if (!is_var && tm.arg_len != p_cnt) || (is_var && tm.arg_len < p_cnt) {
+            err(&f, &mut diags, tm.span_start, tm.span_end,
+                "Call arg count " + tm.arg_len.str() + " != signature param count " + p_cnt.str())
+            ok = false
+        } else {
+            chk := if is_var { p_cnt } else { tm.arg_len }
+            for ai in 0..chk {
+                av := f.val_args[tm.arg_start + ai]
+                if valid_val(&f, av) {
+                    pty := types.params[p_start + ai].ty
+                    if f.vals[av].ty != pty {
+                        err(&f, &mut diags, tm.span_start, tm.span_end,
+                            "Call arg " + ai.str() + " TypeId " + f.vals[av].ty.str() + " != param " + pty.str())
+                        ok = false
+                    }
+                }
+            }
+        }
+    }
+    ok
+}
+
+pub fn verify_func(types: &ht.TypeTable, f: &ssa.SsaFunc, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if !types.sealed {
+        err(&f, &mut diags, 0, 0, "TypeTable must be sealed before ssa_verify")
+        return false
+    }
+    if f.blocks.len == 0 {
+        err(&f, &mut diags, 0, 0, "SsaFunc has no basic blocks")
+        return false
+    }
+    if !valid_ty(&types, f.ret_ty) {
+        err(&f, &mut diags, 0, 0, "SsaFunc invalid ret_ty " + f.ret_ty.str())
+        return false
+    }
+
+    // 1. Verify StackSlots (exact size, align)
+    for si in 0..f.slots.len {
+        sl := &f.slots[si]
+        if sl.id != si {
+            err(&f, &mut diags, 0, 0, "StackSlot " + si.str() + " id mismatch")
+            ok = false
+        }
+        if sl.dead { continue }
+        if !valid_ty(&types, sl.ty) {
+            err(&f, &mut diags, 0, 0, "StackSlot " + si.str() + " invalid TypeId " + sl.ty.str())
+            ok = false
+            continue
+        }
+        te := &types.entries[sl.ty]
+        if sl.size != te.size || sl.align != te.align {
+            err(&f, &mut diags, 0, 0,
+                "StackSlot " + si.str() + " layout mismatch: (" + sl.size.str() + "," + sl.align.str() +
+                ") != (" + te.size.str() + "," + te.align.str() + ")")
+            ok = false
+        }
+    }
+
+    // 2. Verify function param_vals
+    for pi in 0..f.param_vals.len {
+        pv := f.param_vals[pi]
+        if !valid_val(&f, pv) {
+            err(&f, &mut diags, 0, 0, "fn param " + pi.str() + " invalid SsaVal")
+            ok = false
+            continue
+        }
+        if f.vals[pv].def_bb != 0 || f.vals[pv].def_inst != ssa.DEF_FN_PARAM {
+            err(&f, &mut diags, 0, 0, "fn param " + pi.str() + " must have def_bb=0, def_inst=DEF_FN_PARAM")
+            ok = false
+        }
+        if !valid_ty(&types, f.vals[pv].ty) {
+            err(&f, &mut diags, 0, 0, "fn param " + pi.str() + " invalid TypeId")
+            ok = false
+        }
+    }
+
+    // 3. Structural CFG & preds verification
+    n_bbs := f.blocks.len
+    mut expected_preds: []i32 = []
+    for _ in 0..n_bbs { expected_preds.push(0) }
+    mut succs: []i32 = []
+    for bb in 0..n_bbs {
+        blk := f.blocks[bb]
+        if blk.params_start < 0 || blk.params_len < 0 || blk.params_start + blk.params_len > f.block_params.len {
+            err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid params slice")
+            ok = false
+        }
+        if blk.inst_start < 0 || blk.inst_len < 0 || blk.inst_start + blk.inst_len > f.block_insts.len {
+            err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid insts slice")
+            ok = false
+        }
+        if blk.pred_start < 0 || blk.pred_len < 0 || blk.pred_start + blk.pred_len > f.preds.len {
+            err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid preds slice")
+            ok = false
+        }
+        if blk.term_id < 0 || blk.term_id >= f.terms.len {
+            err(&f, &mut diags, 0, 0, "bb" + bb.str() + " missing terminator")
+            ok = false
+            continue
+        }
+        ssa.term_succs(&f, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            if s < 0 || s >= n_bbs {
+                err(&f, &mut diags, 0, 0, "bb" + bb.str() + " out-of-range successor bb" + s.str())
+                ok = false
+            } else {
+                expected_preds[s] += 1
+            }
+        }
+    }
+    for bb in 0..n_bbs {
+        if f.blocks[bb].pred_len != expected_preds[bb] {
+            err(&f, &mut diags, 0, 0, "bb" + bb.str() + " pred count mismatch (did you call compute_preds?)")
+            ok = false
+        } else {
+            // Also confirm every recorded pred actually has an edge to bb
+            ps := f.blocks[bb].pred_start
+            for pi in 0..f.blocks[bb].pred_len {
+                p := f.preds[ps + pi]
+                if p < 0 || p >= n_bbs {
+                    err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid pred bb" + p.str())
+                    ok = false
+                } else {
+                    ssa.term_succs(&f, p, &mut succs)
+                    mut found := false
+                    for si in 0..succs.len {
+                        if succs[si] == bb { found = true; break }
+                    }
+                    if !found {
+                        err(&f, &mut diags, 0, 0, "bb" + bb.str() + " lists non-predecessor bb" + p.str())
+                        ok = false
+                    }
+                }
+            }
+        }
+    }
+    if !ok { return false }
+
+    // 4. Compute dominator tree & verify all reachable blocks' params, instructions, dominance & terminators
+    dom := ssa.compute_doms(&f)
+    mut def_seen: []bool = []
+    for _ in 0..f.vals.len { def_seen.push(false) }
+    for pi in 0..f.param_vals.len {
+        pv := f.param_vals[pi]
+        if def_seen[pv] {
+            err(&f, &mut diags, 0, 0, "duplicate fn param SsaVal v" + pv.str())
+            ok = false
+        }
+        def_seen[pv] = true
+    }
+
+    for ri in 0..dom.rpo_order.len {
+        bb := dom.rpo_order[ri]
+        blk := f.blocks[bb]
+
+        // Block params
+        for pi in 0..blk.params_len {
+            pv := f.block_params[blk.params_start + pi]
+            if !valid_val(&f, pv) {
+                err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid block param id")
+                ok = false
+                continue
+            }
+            if f.vals[pv].def_bb != bb || f.vals[pv].def_inst != ssa.DEF_BLOCK_PARAM {
+                err(&f, &mut diags, 0, 0, "bb" + bb.str() + " block param v" + pv.str() + " def mismatch")
+                ok = false
+            }
+            if !valid_ty(&types, f.vals[pv].ty) {
+                err(&f, &mut diags, 0, 0, "bb" + bb.str() + " block param v" + pv.str() + " invalid TypeId")
+                ok = false
+            }
+            if def_seen[pv] {
+                err(&f, &mut diags, 0, 0, "duplicate SSA definition of v" + pv.str())
+                ok = false
+            }
+            def_seen[pv] = true
+        }
+
+        // Instructions
+        for pos in 0..blk.inst_len {
+            iid := f.block_insts[blk.inst_start + pos]
+            if iid < 0 || iid >= f.insts.len {
+                err(&f, &mut diags, 0, 0, "bb" + bb.str() + " invalid inst id " + iid.str())
+                ok = false
+                continue
+            }
+            ins := f.insts[iid]
+            if ssa.inst_produces_val(ins.kind) && valid_val(&f, ins.res) {
+                if def_seen[ins.res] {
+                    err(&f, &mut diags, ins.span_start, ins.span_end, "duplicate SSA definition of v" + ins.res.str())
+                    ok = false
+                }
+                def_seen[ins.res] = true
+            }
+            if !verify_inst(&types, &f, &dom, bb, pos, iid, &mut diags) {
+                ok = false
+            }
+        }
+
+        // Terminator
+        tm := f.terms[blk.term_id]
+        if tm.kind == .Goto {
+            if !check_edge_args(&types, &f, &dom, bb, tm.target_a, tm.arg_start, tm.arg_len,
+                tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+        } else if tm.kind == .Branch {
+            if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "Branch cond") {
+                ok = false
+            } else if f.vals[tm.cond_val].ty != ht.TY_BOOL {
+                err(&f, &mut diags, tm.span_start, tm.span_end,
+                    "Branch cond must have TY_BOOL, got " + f.vals[tm.cond_val].ty.str())
+                ok = false
+            }
+            if !check_edge_args(&types, &f, &dom, bb, tm.target_a, tm.arg_start, tm.arg_len,
+                tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+            if !check_edge_args(&types, &f, &dom, bb, tm.target_b, tm.arg2_start, tm.arg2_len,
+                tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+        } else if tm.kind == .Switch {
+            if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "Switch val") {
+                ok = false
+            }
+            if tm.case_start < 0 || tm.case_len < 0 || tm.case_start + tm.case_len > f.switch_bbs.len {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Switch case slice out of bounds")
+                ok = false
+            } else {
+                for ci in 0..tm.case_len {
+                    c_bb := f.switch_bbs[tm.case_start + ci]
+                    c_as := f.switch_arg_starts[tm.case_start + ci]
+                    c_al := f.switch_arg_lens[tm.case_start + ci]
+                    if !check_edge_args(&types, &f, &dom, bb, c_bb, c_as, c_al,
+                        tm.span_start, tm.span_end, &mut diags) {
+                        ok = false
+                    }
+                }
+            }
+            if !check_edge_args(&types, &f, &dom, bb, tm.target_a, tm.arg_start, tm.arg_len,
+                tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+        } else if tm.kind == .Call || tm.kind == .ExternCall {
+            if !verify_call_sig(&types, &f, &dom, bb, &tm, true, &mut diags) { ok = false }
+            if tm.dest_val >= 0 && valid_val(&f, tm.dest_val) {
+                if def_seen[tm.dest_val] {
+                    err(&f, &mut diags, tm.span_start, tm.span_end, "duplicate SSA definition of call dest_val")
+                    ok = false
+                }
+                def_seen[tm.dest_val] = true
+            }
+            if tm.target_a < 0 || tm.target_a >= n_bbs || f.blocks[tm.target_a].params_len != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Call next_bb invalid or expects block params")
+                ok = false
+            }
+        } else if tm.kind == .IndirectCall {
+            if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "IndirectCall callee") {
+                ok = false
+            }
+            if tm.env_val >= 0 && !check_val_use_term(&f, &dom, tm.env_val, bb, tm.span_start, tm.span_end, &mut diags, "IndirectCall env") {
+                ok = false
+            }
+            if !verify_call_sig(&types, &f, &dom, bb, &tm, true, &mut diags) { ok = false }
+            if tm.dest_val >= 0 && valid_val(&f, tm.dest_val) {
+                if def_seen[tm.dest_val] {
+                    err(&f, &mut diags, tm.span_start, tm.span_end, "duplicate SSA definition of IndirectCall dest_val")
+                    ok = false
+                }
+                def_seen[tm.dest_val] = true
+            }
+            if tm.target_a < 0 || tm.target_a >= n_bbs || f.blocks[tm.target_a].params_len != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "IndirectCall next_bb invalid or expects block params")
+                ok = false
+            }
+        } else if tm.kind == .IntrinsicCall {
+            if !verify_call_sig(&types, &f, &dom, bb, &tm, false, &mut diags) { ok = false }
+            if tm.dest_val >= 0 && valid_val(&f, tm.dest_val) {
+                if def_seen[tm.dest_val] {
+                    err(&f, &mut diags, tm.span_start, tm.span_end, "duplicate SSA definition of IntrinsicCall dest_val")
+                    ok = false
+                }
+                def_seen[tm.dest_val] = true
+            }
+            if tm.target_a < 0 || tm.target_a >= n_bbs || f.blocks[tm.target_a].params_len != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "IntrinsicCall next_bb invalid or expects block params")
+                ok = false
+            }
+        } else if tm.kind == .TaskScopeEnter || tm.kind == .TaskScopeJoin ||
+            tm.kind == .RegionEnter || tm.kind == .RegionExit {
+            if tm.cond_val >= 0 {
+                if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "Scope term val") {
+                    ok = false
+                }
+            }
+            if tm.arg_len > 0 {
+                if tm.arg_start < 0 || tm.arg_start + tm.arg_len > f.val_args.len {
+                    err(&f, &mut diags, tm.span_start, tm.span_end, "TaskScopeEnter arg slice out of bounds")
+                    ok = false
+                } else {
+                    for ai in 0..tm.arg_len {
+                        av := f.val_args[tm.arg_start + ai]
+                        if av >= 0 && !check_val_use_term(&f, &dom, av, bb, tm.span_start, tm.span_end, &mut diags, "TaskScopeEnter arg") {
+                            ok = false
+                        }
+                    }
+                }
+            }
+            if tm.target_a < 0 || tm.target_a >= n_bbs || f.blocks[tm.target_a].params_len != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Scope terminator next_bb invalid or expects block params")
+                ok = false
+            }
+        } else if tm.kind == .Return {
+            if f.ret_ty == ht.TY_UNIT {
+                if tm.cond_val >= 0 {
+                    if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "Return val") {
+                        ok = false
+                    } else if f.vals[tm.cond_val].ty != ht.TY_UNIT {
+                        err(&f, &mut diags, tm.span_start, tm.span_end, "Return value in unit function must be TY_UNIT or -1")
+                        ok = false
+                    }
+                }
+            } else {
+                if !check_val_use_term(&f, &dom, tm.cond_val, bb, tm.span_start, tm.span_end, &mut diags, "Return val") {
+                    ok = false
+                } else if f.vals[tm.cond_val].ty != f.ret_ty {
+                    err(&f, &mut diags, tm.span_start, tm.span_end,
+                        "Return TypeId " + f.vals[tm.cond_val].ty.str() + " != func ret_ty " + f.ret_ty.str())
+                    ok = false
+                }
+            }
+        }
+    }
+
+    // 5. Balanced TaskScopeEnter/TaskScopeJoin and RegionEnter/RegionExit depth on all paths
+    mut visited: []bool = []
+    mut td: []i32 = []
+    mut rd: []i32 = []
+    for _ in 0..n_bbs { visited.push(false); td.push(0); rd.push(0) }
+    mut q: []i32 = [0]
+    visited[0] = true
+    mut head := 0
+    while head < q.len {
+        bb := q[head]; head += 1
+        tm := f.terms[f.blocks[bb].term_id]
+        mut ntd := td[bb]
+        mut nrd := rd[bb]
+        if tm.kind == .TaskScopeEnter { ntd += 1 }
+        else if tm.kind == .TaskScopeJoin {
+            if ntd <= 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "unmatched TaskScopeJoin (depth < 0)")
+                ok = false
+            } else { ntd -= 1 }
+        } else if tm.kind == .RegionEnter { nrd += 1 }
+        else if tm.kind == .RegionExit {
+            if nrd <= 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "unmatched RegionExit (depth < 0)")
+                ok = false
+            } else { nrd -= 1 }
+        } else if tm.kind == .Return {
+            if ntd != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Return with unbalanced TaskScope depth " + ntd.str())
+                ok = false
+            }
+            if nrd != 0 {
+                err(&f, &mut diags, tm.span_start, tm.span_end, "Return with unbalanced Region depth " + nrd.str())
+                ok = false
+            }
+        }
+        ssa.term_succs(&f, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            if !visited[s] {
+                visited[s] = true
+                td[s] = ntd
+                rd[s] = nrd
+                q.push(s)
+            } else if td[s] != ntd || rd[s] != nrd {
+                err(&f, &mut diags, tm.span_start, tm.span_end,
+                    "bb" + s.str() + " reached with conflicting TaskScope/Region depth")
+                ok = false
+            }
+        }
+    }
+
+    ok
+}
+
+pub fn verify_program(types: &ht.TypeTable, prog: &ssa.SsaProgram, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    for i in 0..prog.funcs.len {
+        if !verify_func(&types, &prog.funcs[i], &mut diags) {
+            ok = false
+        }
+    }
+    ok
+}
