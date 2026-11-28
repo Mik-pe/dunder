@@ -491,15 +491,19 @@ Garantier och semantik för `extern "<abi>" fn`-callbacks:
 2. **Registerbevarande**: callback-prologen sparar och återställer samtliga
    callee-saved register enligt målets ABI (inklusive `x19..x28` och `d8..d15`
    på ARM64 samt `XMM6..XMM15` på Win64).
-3. **OS-TLS för samtidighet, reentrans och främmande trådar**:
-   - Dunders trådlokala exekveringstillstånd (registerbank och allokatorkontext)
-     lagras i operativsystemets trådlokala lagring (OS-TLS), aldrig i en enda
-     delad global slot.
-   - Flera trådar kan samtidigt korsa FFI-gränsen och anropa callbacks utan
-     datakapplöpning.
+3. **Trådisolerade callbackramar och OS-TLS för samtidighet, reentrans och främmande trådar**:
+   - Dunders trådlokala exekveringstillstånd (arenaregister `x19..x24` på ARM64,
+     registerbank `r15` på x86-64 och allokatorkontext) sparas i per-tråd
+     stacklänkade `CallbackFrame`-poster och operativsystemets trådlokala
+     lagring (OS-TLS), aldrig i en enda delad global slot.
+   - Flera `task scope`-arbetare kan samtidigt anropa `@thread_safe`-märkta
+     `extern`-funktioner medan programmet även använder `extern "<abi>" fn`-callbacks
+     utan korruption av arbetarnas per-tråd-arenor.
    - Reentranta callbacks (exempelvis `DispatchMessageW` -> `WndProc` ->
-     Win32-anrop -> ny `WndProc`, eller nästlade AppKit-delegater) fungerar
-     genom att varje aktivering sparar och återställer föregående ramtillstånd.
+     Win32-anrop -> ny `WndProc`, eller nästlade AppKit-delegater) fungerar med
+     obegränsat djup genom att varje aktivering länkar in och återställer sin
+     föregående `CallbackFrame` (och skriver tillbaka eventuell arenatillväxt
+     från callbacken till anroparens ram).
    - **Främmande OS-trådar** (t.ex. Metal-kompletteringshanterare,
      ljudcallbacks eller drivrutinstrådar): om en callback anropas på en tråd
      som inte skapats av Dunder kopplas automatiskt en lättvikts, trådisolerad
@@ -575,7 +579,10 @@ exempelvis `capability filesystem, unsafe`.
   `capability unsafe`, får modul A **aldrig** ärva `unsafe`-behörighet.
 - Utan `capability unsafe` i modulens eget huvud avvisas `extern`-block,
   `extern "<abi>" fn`-definitioner, `unsafe fn`, `unsafe { ... }`,
-  `@thread_safe` samt `impl Sendable` för resurser som innehåller råpekare.
+  `@thread_safe`, destrukturering av `@resource(dispose)` samt
+  `unsafe impl Sendable` och `unsafe impl Sync` (för `@resource`, råpekare
+  eller interiör muterbarhet). Verifierad säker `impl Sendable`/`impl Sync`
+  för icke-`@resource` `opaque struct`-typer kräver inte `capability unsafe`.
 - Säker kod får anropa publika, säkra omslagsfunktioner som exponerats av en
   `unsafe`-modul, under förutsättning att omslaget upprätthåller kontrakten för
   livstid, justering, nullfrihet och aliasing.
@@ -1073,8 +1080,9 @@ extern "C" {
 
 ## 6. Migrering från äldre FFI-syntax
 
-Den äldre FFI-ytan fasas ut under migreringen av `stdlib/`, `packages/`,
-`tests/` och `tools/`:
+Den äldre FFI-ytan (`@extern`, `@c_layout`, `@c_variadic`, `callback(...)`,
+`cstr` och `ref_at`) har tagits bort helt inför 1.0 och ersatts av följande
+konstruktioner:
 
 | Äldre konstruktion | Ny specifikation |
 | --- | --- |

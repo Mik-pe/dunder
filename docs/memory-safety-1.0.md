@@ -1,6 +1,7 @@
 # Dunder 1.0 Architecture Specification: Memory Safety, Borrow Checking, Calls & IR Pipeline
 
-**Status:** Peer-reviewed architectural blueprint (baseline `dunder 0.13.1`, HEAD `ee96969`)  
+**Status:** 1.0 Specification Locked — Phase 0 shipped & 3-host verified (`07c7c6e`); Wave 2B FFI shipped (`cb8fa9d`); Phases 1–4 implemented (`selfhost/hir/`, `selfhost/mir2/`, `selfhost/ssa/`, `arm64_enc`/`x86_enc`/`object_module`, native `arm64_isel`/`x86_isel`/`wasm_isel` through `15b35b0`); Phase 5 documentation sync & final RC cutover in progress.  
+**Audit Baseline:** `dunder 0.13.1` (HEAD `ee96969`) -> `1.0`  
 **Scope:** Language semantics, ownership/borrow model, concurrency & runtime boundaries, unidirectional compiler IR pipeline, and staged `0.13.2 -> 1.0` self-host migration plan.  
 **Core Goals Preserved:** Self-hosted in `.ddr`, fast native compilation (~300k LOC/s clean, <100 ms p95 incremental), zero LLVM / zero GC, ergonomic syntax without lifetime soup, unboxed POD values (`<= 128B`), structured concurrency with per-thread arenas, and all 6 targets (`arm64-macos`, `arm64-linux`, `x86_64-linux`, `x86_64-windows`, `wasm32`, `wasm32-wasi`).
 
@@ -420,18 +421,9 @@ All dataflow sets use packed `[]u64` bitsets (typically 1–2 `u64` words per fu
    - Closures pass `env_ptr` as hidden ABI arg 0; owned closures carry `[entry_fn, drop_fn, caps...]`; borrowed closures use a typed `StackSlot`.
    - Native per-target calling conventions in Phase 4 (`x0..x7` on ARM64; SysV `rdi..r9`/`xmm0..7` and Win64 `rcx..r9` + 32B shadow on x86_64; native typed locals + per-signature `call_indirect` type indices on WASM).
 
-2. **Thread-Safe, Re-Entrant FFI Callback Bridge (Zero Custom Linker TLS Changes)**:
-   - Custom linkers (`elf.ddr`, `macho.ddr`, `pe.ddr`) emit no native TLS sections (`PT_TLS`/TLV/`.tls`). Instead, use OS dynamic TLS keys via already-imported system libraries:
-     - macOS / Linux: `pthread_key_create`, `pthread_getspecific`, `pthread_setspecific`.
-     - Windows (`kernel32.dll`): `TlsAlloc`, `TlsGetValue`, `TlsSetValue`.
-     - WASM: single-threaded linear memory with `__indirect_function_table` (no TLS required).
-   - Initialize one global `cb_key` at `_start` **only when `has_callbacks` is true**.
-   - At every `@extern` call site when `has_callbacks` is true (required even when the call takes no `callback(...)` arg, e.g. `objc_msgSend(app, sel("run"))` invoking a callback previously registered via `class_addMethod`; leaf C calls may opt out later via `@no_callback`):
-     1. Allocate a stack-local **`CallbackFrame { prev: ptr, saved_regs: [x19..x24] / r15 }`** in the calling Dunder frame (zero heap allocation, unbounded re-entrancy, zero thread-exit destructors).
-     2. Read `frame.prev = tls_get(cb_key)`, write `tls_set(cb_key, &frame)`.
-     3. Invoke the foreign function.
-     4. Reload `x19..x24` (or `r15`) from `frame` (preserving any arena growth done inside callbacks!) and restore `tls_set(cb_key, frame.prev)`.
-   - On callback trampoline entry: `frame = tls_get(cb_key)`; if `frame == NULL` -> **trap 111** (rejects foreign OS threads safely); load Dunder runtime registers from `frame`; call Dunder callback body; write updated `x19..x21` back to `frame` before returning to C. Fixes **S-7** with zero cross-thread contention.
+2. **Thread-Safe, Re-Entrant FFI Callback Bridge (Wave 2B `extern "<abi>" fn` + Per-Thread `CallbackFrame` / OS-TLS)**:
+   - Legacy `callback(...)` was removed in Wave 2B (`cb8fa9d`) in favor of top-level `extern "<abi>" fn` callbacks.
+   - Per-thread stack-linked **`CallbackFrame { prev, saved_regs }`** (`runtime.ddr`: `callback_push`/`callback_pop`/`callback_find`) combined with OS dynamic TLS (`pthread_key_*` on macOS/Linux, `Tls*` on Windows in `ffi_abi.ddr` — zero custom linker TLS sections needed) eliminates cross-thread arena register (`x19..x24` / `r15`) races across concurrent `task scope` workers, supports unbounded re-entrancy and registered event-loop callbacks (e.g., `objc_msgSend`), persists arena growth inside callbacks back to the caller, and attaches lightweight isolated TLS contexts on foreign OS threads (WASM uses single-threaded linear memory + `__indirect_function_table`). Fixes **S-7** with zero cross-thread contention.
 
 3. **Phase 3 Backend & Runtime Decoupling Prerequisites (Required Before Phase 4 Native ISel)**:
    - **Port Runtime & Generated Type Helpers to SSA MIR / `.ddr`**: Today `selfhost/runtime/{runtime.ddr, program_emit.ddr}` and `selfhost/frontend/backend_emit.ddr` emit raw ARM64 `arm.Code` expecting `x0..x7`/`x19..x24`, translated via `[r15]` bank on x86_64 and globals `0..31` on WASM. Switching x86_64/WASM user code to native ABIs requires porting `runtime.ddr`, `program_emit.ddr`, `backend_emit.ddr`, `task_scope_emit.ddr`, and `task_native.ddr` to emit **SSA MIR** (or pure `.ddr` compiled through SSA MIR -> target LIR), leaving only tiny target-specific `_start`/syscall/TLS stubs.
@@ -471,41 +463,41 @@ All dataflow sets use packed `[]u64` bitsets (typically 1–2 `u64` words per fu
 
 Every phase MUST maintain `tools/bootstrap.sh` (seed -> stage1 -> stage2 == stage3 byte-identical), `tools/verify-selfhost.sh`, parallel builds, and all 6 targets:
 
-#### Phase 0 (`0.13.2`) — Immediate P0/P1 Stopgap Patch Release
-- Land all Phase 0 stopgaps from the Traceability Matrix (**S-1..S-13, C-1, R-1, R-2, R-4**).
-- Add all 12+ adversarial reproducers as permanent regression tests in `tests/`.
-- Verify via `tools/bootstrap.sh` + `tools/verify-selfhost.sh` on macOS ARM64 and Kiri Linux ARM64/x86_64.
+#### Phase 0 (`0.13.2`) — Immediate P0/P1 Stopgap Patch Release `[DONE — 07c7c6e]`
+- Landed all Phase 0 stopgaps from the Traceability Matrix (**S-1..S-13, C-1, R-1, R-2, R-4**) and Wave 2B FFI cleanup (`cb8fa9d`).
+- Added permanent regression suite `tools/test_phase0_soundness.ddr` (32 checks, Tier 0).
+- Verified via 3-stage `tools/bootstrap.sh` + `tools/verify-selfhost.sh` across `arm64-macos` (88/88), `arm64-linux` (84/84), `x86_64-linux` (84/84), and adversarial red-team verification (0/58 exploits).
 
-#### Phase 1 (`0.14`) — Dual-Check V2 Frontend (`AST -> Typed HIR -> HL-MIR`, Zero Throwaway Codegen)
+#### Phase 1 (`0.14`) — Dual-Check V2 Frontend (`AST -> Typed HIR -> HL-MIR`, Zero Throwaway Codegen) `[DONE]`
 *Do NOT build a throwaway `HIR -> legacy compile.ddr` emitter.*
-1. Complete `selfhost/frontend/ast.ddr` + `parser.ddr` for full language coverage and unify parsing across `build`, `check`, `fmt`, and `lsp`.
-2. Build `selfhost/hir/` (name resolution, type inference with `ParamMode::BorrowOrCopy`, trait checking, non-lending `Iterator` enforcement, first-class closure structs with `PARAM_ENV`, HIR monomorphization, single sealed `TypeTable`, typed internal `__sys_*` declarations).
-3. Build `selfhost/mir2/` HL-MIR pipeline (`mir_build` with shared `defer_bb` & LIFO `ScopeNode`, `mir_verify`, `mir_init`, Polonius-lite `mir_borrowck` with invariance & `dropck`, `mir_escape`, `mir_drop_elab`).
-4. Expose as `--check-v2` running side-by-side with legacy `compile.ddr` (which continues codegen untouched). Validate 100% parity across `selfhost/`, `stdlib/`, `tests/`, and `../dunder-hundmat`, confirming **C-1..C-3** are resolved and zero false regressions exist.
+1. Completed `selfhost/frontend/ast.ddr` + `parser.ddr` for full language coverage and unified parsing across `build`, `check`, `fmt`, and `lsp`.
+2. Built `selfhost/hir/` (`hir_types.ddr`, `hir_body.ddr`, `hir_lower.ddr`, `hir_mono.ddr`) with `ParamMode::BorrowOrCopy`, trait checking, non-lending `Iterator`, first-class closure structs with `PARAM_ENV`, HIR monomorphization, single sealed `TypeTable`, and typed internal intrinsics.
+3. Built `selfhost/mir2/` HL-MIR pipeline (`mir_body.ddr`, `mir_build.ddr` with shared `defer_bb` & LIFO `ScopeNode`, `mir_verify.ddr`, `mir_init.ddr`, Polonius-lite `mir_borrowck.ddr` with invariance & `dropck`, `mir_escape.ddr`, `mir_drop_elab.ddr`, `mir_check.ddr`).
+4. Exposed as `--check-v2` and validated across `selfhost/`, `stdlib/`, `tests/`, and `../dunder-hundmat`, resolving **C-1..C-3**.
 
-#### Phase 2 (`0.15`) — Single Thin Cutover Bridge & Legacy Frontend Deletion
-1. Implement a single thin (~600–900 LOC) **`Post-Drop HL-MIR -> arm.Code`** bridge (post-drop HL-MIR has only ~15 flat statements/terminators, zero borrow state, zero drop-flag computation, and zero token lookahead) plus 2-word `(ptr, len)` views (`&str`, `&[]T`).
-2. Switch all 6 targets to the V2 frontend through this thin bridge, verifying 2-stage byte-identical self-hosting on all 3 bootstrap hosts (`arm64-macos`, `arm64-linux`, `x86_64-linux`).
+#### Phase 2 (`0.15`) — Single Thin Cutover Bridge & Legacy Frontend Deletion `[2A/2B DONE (`d2d4b17`..`aa8f52b`); 2C Cutover IN PROGRESS]`
+1. Implemented the `Post-Drop HL-MIR -> arm.Code` bridge (`selfhost/mir2/{mir_emit.ddr, mir_emit_ffi.ddr, mir_emit_tasks.ddr, mir_emit_helpers.ddr}`), `--build-v2`, Wave 2B FFI + `task scope` + `std.sync` + `-g` DWARF parity, and differential test suites (`aa8f52b`).
+2. Complete Phase 2C full self-host parity & default cutover across all 6 targets, verifying 2-stage byte-identical self-hosting on all 3 bootstrap hosts (`arm64-macos`, `arm64-linux`, `x86_64-linux`).
 3. **Delete in one clean cutover:** `compile.ddr`, `generics.ddr`, `closures.ddr`, `variant_functions.ddr`, `open_bodies.ddr`, `ownership_check.ddr`, `local_borrows.ddr`, `borrows.ddr`, `ownership_lease.ddr`, `deferred_blocks.ddr`, `scratch.ddr`, `borrowed_view.ddr`, `mir_owners.ddr`, and `selfhost/opt/*`.
 4. Refresh frozen bootstrap seeds.
 
-#### Phase 3 (`0.16`) — Target-Independent SSA MIR Optimizer & Runtime/Encoder Decoupling
-1. Lower Post-Drop HL-MIR -> Target-Independent SSA MIR (typed virtual values, explicit `StackSlot(size, align)`, zero ARM64 regs/flags) with `MirVerifier` enforced after every pass.
-2. Implement unified SSA MIR inliner, SROA/mem2reg, GVN/const-prop, bounds/overflow check elision, and DCE. Delete `mir_lift.ddr`, `mir_expr_stack.ddr`, `mir_retained.ddr`, `mir_preserve.ddr`, `mir_call_inputs.ddr`, `mir_source_call.ddr`, `stack_option_argument`, and `catalog.predicates`/`converters`.
+#### Phase 3 (`0.16`) — Target-Independent SSA MIR Optimizer & Runtime/Encoder Decoupling `[3A/3B DONE (`9d289ad`, `a2cc37b`); Runtime Port IN PROGRESS]`
+1. Implemented Target-Independent SSA MIR (`selfhost/ssa/{ssa_ir.ddr, ssa_lower.ddr, ssa_verify.ddr, ssa_opt.ddr}` — typed virtual values, `StackSlot(size, align)`, zero ARM64 regs/flags) with `ssa_verify` enforced after every pass (`a2cc37b`).
+2. Implemented unified SSA MIR optimizer: SROA/Mem2Reg, SSA MIR inliner, GVN/const-fold/copy-prop, bounds/overflow check elision, and CFG simplification/DCE.
 3. **Backend/runtime decoupling prerequisites:**
-   - Port `backend_emit.ddr` (generated clone/drop/iso helpers), `selfhost/runtime/{runtime.ddr, program_emit.ddr}`, and `selfhost/tasks/{task_scope_emit.ddr, task_native.ddr}` to emit SSA MIR / pure `.ddr` (fixing macOS `x29` and x86_64 unused worker stack).
-   - Extract stateless `arm64_enc.ddr` and `x86_enc.ddr`; strip ARM64 global-bank ops from `wasm_bytes.ddr`; replace `mir_link.ddr`'s `arm.Code`-backed `LinkedImage` with target-neutral `ObjectModule`.
+   - Extracted stateless `selfhost/backend/arm64_enc.ddr`, `selfhost/backend/x86_enc.ddr`, and target-neutral `selfhost/backend/object_module.ddr` (`9d289ad`).
+   - Port `backend_emit.ddr`, `selfhost/runtime/{runtime.ddr, program_emit.ddr}`, and `selfhost/tasks/{task_scope_emit.ddr, task_native.ddr}` to SSA MIR / pure `.ddr` and strip legacy ARM64 global-bank ops from `wasm_bytes.ddr`.
 4. Gate: byte-identical selfhost + `--exhaustive` MIR oracle + `dunder-hundmat` benchmark parity.
 
-#### Phase 4 (`0.17`) — Native Target LIR/ISel for ARM64, x86_64 & WASM
-1. Lower SSA MIR directly to native per-target LIR + regalloc:
-   - `arm64_isel` -> `arm64_enc.ddr` -> `ObjectModule` -> `macho.ddr` / `elf.ddr` / `dwarf.ddr`.
-   - `x86_isel` (native SysV & Win64 ABI, deleting `[r15]` virtual register bank emulation) -> `x86_enc.ddr` -> `ObjectModule` -> `elf.ddr` / `pe.ddr` / `dwarf.ddr`.
-   - `wasm_isel` (native typed Wasm locals + per-signature `call_indirect`, deleting global `0..31` emulation) -> `wasm_bytes.ddr` -> `wasm_memory.ddr` / `wasm_abi.ddr`.
-2. Update `fragments.ddr` and `compile_parallel.ddr` to cache and compile per-function `HIR -> MIR -> ObjectModule` fragments.
+#### Phase 4 (`0.17`) — Native Target LIR/ISel for ARM64, x86_64 & WASM `[4A/4B/4C ISel DONE (`388a324`, `fc3e2fc`, `2188279`, `15b35b0`); Linker/Cache Wiring IN PROGRESS]`
+1. Implemented native per-target LIR + linear-scan register allocation / typed-local lowering over SSA MIR:
+   - `selfhost/backend/arm64_isel.ddr` -> `arm64_enc.ddr` -> `object_module.ddr` -> `macho.ddr` / `elf.ddr` / `dwarf.ddr` (`388a324`).
+   - `selfhost/backend/x86_isel.ddr` (native SysV & Win64 ABI, zero `[r15]` virtual register bank emulation) -> `x86_enc.ddr` -> `object_module.ddr` -> `elf.ddr` / `pe.ddr` / `dwarf.ddr` (`fc3e2fc`).
+   - `selfhost/backend/wasm_isel.ddr` (native typed Wasm locals + per-signature `call_indirect`, zero global `0..31` emulation) -> `wasm_bytes.ddr` -> `wasm_memory.ddr` / `wasm_abi.ddr` (`2188279`).
+2. Update `fragments.ddr` and `compile_parallel.ddr` to cache and compile per-function `HIR -> MIR -> SSA -> ObjectModule` fragments.
 3. Gate: full 6-target verification (macOS ARM64, Kiri Linux ARM64 & x86_64, native Windows x86_64, Node WASM/WASI) + <100 ms p95 incremental build check.
 
-#### Phase 5 (`0.18 -> 1.0 RC`) — Adversarial Verification, Spec Lock & Seed Freeze
-1. Re-run full adversarial soundness suite (215+ probes + CFG borrow/drop/concurrency fuzzing across all 6 targets) and full `dunder-hundmat` dogfooding.
-2. Synchronize `docs/memory.md`, `docs/arkitektur.md`, `docs/ffi.md`, `docs/tasks.md`, and `docs/syntax.md` with finalized 1.0 contracts.
+#### Phase 5 (`0.18 -> 1.0 RC`) — Adversarial Verification, Spec Lock & Seed Freeze `[IN PROGRESS]`
+1. Synchronized `docs/memory.md`, `docs/arkitektur.md`, `docs/ffi.md`, `docs/tasks.md`, `docs/syntax.md`, and `docs/memory-safety-1.0.md` with finalized 1.0 contracts `[DONE]`.
+2. Re-run full adversarial soundness suite (215+ probes + CFG borrow/drop/concurrency fuzzing across all 6 targets) and full `dunder-hundmat` dogfooding on the unified V2/SSA/native-ISel pipeline.
 3. Generate and verify final byte-identical 1.0 bootstrap seeds across all 3 hosts and tag `1.0.0`.

@@ -28,12 +28,12 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | Vanlig `for value in values` | Läslån av samlingen under loopen. |
 
 Regeln för flytt gäller `string`, dynamiska arrayer (`[]T`), iteratorer,
-fångande closures (`Fn`, `FnMut`, `FnOnce`) samt fasta arrayer `[T; N]`, structar och enums som innehåller
+`&mut T`, fångande closures (`Fn`, `FnMut`, `FnOnce`) samt fasta arrayer `[T; N]`, structar och enums som innehåller
 flyttbundna värden (inklusive `Map`, `Set` och `@resource`). Tal, bool, runes, pekare, rena
-funktionspekare (`fn(...)`), fältlösa enums och `Copy`-värden (nästlade structar,
+funktionspekare (`fn(...)`), delade vyer (`&T`, `&str`, `&[]T`), fältlösa enums och `Copy`-värden (nästlade structar,
 tupler, data-enums och fasta arrayer `[T; N]` vars element är `Copy`) kopieras i stället vid tilldelning och retur.
-`Fn(...)` implementerar `Clone` via referensräkning i miljön så att
-flera ägare kräver ett explicit `.clone()` eller `move`. När en `Copy`-struct,
+`&str` och `&[]T` är förstklassiga 2-ords `Copy`-värden `(ptr, len)` (16 byte på 64-bitars nativa mål, 8 byte på `wasm32`) som skickas och returneras direkt i register utan stackbeskrivare.
+`Fn(...)` implementerar `Clone` via referensräkning i miljön **endast när alla fångade fält är `Clone`**; en `Fn` som fångar en icke-klonbar `@resource` kan skapas och anropas, men `.clone()` avvisas statiskt. `FnMut` och `FnOnce` är aldrig `Clone`. När en `Copy`-struct,
 tupel, payload-enum eller positiv fast array `[T; N]` av POD-element ryms inom 16 åttabyte-ord (upp till 128 byte för fasta arrayer) lagras den som ett platt
 inline POD-värde på stacken (utan heapallokering eller referensräkning), och lån
 (`&T`/`&mut T`) passerar buffertpekaren direkt (`T*`) på samma sätt som för
@@ -67,15 +67,27 @@ Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `File
 `sqlite.Database`, kanaler (`Sender`/`Receiver`), `Child`,
 `ChildSet`, `ChildStdin`, `ChildStdout`, `ChildStderr`, `FileReader`,
 `FileWriter` samt allokeringsbehållarna `Bump`, `OwnedBuf`, `Arena` och
-`FrozenArena` är sådana resurser. Handtag som `TcpListener`, `TcpStream`,
-`UdpSocket`, `File`, `sqlite.Database`, `Sender<T>` och `Receiver<T>` implementerar
-dessutom `Sendable` med strikt `move`-överföring mellan trådar (ingen kloning;
-sändarens ägarslot nollställs), och `task scope`-arbetsytor kan även äga
-`@resource(dispose)`-fält som stängs på ägarens tråd när scopet avslutas. Fil- och körningskapabiliteter som bara
+`FrozenArena` är sådana resurser. Allokator- och bufferttyperna i `std.alloc`
+(`OwnedBuf<A>`, `Bump<A>`, `Arena<A>`, `FrozenArena<A>`, `Capped<A>`, `Block`
+och `Layout`) är förseglade som `pub opaque struct` så att säker kod inte kan
+förfalska interna pekare, längder eller kapaciteter (läsåtkomst sker via säkra
+metoder som `.len()`, `.cap()`, `.size()`, `.align()`, `.used()` och `.remaining()`).
+Råa OS-filbeskrivaranrop i `std.sys` (`sys.net_read`, `sys.net_write`,
+`sys.net_close`, `sys.net_poll` och `sys.fd_*`) är `unsafe fn`; säker kod
+använder i stället ägda `@resource`-handtag i `std.net` och `std.fs`.
+Handtag som `TcpListener`, `TcpStream`, `UdpSocket`, `File` och `sqlite.Database`
+implementerar `unsafe impl Sendable` med strikt `move`-överföring mellan trådar
+(ingen kloning; sändarens ägarslot nollställs), medan trådsäkra synkroniseringshandtag
+som `Sender<T>`, `Receiver<T>`, `Published<T>`, `Semaphore`, `CancelToken`,
+`AtomicI64`, `AtomicBool` och `Waker` även deklarerar `unsafe impl Sync`.
+`task scope`-arbetsytor kan även äga `@resource(dispose)`-fält som stängs på
+ägarens tråd när scopet avslutas. Fil- och körningskapabiliteter som bara
 innehåller en sökväg kan däremot uttryckligen klonas.
-Lokala resurser i en worker följer scopets beviljade kapabiliteter och effektregler. Transport över en
-isolerad taskgräns kräver `Sendable`-värden; frysta ögonblicksbilder kan även delas låsfritt via `std.sync.Published<T>` och `ReadGuard<T>`. Resurstyper använder Dunders
-vanliga structlayout och lagras som ägda värden.
+Lokala resurser i en worker följer scopets beviljade kapabiliteter och effektregler.
+Transport över en isolerad taskgräns kräver `Sendable`-värden; frysta ögonblicksbilder
+i `std.sync.Published<T>` och `task scope (shared ...)` kräver `T: Sendable + Sync`
+(se [Isolerade uppgifter](tasks.md)). Resurstyper använder Dunders vanliga structlayout
+och lagras som ägda värden.
 
 ### Automatisk stängning
 
@@ -83,12 +95,31 @@ Med `@resource(dispose)` anropar kompilatorn den privata instansmetoden
 `fn dispose(&self)` eller `fn dispose(&mut self)` när det sista ägda värdet
 släpps. Metoden måste vara säker och returnera `()`. Den körs synkront före
 frigöring av structens fält och kan därför blockera om stängningsoperationen
-blockerar. Samma regel gäller vid blockslut, `return` (även av ett felvärde),
+blockerar. Samma regel gäller vid blockslut, `return` (även av ett felvärde via `?`),
 `break`, `continue`, ersättning av ett värde och när ägaren finns i ett aggregat.
 Muterbar `dispose(&mut self)` gör att resurser som `FileReader`, `Bump`,
 `OwnedBuf`, `Arena` och `FrozenArena` även kan dela på en explicit `.close()`
 eller `.release()` och lämna värdet tomt utan dubbel frigöring.
-En runtimefälla som avslutar hela processen går direkt till processavslut.
+
+**Destrukturering, `dropck` och panikkontrakt (1.0):**
+- **Destrukturering och partiell flytt:** både partiell fältflytt (`r.fält`) och
+  full struct-destrukturering (`Res { ... } := move r`) av en `@resource(dispose)`-struct
+  är **förbjudna i säker kod överallt** eftersom `dispose()` annars skulle hoppas över.
+  Destrukturering tillåts enbart inuti `unsafe { ... }` i den deklarerande modulen
+  (till exempel `OwnedBuf::into_allocator` och `Arena::freeze` i `std.alloc`, där
+  modulen själv garanterar städkontraktet).
+- **Drop-check (`dropck`):** om en `@resource(dispose)`-typ (direkt eller transitivt)
+  lagrar lån håller kompilatorns `Drop`-punkt dessa ursprung levande fram till
+  städningen så att `dispose(&self)` aldrig kan läsa en redan ändrad eller frigjord
+  ägare. Vanliga structar, enums och vyer utan `dispose` är `may_dangle` — deras
+  implicita städning håller inte ursprungen vid liv efter sista användningen.
+- **Panik- och fällkontrakt (abort-only):** `panic()`, `assert()` samt runtimefällor
+  (heltalsspill `101`, index utanför gräns `103`, strängallokering `105`, ogiltig UTF-8 `106`,
+  flyttalsfälla `107`, okänd sluten enum `108`, kapacitets-/minnesgräns `109`,
+  ogiltig callback `111`, task-/deskriptorfälla `112`) avbryter processen omedelbart
+  utan stackupprullning — varken `defer` eller `dispose` körs vid en panik.
+  Återhämtningsbara fel uttrycks med `Result<T, E>` och `?`, som alltid rullar upp
+  i strikt LIFO-ordning (`task scope`-inväntan före yttre `defer` och `dispose`).
 
 Flytt av hela resursen överför stängningsansvaret. Använd `replace` för
 att ta över ett ägt fält och lämna ett giltigt värde åt stängningsmetoden.
@@ -188,13 +219,13 @@ lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
 
 ### Lokala läslån och intervallvyer
 
-`r := &owner.field` och `r := &values[index]` skapar oföränderliga lokala
-referenser. Typen kan härledas eller anges, exempelvis `r: &i32 = &values[0]`.
-Ett lokalt läslån kan upphöra efter sin sista lexikala användning. Om den
-sista läsningen sker före en loop får loopen ändra ägaren. För ett lån som
-deklarerats utanför loopen räknas även läsningar i loophuvudet och tidigare
-i loopkroppen eftersom nästa varv kan läsa referensen igen. En läsning
-efter loopen eller i `defer` håller också lånet vid liv.
+`r := &owner.field` och `r := &values[index]` skapar lokala referenser med härledd eller explicit typ (`r: &i32 = &values[0]`), och `mut r: &T` kan bindas om lokalt (`r = &annan`) varvid det tidigare ursprunget omedelbart släpps vid full överskrivning.
+Lånekontrollen arbetar som icke-lexikal livstidsanalys (**CFG-NLL / Polonius-lik** ursprungspropagering över kontrollflödesgrafen utan tokenskanning):
+- Ett lån upphör exakt efter sin sista nåbara användning i kontrollflödesgrafen. Ömsesidigt uteslutande `if`/`else`-grenar (exempelvis `if c { v.push(3) } else { print(r) }`) och sammanfallande fält- eller parameternamn (`Foo { r: 1 }`) ger inga falska konflikter.
+- Läsningar i loopar bevarar lånet längs bakåtkanter, och läsningar i `defer` håller både ägare och lån vid liv längs **varje** utgångsväg (`return`, `?`, `break`, `continue` och normalt blockslut).
+- **Invarians bakom `&mut`:** ursprung som ingår i `T` bakom `&mut T` eller `&mut FnMut` är bidirektionellt invarianta (`O_a <-> O_b`). Det förhindrar att ett kortlivat lokalt lån skrivs in i en mer långlivad ägare genom en muterbar referens. I Dunder 1.0 tillåts lokal ombindning (`mut r: &T` samt `&mut`-ombindning av lokala poster inom samma funktion), medan överskrivning av lagrade lånefält genom en `&mut`-funktionsparameter (t.ex. `fn set(dst: &mut Holder, val: &i32)`) avvisas.
+- **Tvåfaslån (`TwoPhaseMut`):** används strikt för implicita `&mut self`-metodmottagare (t.ex. `v.push(v.len)`). Under argumentutvärderingen tillåts delade läsningar av mottagaren, medan skrivningar, flyttar, `&mut` och ett andra tvåfaslån (`v.push(v.pop())`) avvisas; vid anropspunkten aktiveras lånet till fullt `Mut` och kontrolleras på nytt mot aktiva lån (så `v.push_ref(&v[0])` avvisas).
+- **Återlån och utvärderingsordning:** sammansatta uttryck — anropsargument, binära operatorer (inklusive `&str ==`/`!=`), snittgränser, structliteraler och `replace` — utvärderas strikt från vänster till höger med levande lån i temporärer. Återlån genom ett `&mut`-alias (`&*r`, `&mut *r`, `&r[0]`) kopplas till den underliggande ägaren så att motstridiga ändringar via aliaset fångas enhetligt.
 
 ```dunder
 fn main() {
@@ -248,18 +279,13 @@ identitetsprov; råpekaren följer då kontraktet för `unsafe`.
 
 ### Lån i structar och enums
 
-Delade lån kan ingå i structfält och enumpayloads, även via nästlade typer.
-En funktion som returnerar ett sådant värde kan ange källan med `from`.
-Lokala värden kan låna från flera ägare. Varje ägare förblir lånad till sista läsningen. Vid retur måste samtliga lån komma från den deklarerade parametern. Ett tomt
-muteras). Fältlösa enumvarianter som `.None` och `.Err` delar statisk lagring
-utan allokering eller ägare. Matchning och destrukturering bevarar sambandet
-med den ursprungliga lagringen.
+Delade och exklusiva lån kan ingå i structfält och enumpayloads, även via nästlade typer (inklusive `Option<&mut T>`, `Result<&str, E>` och användardefinierade markörer).
+En funktion som returnerar ett sådant värde anger källan med `from` när det finns flera möjliga källparametrar.
+Lokala värden — även från `if`- och `match`-uttryck (`r := if c { &a } else { &b }`) — kan låna från flera ägare; varje ägare förblir lånad till sista nåbara användningen. Vid retur måste samtliga ursprung härstamma från den deklarerade `from`-källan. Fältlösa enumvarianter som `.None` och `.Err` delar statisk lagring utan allokering eller ägare. Matchning och destrukturering bevarar sambandet med den ursprungliga lagringen.
 
-Ett värde med lån kan bindas lokalt och skickas mellan funktioner.
-Lånefälten sätts när värdet skapas. Arrayelement, ägda closuremiljöer och
-taskgränser kräver fristående värden. Ett lokalt delintervall kan användas
-i en struct eller enum i samma funktion. Om vyns beskrivning ligger i
-den aktuella stackramen avvisar kompilatorn en retur av structen eller enumen.
+Ett värde med lån kan bindas lokalt och skickas och returneras mellan funktioner.
+Arrayelement, ägda closuremiljöer som lämnar scopet och taskgränser kräver fristående värden.
+Eftersom `&str` och `&[]T` är 2-ords `Copy`-värden `(ptr, len)` utan lokal stackramsbeskrivare kan även `Option<&str>`, `Result<&str, E>`, tupler och structar som lagrar delvyer returneras direkt när underliggande ägare anges med `from`.
 
 ### Fält, element och begränsningar
 
@@ -315,7 +341,11 @@ fältet och returkontraktet anger `from self`.
 Ett uppslag med returtypen `Option<&mut i32> from self` kan ge
 `.Some(&mut self.values[i])` eller `.None`. Värdet i `.Some` håller
 ägaren exklusivt lånad fram till sin sista användning. Matcha resultatet
-direkt eller använd `match move` för ett namngivet resultat.
+direkt eller använd `match move` för ett namngivet resultat; i `.Some(m) => { m.clear() }`
+återlånas `*m` för metodanrop och `&mut m` utan att flytta `m`.
+I en `match`-arm med guard hålls matchningsämnet under ett delat `Shared`-lån
+genom hela guarden, så guarden får varken mutera eller flytta ut bindningar (`if take(move v)` avvisas);
+först efter att guarden godkänts gäller vanliga flyttregler i armkroppen.
 
 Även vanlig `match värde` (eller `match s.fält`) över en namngiven lokal eller
 ett ägt structfält tillåter att en arm flyttar ut en ägd eller `@resource`-nyttolast
@@ -328,14 +358,12 @@ eller `out.push(move c)` i `.Ok(c)`), på samma sätt som en partiell fältflytt
   oindexerat ämne (inte en parameter/referens `fn f(r: Result<...>)`,
   `match &r`, `match arr[i]` eller fält inuti en `@resource(dispose)`-struct
   med automatisk stängning).
-- En `match`-guard får aldrig flytta ut bindningar (`if take(move v)` avvisas);
-  efter att guarden godkänts gäller vanliga flyttregler.
 - `.Ok(mut x)` skapar en muterbar bindning och kräver `match move ...` eller ett
   färskt ägt uttryck (annars föreslås `match move` eller lokal kopia/`clone` för
   klonbara typer). Icke-klonbara `@resource`-typer föreslår aldrig `.clone()`
   i någon ägarskaps- eller lånediagnostik.
-Ägare som ett aktivt `defer` behöver får inte flyttas eller autofrisättas
-före den uppskjutna körningen.
+Ägare som ett aktivt `defer` behöver måste vara initierade och olåsta för flytt
+längs varje väg som når `defer`-blocket — inklusive tidig `return`, `?`, `break` och `continue`.
 
 Arrayrepetition som `[text; 4]` är en uttrycklig replikering: initialiseraren
 utvärderas och konsumeras en gång, även om antalet är noll. Skriv
@@ -357,16 +385,13 @@ anrop kan alla uppfylla det kravet. Lokala ägare, råpekare och
 `move`-parametrar ger ingen sådan livstid.
 
 Om anroparen binder resultatet till en lokal gäller lånet fram till
-referensens sista lexikala läsning, med samma regler för loopar och
+referensens sista nåbara användning i kontrollflödesgrafen, med samma regler för loopar och
 `defer` som för direkta läslån. Det skyddar hela
 platsen som lämnades som källargument. Den som skickar `&record.bytes` kan
 alltså fortfarande ändra ett oberoende fält i `record`. Ett arrayintervall
-delar elementlagringen med originalet.
-Anroparen håller den returnerade vyns beskrivare i sin egen stackram,
-så att flera anrop kan hålla olika intervall levande samtidigt. I
-`unsafe` observerar `addr(&view[i])` adressen till originalelementet.
-`addr(&view)` observerar vyns egen referenscell, även när funktionen
-vidarebefordrar en hel array. En uttrycklig `.clone()` ger en ägd kopia.
+delar elementlagringen med originalet och returneras som ett 2-ords `Copy`-värde `(ptr, len)` i register utan lokal stackbeskrivare. I
+`unsafe` observerar `addr_of(&view[i])` adressen till originalelementet och
+`addr_of(&view)` adressen till vyns egen lokala cell. En uttrycklig `.clone()` ger en ägd kopia.
 
 En metod som uppdaterar sin samling kan lämna tillbaka en delad vy med
 `fn refresh(&mut self) -> &[]i32 from self`. Anroparen får läsa vyn
@@ -549,15 +574,20 @@ anroparen får förbruka oavsett adressbredd.
 
 En synkron callback kan fånga en post med lånade fält genom `fn[&post]`.
 Både posten och fältens ägare förblir lånade medan callbacken kan anropas.
+En closure som returnerar ett lån härlett ur sin fångade miljö (t.ex. `fn[&v]() -> &i32 { &v[0] }`)
+binder returursprunget till miljöns fångade ursprung (`PARAM_ENV`), så att `v` förblir lånat så länge
+returvärdet används även efter att closuren själv gått ur bruk.
 En callback som ska överleva anropet behöver äga sina fångade data.
 
-Ett konkret anrop kan knyta resultatet till ett delat lånefält med
-`from self.text`. Kompilatorn kontrollerar ursprunget vid varje retur.
-När mottagaren är en lokal post med lagrade lån hålls dess källor lånade
-medan markörens egna fält kan ändras igen. Funktionspekare använder
-parameterns vanliga returkontrakt. Två resultat från
-`std.text.Graphemes.next` kan därför läsas samtidigt.
+Traiten `Iterator` är **icke-lånande** i 1.0: en iterator som bär ett lagrat lån (exempelvis
+`std.text.Graphemes`) knyter resultatet från `next(&mut self)` till ett delat lånefält på typen
+med `from self.text` — fristående från `&mut self`-lånet. När mottagaren är en lokal eller tillfällig
+iterator (som `for g in text.graphemes(s.as_str())`) hålls den lånade källan `s` låst genom hela
+loopen medan markörens egna fält kan flyttas fram, och två resultat från `Graphemes.next` kan
+läsas samtidigt. En iterator vars `next(&mut self)` försöker returnera ett lån bundet direkt till
+`&mut self` (`from self`, t.ex. `&mut self.buf[i]`) avvisas från `Iterator` eftersom upprepade
+`next()`-anrop annars skulle skapa överlappande `&mut`-alias.
 
-En funktion med `Option<&str> from value` eller `Option<&[]T> from value`
-kan returnera ett delintervall. Anroparen äger utrymmet för beskrivningen
-av intervallet. Underliggande data förblir lånade från `value`.
+Funktioner med `Option<&str> from value`, `Result<&str, E> from value` eller användarstructar
+med `&str`/`&[]T`-fält returnerar 2-ords `Copy`-vyer `(ptr, len)` direkt utan stackramshinder;
+underliggande data förblir lånade från `value`.

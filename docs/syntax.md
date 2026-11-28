@@ -230,7 +230,7 @@ exempelvis `lib.Box<[]i32>`. [Körbart exempel med två moduler](../tests/fixtur
 Ett `where` efter typens parameterlista anger krav som gäller så fort typen
 används. Krav uttrycks som traitgränser (`T: Trait1 + Trait2`) eller direkt i
 parameterlistan (`<T: Trait1 + Trait2>`), inklusive inbyggda strukturella
-traits som `T: Storable`, `T: Clone`, `T: Copy` och `T: Sendable`.
+traits som `T: Storable`, `T: Clone`, `T: Copy`, `T: Sendable` och `T: Sync`.
 
 På en generisk funktion kan `where` stå efter signaturen. På ett
 `impl`-block står det efter mottagartypen, exempelvis
@@ -279,27 +279,33 @@ fn label<T: Ordered>(x: T) -> string {
 Metoder i `impl Trait for Type` ärver synlighet från traiten och skrivs utan
 `pub`. Antingen traiten eller måltypen måste deklareras i samma modul
 (lokala traits kan implementeras för primitiva, sammansatta och importerade
-typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
+typer). Kompilatorn tillhandahåller fem inbyggda strukturella traits:
 
-- `Sendable` härleds automatiskt för vanliga structar, enums, tupler och arrayer
-  vars delar är `Sendable` (inklusive `string`, `Result<T, E>` och sammansatta
-  arrayer). För en `opaque struct` deklareras den uttryckligen med
-  `impl Sendable for Typ {}` (eller villkorligt som
+- `Sendable` (säker ägarskapsöverföring mellan trådar) och `Sync` (säker
+  samtidig delning av `&T` över trådgränser, t.ex. i `Published<T>` och
+  `task scope (shared ...)`) härleds automatiskt för vanliga transparenta
+  structar, enums, tupler och arrayer vars delar uppfyller respektive trait
+  (inklusive `string`, `Result<T, E>` och sammansatta arrayer). För en
+  icke-`@resource` `opaque struct` tillåts verifierad säker
+  `impl Sendable for Typ {}` / `impl Sync for Typ {}` (eller villkorligt som
   `impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`), varpå
-  kompilatorn bevisar att alla privata fält uppfyller regeln. En
-  `@resource`-typ kan också deklarera `impl Sendable for Typ {}` uttryckligen
-  (som `std.fs.FileReader`), varpå kompilatorn bevisar fälten; annars är
-  `@resource`, råpekare, lån, closures och oklassificerade `opaque struct`
-  inte `Sendable`.
+  kompilatorn kontrollerar alla privata fält och avvisar `@resource` och
+  råpekare. För `@resource`-typer, råpekare eller interiör muterbarhet krävs
+  uttryckligen **`unsafe impl Sendable for Typ {}`** respektive
+  **`unsafe impl Sync for Typ {}`** i en modul med `capability unsafe`.
+  Oklassificerade `@resource`- eller `opaque struct`-typer, råpekare, lån,
+  closures och `Task<R>` är varken `Sendable` eller `Sync`.
 - `Storable` anger att typen får lagras som arrayelement eller fält.
 - `Clone` gäller strukturellt för typer utan `@resource`-fält och utan inbyggda
   lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
 - `Copy` gäller för värden utan heap- eller ägarskapsstädning (`bool`, heltal,
-  `f32`, `f64`, `rune`, `ptr`, råa `fn(...)`-funktionsvärden, fältlösa enums
-  samt aggregat, tupler och fasta arrayer `[T; N]` vars delar är `Copy`, men inte `string`, `[]T` eller
+  `f32`, `f64`, `rune`, pekare, råa `fn(...)`-funktionsvärden, delade vyer
+  `&T`/`&str`/`&[]T`, fältlösa enums samt aggregat, tupler och fasta arrayer
+  `[T; N]` vars delar är `Copy`, men inte `string`, `[]T`, `&mut T` eller
   fångande closures `Fn(...)`). Positiva fasta POD-arrayer upp till 128 byte lagras inline på stacken.
-- Värden av typen `Fn(...)` följer flyttsemantik och implementerar `Clone`, där
-  `.clone()` delar den infångade miljön genom referensräkning.
+- Värden av typen `Fn(...)` följer flyttsemantik och implementerar `Clone` via
+  referensräkning i miljön **endast när alla fångade fält är `Clone`** (en `Fn`
+  som fångar en `@resource` kan inte klonas). `FnMut` och `FnOnce` är aldrig `Clone`.
 - `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
 
 I preludiet finns `Eq`, `Ord: Eq`, `Hash: Eq`, `Display` och
@@ -354,32 +360,38 @@ rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga.
 Vanliga sträng- och aggregatparametrar lånar indata för läsning under
 anropet; skalärer kan överföras som billiga värden. Explicit `&T` fungerar
 också för läslån. `&mut T` kräver ett uttryckligt skrivlån vid anropet.
-Lokala läsreferenser kan namnges med `r := &value` eller `r: &T = &value`.
-Fält och arrayelement går också att låna. Referensen är oföränderlig och
-frisätts efter sin sista lexikala läsning. En läsning i en loop kan köras
-igen vid nästa varv. En läsning i `defer` håller lånet vid liv till blockslut.
-Oberoende syskonfält får ändras; ett elementlån låser hela arrayen.
-Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
+Lokala läsreferenser kan namnges med `r := &value` eller `r: &T = &value` och
+kan bindas om lokalt med `mut r: &T` (där en ny tilldelning släpper föregående
+ursprung). Fält och arrayelement går också att låna. Lån följer icke-lexikala
+livstider över kontrollflödesgrafen (CFG-NLL) och upphör efter sin sista
+nåbara användning. En läsning i en loop bevaras längs bakåtkanten och en läsning
+i `defer` håller lånet vid liv längs varje utgångsväg (`return`, `?`, `break`,
+`continue` och blockslut). Oberoende syskonfält får ändras; ett elementlån låser
+hela arrayen. Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
+Ursprung bakom `&mut T` är invarianta, och överskrivning av lagrade lånefält via
+en `&mut`-funktionsparameter är förbjuden i 1.0.
 
 Temporära uttryck får lånas direkt vid anrop, exempelvis `read(&f())` och
 `sum(&[1, 2])`, och hålls levande tills anropet är klart. De får inte bindas
 som lokala referenser. Lokala skrivlån skrivs `r := &mut value`. En funktion
 kan returnera ett lån från en parameter. Ett returnerat skrivlån kräver en
 muterbar källparameter. Finns det flera möjliga källor anger `from namn`
-vilken parameter returvärdet lånar från. En post eller enum som lånar från
-flera delade parametrar kan ange dem tillsammans med `from (a, b)`.
-Anroparen håller båda ägarna lånade tills returvärdet är färdiganvänt.
-En funktionstyp anger samma kontrakt med positioner, exempelvis
-`fn(&i32, &i32) -> Par from (1, 2)`.
+vilken parameter returvärdet lånar från; en metod på en typ med lagrade lån
+kan projicera ett specifikt fälts ursprung med `from self.fält`, och en post
+eller enum som lånar från flera delade parametrar kan ange dem tillsammans med
+`from (a, b)`. Anroparen håller samtliga källor lånade tills returvärdet är
+färdiganvänt. En funktionstyp eller closuretyp anger samma kontrakt med
+positioner, exempelvis `fn(&i32, &i32) -> Par from (1, 2)`.
 
 ```dunder
 fn tail(values: &[]i32) -> &[]i32 { &values[1..] }
 fn first(a: &i32, b: &i32) -> &i32 from a { a }
 ```
 
-Delade lån får ingå i en struct eller enum. Källan följer med genom anrop,
-fältåtkomst, mönsterbindningar och `?`. I exemplet får anroparen behålla
-resultatet så länge `values` lever och elementen ligger kvar.
+Delade och exklusiva lån får ingå i en struct eller enum (inklusive
+`Option<&mut T>`, `Option<&str>` och `Result<&str, E>`). Källan följer med
+genom anrop, fältåtkomst, mönsterbindningar och `?`. I exemplet får anroparen
+behålla resultatet så länge `values` lever och elementen ligger kvar.
 
 ```dunder
 fn first_if_present(values: &[]i32) -> Option<&i32> from values {
@@ -389,9 +401,13 @@ fn first_if_present(values: &[]i32) -> Option<&i32> from values {
 ```
 
 I en funktionstyp anges källan med ett ettbaserat parameternummer, exempelvis
-`fn(&i32, &i32) -> &i32 from 1`. Även anrop via en funktionsvariabel
-kontrollerar sambandet mellan argument och resultat.
-[Låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
+`fn(&i32, &i32) -> &i32 from 1`. Även anrop via en funktionsvariabel eller
+closure kontrollerar sambandet mellan argument, fångad miljö och resultat.
+Lexikala scratch-arenor deklareras som block med `region namn(antal_byte) { ... }`
+(eller `region namn { ... }` med 64 KiB standardkapacitet), där allokeringar
+via `namn.alloc(n)` är bundna till regionens livstid och inte får lämna blocket.
+[Låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer) ·
+[Lexikala scratch-regioner](memory.md#lexikala-scratch-regioner).
 
 En funktion som ska behålla resursen deklarerar `move`:
 
@@ -552,9 +568,9 @@ fn main() {
 
 Listan utvärderas när closuren skapas. `fn[x]` följer vanliga äganderegler:
 kopierbara värden kopieras, medan resursägande värden flyttas in. En fångande
-`Fn(...)` är själv flyttbunden (`move_only`) och stöder `.clone()` för delad
-referensräknad användning eller `move` vid ägarbyte, medan en rå `fn(...)` utan
-captures är `Copy`. `fn[mut x]` ger en `FnMut` som låter kroppen ändra sitt
+`Fn(...)` är själv flyttbunden (`move_only`) och stöder `.clone()` (via delad
+referensräknad miljö) **endast när alla fångade fält är `Clone`** — fångas en
+`@resource` avvisas `.clone()`. En rå `fn(...)` utan captures är `Copy`. `fn[mut x]` ger en `FnMut` som låter kroppen ändra sitt
 eget infångade värde mellan anrop. `move fn[x]` ger en `FnOnce` som förbrukas
 när den anropas. Resurser som miljön fortfarande äger städas när miljön släpps.
 
@@ -1125,12 +1141,19 @@ C-fältlayout, och `@repr(<heltal>) enum` deklarerar öppna C-ABI-enums.
 Statiska C- och UTF-16-strängliteraler skrivs `c"..."` (`&ffi.CStr`) och
 `w"..."` (`&ffi.WStr`). En modul med `capability unsafe` kan använda
 `unsafe fn` (även i `trait` och `impl Trait for Type`), `unsafe { ... }`,
+`unsafe impl Sendable` / `unsafe impl Sync`,
 `addr_of(&place)` / `addr_of(&mut place)`, `bytes_view(&owner, base, length)`,
 `@link(...) extern "<abi>" { ... }` (inklusive variadiska `...`-parametrar och
 `static`/`static mut`-datasymboler) samt toppnivå-callbacks med
 `extern "<abi>" fn` och `Option<extern "<abi>" fn(...)>`.
 `capability filesystem`, `network`, `process` och `stdio` styr tillgången till
-delegerbara OS-handtag. `@resource(dispose)` stöder städmetoden
-`fn dispose(&self)` eller `fn dispose(&mut self)`. En `pub opaque struct`
+delegerbara OS-handtag (råa filbeskrivarfunktioner i `std.sys` som `sys.net_*`
+och `sys.fd_*` är `unsafe fn`). `@resource(dispose)` stöder städmetoden
+`fn dispose(&self)` eller `fn dispose(&mut self)`; destrukturering av en
+`@resource(dispose)`-struct avvisas i säker kod och tillåts endast inuti
+`unsafe { ... }` i den deklarerande modulen. En `pub opaque struct`
 exponerar typen och låter den definierande modulen äga konstruktion och
-fältåtkomst. [Språkkontrakt och exempel](ffi.md)
+fältåtkomst — i `std.alloc` är `OwnedBuf<A>`, `Bump<A>`, `Arena<A>`,
+`FrozenArena<A>`, `Capped<A>`, `Block` och `Layout` förseglade som
+`pub opaque struct` med säkra läsmetoder (`.len()`, `.cap()`, `.size()`,
+`.align()`, `.used()`, `.remaining()`). [Språkkontrakt och exempel](ffi.md)

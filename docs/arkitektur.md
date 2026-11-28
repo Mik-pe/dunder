@@ -2,14 +2,20 @@
 
 Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux, `wasm32`, `wasm32-wasi`
 och `x86_64-windows` (PE32+) med explicit målval. ELF, Mach-O, PE32+, systemanrop
-och kodgenerering ingår i kompilatorn. Källfunktionerna går genom verifierad MIR. ARM64-backenden emitterar maskinord,
-x86-64/Linux använder `x86_mir` och Wasm-målen använder `wasm_mir`.
-Windows använder x86-sänkningen med Win64-ABI. Läs [målplattformar och begränsningar](targets.md).
+och kodgenerering ingår i kompilatorn. Dunder 1.0 bygger på en enkelriktad,
+typad kompilatorpipeline från förlustfritt AST via HIR, högnivå-CFG MIR
+(`selfhost/mir2/`) och måloberoende typad SSA MIR (`selfhost/ssa/`) till
+nativa målspecifika instruktionsväljare (`arm64_isel`, `x86_isel`, `wasm_isel`),
+tillståndslösa kodare (`arm64_enc`, `x86_enc`, `wasm_bytes`) och en
+måloberoende `ObjectModule` som matar Mach-O-, ELF64-, PE32+-, Wasm- och
+DWARF-emittrarna. Läs [målplattformar och begränsningar](targets.md) och
+[1.0-arkitekturspecifikationen](memory-safety-1.0.md).
 
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
 GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Fortsatt utveckling](next-steps.md)
-Automatisk frigöring för arrayer och strängar, POD-värden och lokal/helfunktions
-optimering (MIR-SSA, helfunktionsinlining, `BorrowHome`) ingår som standard.
+Automatisk frigöring för arrayer, strängar och `@resource(dispose)`, platta
+POD-värden samt verifierad SSA-optimering (Mem2Reg/SROA, enad SSA-inlining,
+GVN, gränskontrollseliminering och DCE) ingår som standard.
 Byggen för macOS och Linux kan bädda in DWARF v4-debuginformation (`-g`/`--debug`)
 samt använda [funktionscachen](incremental.md). `dunder lsp` föreslår
 `mut` vid tilldelning till en oföränderlig lokal variabel. När en importerad
@@ -62,90 +68,105 @@ kontrolleras fortsatt konservativt per rot. Grenar förenas konservativt och
 varje loopbakåtkant måste återställa de ägarvillkor som krävs vid loopens
 början. En tidig retur städar fortfarande ägda resurser i omvänd ordning.
 
-### Initiering per lagringsplats
+### Initiering, CFG-lånekontroll och drop-elaborering (`selfhost/mir2/`)
 
-`ownership_state` kanoniserar lokaler och fältkedjor i ett glest träd per
-funktion. Upprepade källåtkomster till samma fält får samma ägaridentitet,
-medan `typed_places` behåller separata rader för varje typad åtkomst och
-dess emission. Typträdet expanderas aldrig rekursivt i förväg. En läsning,
-ett lån eller en flytt av hela platsen kräver initierade förfäder och
-ättlingar; traversering till ett syskon kräver bara giltiga förfäder.
+I 1.0-pipelinen sker all ägarskaps-, låne- och städkontroll på en typad
+högnivå-CFG MIR ([`selfhost/mir2/`](../selfhost/mir2/mir_body.ddr)) i stället
+för genom lexikal tokenskanning under parsningen:
 
-Checkpoints kopierar tillstånd och platsidentiteter utan att kopiera den
-aktiva loopstacken. Schemat växer monotoniskt genom grenar. Fält som
-upptäcks efter ett checkpoint ärver begränsningarna från sina förfäder.
-Samma regel gäller bakåtkanter och `break`, även om roten redan var
-partiellt flyttad vid loopinträdet. Tilldelning återställer exakt sitt
-subträd. `defer` behåller tills vidare ett konservativt lås på hela roten.
+- **Enhetlig LIFO-kontrollflödesgraf ([`mir_build.ddr`](../selfhost/mir2/mir_build.ddr))**:
+  varje funktion sänks från typad HIR till basblock med uttryckliga `Place`-projektioner,
+  `Call`, `Drop`, `RegionEnter`/`RegionExit`, `TaskScopeEnter`/`TaskScopeJoin` och
+  delade `defer`-basblock (`unwind_target`-`SwitchInt` med loopåterställd aktivitetsflagga).
+  Tidiga utgångar (`return`, `?`, `break`, `continue`) avvecklar alltid inre `task scope`
+  före yttre `defer` och `Drop`.
+- **Definitiv initiering och partiella flyttar ([`mir_init.ddr`](../selfhost/mir2/mir_init.ddr))**:
+  ett glest kanoniskt platsträd per funktion (bitmängder `maybe_init`/`maybe_uninit`
+  över CFG:n) verifierar fältflyttar, återinitiering, `replace` samt att
+  `@resource(dispose)`-structar inte partiellt flyttas eller destruktureras i säker kod.
+- **Polonius-lik CFG-lånekontroll ([`mir_borrowck.ddr`](../selfhost/mir2/mir_borrowck.ddr))**:
+  bakåtriktad ursprungslevnad (inklusive `dropck` för `@resource(dispose)` och
+  `may_dangle` för vanliga vyer) kombinerad med blockgräns-propagerade lånemängder
+  (`contains[bb_entry][O]` strömmad per sats) eliminerar falska konflikter på
+  sammanfallande fältnamn och åtskilda `if`/`else`-grenar. Modellen upprätthåller
+  bidirektionell invarians (`O_a <-> O_b`) bakom `&mut T`/`&mut FnMut`, `TwoPhaseMut`
+  för implicita `&mut self`-mottagare, `Shared`-lås i `match`-guarder, icke-lånande
+  `Iterator`, `PARAM_ENV` för closures som returnerar fångade lån samt
+  enkelriktad utvärderingsordning för anropsargument och binära operatorer.
+- **Råpekarexponering ([`mir_escape.ddr`](../selfhost/mir2/mir_escape.ddr))**:
+  ovillkorlig anropsgrafanalys över alla funktioner, traits, generiska instanser
+  och closures förhindrar att scratch- och lokala lån når `addr_of` (`E4005`).
+- **Drop-elaborering ([`mir_drop_elab.ddr`](../selfhost/mir2/mir_drop_elab.ddr))**:
+  sänker `Drop(p)` direkt till villkorslösa anrop när platsen är garanterat initierad,
+  tar bort döda `Drop` när platsen är flyttad och reserverar minimala 1-bytes
+  drop-flaggor enbart för villkorligt flyttade vägar.
 
-Källans initieringsbevis är separat från runtimeägare och MIR-optimering.
-En managed-fältflytt nollställer bara fältets ägarslot; befintlig rekursiv
-cleanup städar resten. Inga per-fältflaggor behövs vid körning. `replace`
-återanvänder samma typade läs-, skriv- och ägaroperationer: båda operanderna
-slutförs före bytet, den tidigare ägaren blir resultat och destinationen
-förblir giltig. Lokala lån återanvänder dessa platsidentiteter.
+### Förstklassiga vyer (`&[]T`, `&str`) och isolerade uppgifter
 
-### Proveniens och lexikala läslån
-
-`local_borrows.Table` lagrar proveniens och aktiva lokala lån med kanoniska
-ägar-ID:n från `ownership_state`. Tabellen har ingen egen initieringsmodell.
-Alias härleds till den ursprungliga platsen; ett nytt återlån skapar ett
-eget aktivt lån på samma ägare. Referenserna är oföränderliga och frigör sitt
-lås efter sista lexikala läsningen i samma block och loopdjup (eller vid
-blockets slut när ett `defer` eller en inre loop ändrar ägaren). Skrivning,
-skrivlån, flytt och `replace` använder samma överlappningsfråga. Ett lån av
-ett fält blockerar dess förfäder och ättlingar men tillåter syskonfält.
-Arrayindex och intervall följer konservativt arrayens identitet.
-
-`borrowed_view` emitterar intervallkontroller och en framebaserad deskriptor
-för originalets data; den registrerar ingen runtimeägare. Arrayvyer har
-typen `&[]T` och strängvyer typen `&str` (med `.as_bytes()` för `&[]u8`).
-Gränser kontrolleras före textens UTF-8-gränser, med status 103 respektive
-106. Tomma textvyer kräver också giltiga UTF-8-gränser. Konstruktionen
-allokerar ingen heapbuffert och gör ingen retain; `.clone()` begär en ägare
-uttryckligen. Temporära lån vid anrop lever genom hela anropet och kan
-inte bindas lokalt. Scratchlagring kan ännu bara lånas under anrop.
-
-Proveniens tillhör ett färdigt uttrycksresultat. Ett nytt ägt anropsresultat,
-en konstruktor eller ett operatorresultat nollställer argumentens
-lånemetadata i `FunctionContext.loan` (`LoanState`), bland annat `loan.home`, så att det inte ärver en inre vys
-lagringsplats. Projektioner bevarar däremot sitt verkliga ursprung. Den
-befintliga globala escapegrafen för lån återanvänds även för lokala lån och
-indirekta anrop. Nya uttrycksformer måste fånga analysen före emission;
-saknas förberett proveniensbevis avvisas programmet. Nya lån får inte nå en
-råpekarexponerande funktion. Direkt `addr` i explicit `unsafe` kan användas
-för att verifiera adressidentitet.
+`&[]T` och `&str` representeras i 1.0 som förstklassiga 2-ords `Copy`-värden
+`(ptr, len)` (16 byte på 64-bitars nativa mål, 8 byte på `wasm32`), utan
+48-bytes stackramsbeskrivare och utan dold `sret`-kopiering. Intervallgränser
+kontrolleras före UTF-8-gränser (status 103 respektive 106), och eftersom
+vyerna är vanliga `Copy`-värden kan `Option<&str>`, `Result<&str, E>`, tupler
+och användarstructar med vyer returneras fritt med `from`.
 
 Funktionscachen hoppar inte över dessa kontroller: källkroppar och lån
-kontrolleras även när färdig maskinkod kan återanvändas. Kompilatorns fragmentcache lånar tokenstavningar
-och läser nyckel, signatur och nyttolast som vyer ur en bytebuffert.
-[Körbara låneprov](../tools/test_local_borrows.ddr).
+kontrolleras även när färdiga objekt kan återanvändas.
+[Körbara låneprov](../tools/test_local_borrows.ddr) ·
+[Fas 0-regressioner](../tools/test_phase0_soundness.ddr).
 
-På macOS och Linux kan isolerade uppgifter köras på flera trådar.
-Typkontrollen begränsar vilka data och effekter en uppgift får använda.
-Runtimen kopierar indata och resultat mellan separata allokeringsarenor.
-[Uppgifter och ägarskap](tasks.md)
+På macOS, Linux och Windows kan isolerade uppgifter köras på flera trådar med
+`Sendable` + `Sync`, per-tråd-arenor, OS-sidallokerade synkroniseringsprimitiver
+samt gränskontrollerad `.rodata`-tabell (`TYPE_DESC_TABLE`) för frysta
+sammansatta nyttolaster. [Uppgifter och ägarskap](tasks.md)
 
-## Från funktion till maskinkod
+## Enkelriktad kompilatorpipeline (från källkod till maskinkod)
 
-[Modulladdaren](../selfhost/driver/modules.ddr) löser importer och bevarar
-ursprungliga källpositioner. Deklarationernas signaturer fastställs före
-kropparna så att funktioner kan anropa varandra rekursivt.
+```text
+Källkod (.ddr)
+  → Lexer + förlustfritt AST       (selfhost/frontend/lexer.ddr, parser.ddr, ast.ddr)
+  → Typad HIR + monomorfisering    (selfhost/hir/hir_types.ddr, hir_body.ddr, hir_lower.ddr, hir_mono.ddr)
+  → Högnivå-CFG MIR + lånekontroll (selfhost/mir2/mir_build, mir_verify, mir_init, mir_borrowck, mir_escape, mir_drop_elab)
+  → Måloberoende typad SSA MIR     (selfhost/ssa/ssa_ir.ddr, ssa_lower.ddr, ssa_verify.ddr, ssa_opt.ddr)
+  → Nativ LIR/ISel + regalloc      (selfhost/backend/arm64_isel.ddr, x86_isel.ddr, wasm_isel.ddr)
+  → Tillståndslösa kodare          (selfhost/backend/arm64_enc.ddr, x86_enc.ddr, wasm_bytes.ddr)
+  → Måloberoende ObjectModule      (selfhost/backend/object_module.ddr)
+  → Binärformat & debuginfo        (macho.ddr, elf.ddr, pe.ddr, dwarf.ddr, wasm_memory.ddr, wasm_abi.ddr)
+```
 
-En generisk instans identifieras av deklarationen och de konkreta
-typargumentens identiteter. Samordnaren upptäcker instanserna före parallell
-kodgenerering. [Design för generics](generics-design.md)
-
-Den seriella och den parallella kompilatorn använder samma typkontroll. En
-arbetare kan typkontrollera en kropp med en fryst bild av deklarationerna.
-Samordnaren binder symboler och håller reda på nåbara funktioner i bestämd
-ordning. Oanropade kroppar kontrolleras också. [Kompilatorns moduler](../selfhost/README.md)
-· [Parallell kompilering](tasks.md#kompilatorn-som-taskkonsument)
-
-En skalär funktion kan förenklas i en lokal typad modell. Varje nyemitterad
-källfunktion går sedan genom samma MIR-verifiering och sänkning. Länkaren
-placerar nåbara funktioner, datasegment och importer i deterministisk ordning.
-Mach-O-skrivaren signerar den slutliga bilden. [Kodgenerering](optimization.md#gemensam-helfunktionskedja)
+1. **Modulladdning och AST**: [Modulladdaren](../selfhost/driver/modules.ddr)
+   löser importer, bevarar källpositioner och producerar ett gemensamt
+   förlustfritt AST för `build`, `check`, `fmt` och `lsp`.
+2. **Typad HIR och förseglad `TypeTable` ([`selfhost/hir/`](../selfhost/hir/hir_types.ddr))**:
+   deklarationer, trait-kontrakt (`Sendable`, `Sync`, `Iterator`),
+   `ParamMode::BorrowOrCopy` samt closures som typade fångststructar sänks och
+   monomorfiseras i HIR innan en enda förseglad `TypeTable` fryses för
+   parallella arbetare (utan `declared`/`body`-delning eller token-omskrivning).
+   [Design för generics](generics-design.md)
+3. **Verifierad högnivå-MIR ([`selfhost/mir2/`](../selfhost/mir2/mir_verify.ddr))**:
+   varje funktion genomgår `mir_verify`, `mir_init`, `mir_borrowck`, `mir_escape`
+   och `mir_drop_elab` i isolerade arbetare på den frysta HIR-bilden. Oanropade
+   kroppar kontrolleras också. [Kompilatorns moduler](../selfhost/README.md) ·
+   [Parallell kompilering](tasks.md#kompilatorn-som-taskkonsument)
+4. **Måloberoende SSA MIR och enad optimerare ([`selfhost/ssa/`](../selfhost/ssa/ssa_opt.ddr))**:
+   efter drop-elaborering sänks varje funktion till måloberoende typad SSA MIR
+   med explicita `StackSlot(size, align)` (inga inbakade ARM64-register eller
+   flaggor). Optimeraren kör Mem2Reg/SROA, enad SSA MIR-inlining (över structar,
+   metoder, generics, `Option`/`Result` och vyer), dominatorbaserad GVN/konstantvikning,
+   gränskontrollseliminering och DCE, med fullständig semantisk
+   [`ssa_verify.ddr`](../selfhost/ssa/ssa_verify.ddr) efter varje pass.
+   [Kodgenerering](optimization.md#gemensam-helfunktionskedja)
+5. **Nativ mål-ISel, `ObjectModule` och länkning**:
+   [`arm64_isel.ddr`](../selfhost/backend/arm64_isel.ddr),
+   [`x86_isel.ddr`](../selfhost/backend/x86_isel.ddr) och
+   [`wasm_isel.ddr`](../selfhost/backend/wasm_isel.ddr) sänker SSA MIR direkt
+   till målens egna ABI:er och register/Wasm-lokaler via de tillståndslösa
+   kodarna [`arm64_enc.ddr`](../selfhost/backend/arm64_enc.ddr),
+   [`x86_enc.ddr`](../selfhost/backend/x86_enc.ddr) och
+   [`wasm_bytes.ddr`](../selfhost/backend/wasm_bytes.ddr) in i
+   [`object_module.ddr`](../selfhost/backend/object_module.ddr). Länkaren
+   placerar nåbara funktioner, datasegment, `.rodata`-tabeller och importer i
+   deterministisk ordning, och Mach-O-skrivaren ad hoc-signerar slutbilden.
 
 ## Verktygskedjan och målplattformarna
 
@@ -170,13 +191,16 @@ funktionspekare och äger fönster-, renderings- och händelselogiken, och
 WebGPU-exemplet anropar sin JavaScript-värd via en vanlig Wasm-import.
 [Dunders FFI-kontrakt](ffi.md) · [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat)
 
-Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
-anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen
-delar instruktionskodning; x86-64/Linux (`x86_mir`) sänker MIR direkt till fysiska register
-med System V-ABI, medan x86_64-windows sänker samma MIR-producerade symboliska ström
-till Win64 via x86-sänkningen, och Wasm (`wasm_mir`) sänker MIR direkt till typade
-Wasm-lokaler och strukturerat kontrollflöde. Dunders interna funktions-ABI är inte ett
-publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsningar.
+Maskindelen äger instruktionskodning, linjär registerallokering och räckvidd för hopp.
+Plattformslagret anpassar startpunkt, systemanrop, metadata-layout och binärformat.
+ARM64-målen delar kodaren [`arm64_enc`](../selfhost/backend/arm64_enc.ddr) och
+[`arm64_isel`](../selfhost/backend/arm64_isel.ddr); x86-64/Linux och x86-64/Windows
+använder [`x86_isel`](../selfhost/backend/x86_isel.ddr) + [`x86_enc`](../selfhost/backend/x86_enc.ddr)
+med nativ System V- respektive Win64-ABI (utan emulerad ARM64-registerbank), och
+Wasm-målen använder [`wasm_isel`](../selfhost/backend/wasm_isel.ddr) direkt till
+typade Wasm-lokaler, strukturerat kontrollflöde och per-signatur `call_indirect`.
+Dunders interna funktions-ABI är inte ett publikt C-ABI. Se
+[målplattformarna](targets.md) för verifiering och begränsningar.
 
 ## Byggkontraktet
 
@@ -196,9 +220,10 @@ Två efterföljande byggen måste bli byteidentiska innan skriptet publicerar
 kompilatorn. Den kan därefter bygga program för alla sex mål.
 [Frön och återbyggnad](../bootstrap/README.md).
 
-Wasm-backenden ([`wasm_mir`](../selfhost/backend/wasm_mir.ddr)) sänker samma
-verifierade MIR som native direkt till Wasm. Den omvandlar hopp till
-Wasm-block, anrop till Wasm-funktioner och minnesåtkomster till operationer
-på modulens linjära minne. Nåbara externa deklarationer blir typade importer.
-Filer och processer hör till
+Wasm-backenden ([`wasm_isel`](../selfhost/backend/wasm_isel.ddr) samt
+[`wasm_mir`](../selfhost/backend/wasm_mir.ddr) under övergångsfasen) sänker
+verifierad SSA MIR / MIR direkt till Wasm. Den omvandlar kontrollflöde till
+strukturerade Wasm-block, anrop till typade Wasm-funktioner (`call` / per-signatur
+`call_indirect`) och minnesåtkomster till operationer på modulens linjära minne.
+Nåbara externa deklarationer blir typade importer. Filer och processer hör till
 nativevärdens API.

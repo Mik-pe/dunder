@@ -70,9 +70,10 @@ Resultatvärden sparas tills scopet avslutas eller tas över en gång av `.join(
 ## Ägare och resultathandtag
 
 Scopet äger jobbens dispatchgrupper, workerarenor och väntande resultat.
-Det väntar in alla aktiva jobb innan de återstående föräldraägda värdena
-släpps och arenorna avmappas.
-Detta gäller vanlig blockutgång, `return`, `break` och `continue`. Ett
+Det väntar alltid in alla aktiva jobb och avmappar workerarenorna i strikt
+**LIFO-upprullningsordning** — **innan** yttre `defer`-block och yttre
+`@resource(dispose)`-metoder körs eller föräldraägda värden släpps.
+Detta gäller vanlig blockutgång, `return`, `?`, `break` och `continue`. Ett
 resultat som aldrig efterfrågas behöver inte kopieras tillbaka från arbetaren.
 
 `Task<R>` är ett typat, 8 byte stort flyttbart handtag (`move_only`, ej `Clone`).
@@ -136,18 +137,33 @@ adresser, lokala lån, callbacks och taskhandtag. Separata scope äger separata 
 
 `task scope jobs(limit, shared world)` (eller `task scope jobs(shared world)` med
 standardkapacitet `4`) tar en egen isolerad snapshot av `world`
-när scopet öppnas. Värdet är ett ägt `Sendable`-record (transparent eller en
-`opaque struct` som implementerar `Sendable`, till exempel `Map<string, []string>`).
+när scopet öppnas. Värdet måste uppfylla **`Sendable + Sync`** (exempelvis en
+transparent post eller en `opaque struct` med verifierad `impl Sendable`/`impl Sync`,
+som `Map<string, []string>`). Samma krav **`T: Sendable + Sync`** gäller
+`std.sync.Published<T>` så att icke-trådsäkra resurser som `fs.File`, `TcpStream`
+eller `sqlite.Database` aldrig kan delas via samtidiga `&T`-lån.
 Varje worker får samma snapshot som sista parametern `world: &World`. För ett
 scope med arbetsyta skrivs `task scope jobs(limit, initialize, shared world)`
 och parametrarna blir `(input: Job, workspace: &mut Workspace, world: &World)`.
 
 Föräldern kan ändra sitt ursprungliga värde efter öppningen. Den ägda
-snapshoten djupklonas isolerat och eventuella strängar och kopierbara
-payload-enums fryses med referensräknare `0` under scopets livstid, så att
-flera workers kan läsa och klona fält parallellt helt utan icke-atomära
-skrivningar till delade objekt. När scopet stängs inväntas alla jobb och alla
-workerarenor avmappas innan snapshoten avfryses och frigörs.
+snapshoten djupklonas isolerat och samtliga nåbara referensräknare i `[ptr - 8]`
+fryses innan någon arbetare observerar `&T`:
+
+| RC-värde (`[ptr - 8]`) | Betydelse | `retain` | `release` |
+| --- | --- | --- | --- |
+| `rc > 0` | Vanlig icke-atomär per-tråd-RC | `rc += 1` | `rc -= 1`, frigör vid `0` |
+| `rc == 0` | Statisk/odödlig literal | no-op | no-op |
+| `rc == -1` | Frigjord-objekt-fälla (UAF/dubbel-free-skydd) | fälla | fälla |
+| `rc == -2` | Fryst oföränderlig sträng | `string_isolated_clone` till anroparens lokala arena | no-op |
+| `rc <= -3` | Fryst sammansatt nyttolast (`desc_id = (-rc) - 3`) | gränskontrollerat uppslag i skrivskyddad `.rodata`-tabell `TYPE_DESC_TABLE[desc_id]` (status `112` vid ogiltigt index) | no-op |
+
+**`Sync` + fryst-RC-förutsättning:** `string`, `[]T`, `Map` och `Set` är `Sync`
+*enbart* därför att `Published<T>` och `task scope (shared ...)` fryser nåbara
+RC-huvuden (`rc <= -2`) innan andra trådar observerar `&T`. Varje `unsafe`-primitiv
+som exponerar `&T` över trådgränser för `T: Sync` måste antingen frysa `T` först
+eller förhindra icke-atomär RC-kloning. När scopet stängs inväntas alla jobb och
+alla workerarenor avmappas innan snapshoten frigörs.
 
 ## Vad en worker får använda
 
@@ -177,25 +193,25 @@ fn example() {
 ```
 
 Indata och returtyp måste uppfylla den inbyggda kompilatorbevisade traiten
-[`Sendable`](syntax.md#traits-och-impl-trait-for-type):
+[`Sendable`](syntax.md#traits-och-impl-trait-for-type) (ägarskapsöverföring mellan
+trådar), medan delade referenser över trådgränser (`Published<T>` och
+`task scope (shared ...)`) dessutom kräver [`Sync`](syntax.md#traits-och-impl-trait-for-type):
 
-- Primitiva tal, `bool`, `rune`, `()`, `string` och enums utan payload.
-- Payload-enums (inklusive `Result<T, E>`) vars varianttyper är `Sendable`.
-- Ägda och fasta arrayer (`[]T`, `[T; N]`) vars elementtyp är `Sendable`.
-- Transparenta structar och tupler vars fält rekursivt är `Sendable`.
-- `opaque struct` som uttryckligen deklarerar `impl Sendable for Typ {}`
-  (exempelvis `Map<K, V>` när `K: Sendable, V: Sendable`, `Set<K>` när
-  `K: Sendable`, samt renodlade handtagsresurser som `TcpStream`, `TcpListener`,
-  `UdpSocket`, `fs.File`, `sqlite.Database`, `sync.Sender<T>`, `sync.Receiver<T>`,
-  `sync.Published<T>`, `sync.Semaphore`, `sync.CancelToken`, `sync.AtomicI64`,
-  `sync.AtomicBool` och `net.Waker`), där flyttbara `@resource`-handtag använder
-  strikt `move`-överföring (sändarens ägarslot nollställs).
+- Primitiva tal, `bool`, `rune`, `()`, `string` och enums utan payload är både `Sendable` och `Sync`.
+- Payload-enums (inklusive `Result<T, E>`), ägda/fasta arrayer (`[]T`, `[T; N]`), transparenta structar och tupler ärver `Sendable` respektive `Sync` strukturellt från sina delar.
+- **Verifierad säker `impl Sendable / Sync for Typ {}`**: tillåts i säkra moduler (utan `capability unsafe`) för icke-`@resource` `opaque struct`-typer (t.ex. `Map<K, V>`, `Set<K>`, `MethodIndex`, `toml.Tree`, `alloc.Pool<T>`) och generiska omslag (`Reverse<T>`); kompilatorn kontrollerar strukturellt varje privat fält och avvisar `@resource` och råpekare (`ptr`).
+- **`unsafe impl Sendable / Sync for Typ {}`** (kräver `capability unsafe`): krävs för okontrollerade åsidosättningar (`@resource`, råpekare eller interiör muterbarhet). Flyttbara handtagsresurser som `TcpStream`, `TcpListener`, `UdpSocket`, `fs.File` och `sqlite.Database` har `unsafe impl Sendable` med strikt `move`-överföring (sändarens ägarslot nollställs) men är **inte** `Sync`, medan trådsäkra synkroniseringshandtag som `sync.Sender<T>`, `sync.Receiver<T>`, `sync.Published<T>`, `sync.Semaphore`, `sync.CancelToken`, `sync.AtomicI64`, `sync.AtomicBool` och `net.Waker` deklarerar både `unsafe impl Sendable` och `unsafe impl Sync`.
 
 Lån, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer, `Task<R>`
-och oklassificerade `@resource`- eller `opaque struct`-typer är inte `Sendable`
-och avvisas statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
+och oklassificerade `@resource`- eller `opaque struct`-typer är varken `Sendable`
+eller `Sync` och avvisas statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
 isolerad djupkloning så att varje tråd får helt egna allokeringar med egen
 referensräkning i sin arena utan delade icke-atomära räknare.
+Samtliga tvärtrådsprimitiver i `std.sync` (`AtomicI64`, `AtomicBool`, `Semaphore`,
+`CancelToken`, `Channel`, `Published`) och `std.net.Waker` allokerar sitt delade
+tillstånd direkt från operativsystemets sidor (`mmap`/`munmap` på macOS/Linux,
+`VirtualAlloc`/`VirtualFree` på `x86_64-windows`) — aldrig från en trådlokal
+minnespool.
 
 Arbetaren får använda lokala lån, strängar, scratch och allokering i sin
 egen runtime samt de kapabiliteter som uttryckligen beviljats via scopets
@@ -219,11 +235,13 @@ avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst
 
 ## Fel och kompilering
 
-Felaktig kapacitet, stängt eller felaktigt scope vid `.join()` samt fel vid skapande, inväntan eller avmappning
+Felaktig kapacitet, stängt eller felaktigt scope vid `.join()`, ogiltigt
+`TYPE_DESC_TABLE`-index samt fel vid skapande, inväntan eller avmappning
 avslutar processen med status 112. En misslyckad inväntan bevisar inte att arbetaren
 har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
-Vanliga runtimefällor i en worker behåller processavslut som felmekanism;
-kooperativ avbrytning sker med `std.sync.CancelToken` och `std.signal`.
+Vanliga runtimefällor och `panic()` i en worker följer Dunder 1.0:s abort-only-kontrakt
+(processavslut utan stackupprullning eller `defer`/`dispose`);
+återhämtningsbara fel returneras via `Result<T, E>` och kooperativ avbrytning sker med `std.sync.CancelToken` och `std.signal`.
 
 Typkontrollen registrerar direkta effekter, anrop och spawnplatser under
 den vanliga kroppsvandringen. Både build och check certifierar grafen när
